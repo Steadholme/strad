@@ -363,7 +363,7 @@ mod tests {
 
     fn headers(verifier: &AuthVerifier, subject: &str, groups: &str, minute: i64) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_static("rikune.w33d.xyz"));
+        headers.insert(header::HOST, HeaderValue::from_static("analyze.w33d.xyz"));
         headers.insert(HEADER_SUBJECT, HeaderValue::from_str(subject).unwrap());
         headers.insert(HEADER_GROUPS, HeaderValue::from_str(groups).unwrap());
         headers.insert(
@@ -382,7 +382,7 @@ mod tests {
             HeaderValue::from_bytes(&sign_zone(
                 &verifier.zone_key,
                 b"rikune-root",
-                b"rikune.w33d.xyz",
+                b"analyze.w33d.xyz",
                 b"external",
                 minute,
             ))

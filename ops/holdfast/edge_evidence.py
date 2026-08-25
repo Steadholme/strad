@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate signed GitHub Pages and Cloudflare cutover/restore evidence."""
+"""Validate signed evidence for the existing W33D Sluice public edge."""
 
 from __future__ import annotations
 
@@ -10,17 +10,26 @@ import re
 import stat
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{8,255}$")
+PUBLIC_HOST = "analyze.w33d.xyz"
+PUBLIC_URL = f"https://{PUBLIC_HOST}/"
+EDGE_OWNER = "existing-w33d-sluice"
+ROUTE_STATE = "absent"
 
 
 def fail(message: str) -> NoReturn:
     raise ValueError(message)
+
+
+def safe_regular(path: Path, label: str) -> None:
+    mode = path.lstat()
+    if not stat.S_ISREG(mode.st_mode) or path.is_symlink() or mode.st_nlink != 1:
+        fail(f"unsafe {label} file: {path}")
 
 
 def sha256(path: Path) -> str:
@@ -41,9 +50,7 @@ def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def load(path: Path) -> dict[str, Any]:
-    mode = path.lstat()
-    if not stat.S_ISREG(mode.st_mode) or path.is_symlink() or mode.st_nlink != 1:
-        fail(f"unsafe evidence file: {path}")
+    safe_regular(path, "evidence")
     value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique)
     if not isinstance(value, dict):
         fail("evidence root must be an object")
@@ -51,6 +58,7 @@ def load(path: Path) -> dict[str, Any]:
 
 
 def release(path: Path) -> dict[str, str]:
+    safe_regular(path, "release env")
     values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line or line.lstrip().startswith("#"):
@@ -60,6 +68,19 @@ def release(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         if key in values:
             fail(f"duplicate release key: {key}")
+        values[key] = value
+    return values
+
+
+def receipt(path: Path) -> dict[str, str]:
+    safe_regular(path, "receipt")
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or "=" not in line:
+            fail("malformed receipt")
+        key, value = line.split("=", 1)
+        if not key or key in values:
+            fail(f"duplicate or empty receipt key: {key}")
         values[key] = value
     return values
 
@@ -80,13 +101,15 @@ def moment(value: object, label: str) -> datetime:
     if not isinstance(value, str) or not value.endswith("Z"):
         fail(f"{label} must be UTC")
     try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        return datetime.fromisoformat(value[:-1] + "+00:00")
     except ValueError as error:
         fail(f"invalid {label}: {error}")
-    return parsed
 
 
 def verify_signature(evidence: Path, signature: Path, public_key: Path, values: dict[str, str]) -> None:
+    safe_regular(evidence, "edge evidence")
+    safe_regular(signature, "edge signature")
+    safe_regular(public_key, "authority public key")
     if sha256(public_key) != values.get("AUTHORITY_PUBLIC_KEY_SHA256"):
         fail("edge evidence signing key differs from the release authority key")
     result = subprocess.run(
@@ -100,129 +123,89 @@ def verify_signature(evidence: Path, signature: Path, public_key: Path, values: 
         fail("detached edge evidence signature verification failed")
 
 
-def validate_pages_snapshot(value: object) -> None:
-    pages = exact(
-        value,
-        {"repository", "source_branch", "source_path", "cname", "status", "api_response_sha256", "observed_at"},
-        "GitHub Pages snapshot",
-    )
-    if pages != {
-        **pages,
-        "repository": "Last-emo-boy/rikune",
-        "source_branch": "main",
-        "source_path": "/docs",
-        "cname": "rikune.w33d.xyz",
-        "status": "built",
-    }:
-        fail("GitHub Pages preflight differs from the existing owner")
-    hex64(pages["api_response_sha256"], "GitHub Pages snapshot")
-    moment(pages["observed_at"], "GitHub Pages observed_at")
+def validate_edge_identity(value: dict[str, Any], label: str) -> None:
+    if value.get("host") != PUBLIC_HOST:
+        fail(f"{label} host is not {PUBLIC_HOST}")
+    if value.get("edge_owner") != EDGE_OWNER:
+        fail(f"{label} is not attributed to the existing W33D Sluice edge")
+    if value.get("route_state") != ROUTE_STATE:
+        fail(f"{label} does not prove route-absent state")
+    if value.get("external_edge_mutations") != []:
+        fail(f"{label} must not claim GitHub Pages, Cloudflare, or DNS mutation")
 
 
-def validate_cloudflare(value: object) -> tuple[datetime, datetime, datetime]:
-    fields = {
-        "token_secret_path",
-        "token_scopes",
-        "zone_id_sha256",
-        "record_id_sha256",
-        "pre_record_sha256",
-        "post_record_sha256",
-        "patch_method",
-        "patch_path_sha256",
-        "patch_request_sha256",
-        "patch_response_sha256",
-        "patched_at",
-        "origin",
-        "pre_ttl_seconds",
-        "post_ttl_seconds",
-        "ttl_wait_seconds",
-        "ttl_converged_at",
-        "purge_method",
-        "purge_request_sha256",
-        "purge_response_id",
-        "purge_response_sha256",
-        "purged_at",
-    }
-    edge = exact(value, fields, "Cloudflare cutover")
-    secret_path = edge["token_secret_path"]
-    if not isinstance(secret_path, str) or not secret_path.startswith("/") or secret_path.startswith("/root/w33d_infra/"):
-        fail("Cloudflare token must be referenced by an external absolute secret path")
-    if edge["token_scopes"] != ["Cache Purge", "DNS Write"]:
-        fail("Cloudflare token scopes must be the exact least-privilege pair")
-    for name in (
-        "zone_id_sha256",
-        "record_id_sha256",
-        "pre_record_sha256",
-        "post_record_sha256",
-        "patch_path_sha256",
-        "patch_request_sha256",
-        "patch_response_sha256",
-        "purge_request_sha256",
-        "purge_response_sha256",
-    ):
-        hex64(edge[name], f"Cloudflare {name}")
-    if edge["patch_method"] != "PATCH" or edge["purge_method"] != "POST":
-        fail("Cloudflare API method evidence is invalid")
-    if edge["origin"] != "w33d-sluice-ingress":
-        fail("Cloudflare origin is not the W33D ingress")
-    pre_ttl = edge["pre_ttl_seconds"]
-    post_ttl = edge["post_ttl_seconds"]
-    ttl_wait = edge["ttl_wait_seconds"]
-    if (
-        not isinstance(pre_ttl, int)
-        or isinstance(pre_ttl, bool)
-        or not 1 <= pre_ttl <= 86400
-        or not isinstance(post_ttl, int)
-        or isinstance(post_ttl, bool)
-        or not 1 <= post_ttl <= 86400
-        or not isinstance(ttl_wait, int)
-        or isinstance(ttl_wait, bool)
-        or ttl_wait < max(pre_ttl, post_ttl)
-        or ttl_wait > 86400
-    ):
-        fail("Cloudflare TTL convergence evidence is invalid")
-    if not isinstance(edge["purge_response_id"], str) or not SAFE_ID.fullmatch(edge["purge_response_id"]):
-        fail("Cloudflare purge response id is absent")
-    patched = moment(edge["patched_at"], "Cloudflare patched_at")
-    converged = moment(edge["ttl_converged_at"], "Cloudflare ttl_converged_at")
-    purged = moment(edge["purged_at"], "Cloudflare purged_at")
-    if purged < patched:
-        fail("Cloudflare cache purge predates DNS/origin cutover")
-    if converged < patched + timedelta(seconds=ttl_wait):
-        fail("Cloudflare DNS TTL wait has not converged")
-    return patched, purged, converged
-
-
-def validate_probes(value: object, not_before: datetime) -> None:
-    if not isinstance(value, list) or len(value) < 2:
-        fail("public cutover requires IPv4 and IPv6 probe evidence")
+def validate_closed_probes(value: object, not_before: datetime, label: str) -> datetime:
+    if not isinstance(value, list) or len(value) != 2:
+        fail(f"{label} requires exactly one IPv4 and one IPv6 probe")
     families: set[str] = set()
+    latest = not_before
     for item in value:
         probe = exact(
             item,
-            {"family", "observed_at", "status", "cache_control", "github_request_id", "proxy_cache", "fastly_via", "origin", "response_headers_sha256"},
-            "public probe",
+            {
+                "family",
+                "observed_at",
+                "url",
+                "status",
+                "edge_owner",
+                "route_state",
+                "response_headers_sha256",
+            },
+            f"{label} public probe",
         )
         family = probe["family"]
         if family not in {"ipv4", "ipv6"} or family in families:
-            fail("public probe family is duplicate or invalid")
+            fail(f"{label} public probe family is duplicate or invalid")
         families.add(family)
-        if probe["status"] not in {200, 302, 401, 403}:
-            fail("public probe status is not a bounded private-route response")
-        if probe["cache_control"].replace(" ", "") != "private,no-store":
-            fail("public workbench response is not private,no-store")
-        if any(probe[name] is not None for name in ("github_request_id", "proxy_cache", "fastly_via")):
-            fail("public probe still contains GitHub Pages/Fastly cache evidence")
-        if probe["origin"] != "sluice-strad":
-            fail("public probe is not attributed to Sluice/Strad")
-        hex64(probe["response_headers_sha256"], "public response headers")
-        if moment(probe["observed_at"], "public probe observed_at") < not_before:
-            fail("public probe predates cache purge")
+        if probe["url"] != PUBLIC_URL:
+            fail(f"{label} public probe targets the wrong host")
+        if probe["status"] != 404:
+            fail(f"{label} public probe must return exact 404")
+        if probe["edge_owner"] != EDGE_OWNER:
+            fail(f"{label} public probe is not attributed to the existing W33D Sluice edge")
+        if probe["route_state"] != ROUTE_STATE:
+            fail(f"{label} public probe does not prove route-absent state")
+        hex64(probe["response_headers_sha256"], f"{label} public response headers")
+        observed = moment(probe["observed_at"], f"{label} public probe observed_at")
+        if observed < not_before:
+            fail(f"{label} public probe predates the closed-state receipt")
+        latest = max(latest, observed)
     if families != {"ipv4", "ipv6"}:
-        fail("both IPv4 and IPv6 probes are mandatory")
+        fail(f"{label} requires both IPv4 and IPv6 probes")
+    return latest
 
 
-def validate_cutover(value: dict[str, Any], args: argparse.Namespace) -> None:
+def validate_prepare_receipt(path: Path) -> tuple[dict[str, str], datetime]:
+    values = receipt(path)
+    required = {
+        "prepared_at",
+        "release_evidence_sha256",
+        "open_evidence_sha256",
+        "source_grant_id",
+        "route_state",
+        "public_host",
+        "edge_owner",
+        "public_ipv4_ipv6_closed_status",
+        "db_public_db_bracket",
+        "external_edge_mutation",
+    }
+    if set(values) != required:
+        fail("open prepare receipt field set is not exact")
+    if (
+        values["route_state"] != ROUTE_STATE
+        or values["public_host"] != PUBLIC_HOST
+        or values["edge_owner"] != EDGE_OWNER
+        or values["public_ipv4_ipv6_closed_status"] != "404"
+        or values["db_public_db_bracket"] != "absent-404-absent"
+        or values["external_edge_mutation"] != "none"
+    ):
+        fail("open prepare receipt does not prove the exact closed Sluice edge")
+    for name in ("release_evidence_sha256", "open_evidence_sha256"):
+        hex64(values[name], f"open prepare receipt {name}")
+    return values, moment(values["prepared_at"], "open prepare time")
+
+
+def validate_preopen(value: dict[str, Any], args: argparse.Namespace) -> None:
     fields = {
         "schema_version",
         "ceremony",
@@ -232,16 +215,22 @@ def validate_cutover(value: dict[str, Any], args: argparse.Namespace) -> None:
         "open_evidence_sha256",
         "source_grant_id",
         "open_prepare_receipt_sha256",
-        "github_pages_preflight",
-        "github_pages_detach",
-        "cloudflare",
+        "host",
+        "edge_owner",
+        "route_state",
+        "external_edge_mutations",
         "public_probes",
     }
-    if set(value) != fields or value.get("schema_version") != 1 or value.get("ceremony") != "holdfast-rikune-edge-cutover-v1":
-        fail("edge cutover field set or ceremony is invalid")
+    if (
+        set(value) != fields
+        or value.get("schema_version") != 2
+        or value.get("ceremony") != "holdfast-rikune-edge-preopen-v2"
+    ):
+        fail("edge pre-open field set or v2 ceremony is invalid")
     if args.open_evidence is None or args.prepare_receipt is None:
-        fail("cutover validation requires open evidence and prepare receipt")
+        fail("pre-open validation requires open evidence and prepare receipt")
     open_value = load(args.open_evidence)
+    prepare_value, prepared_at = validate_prepare_receipt(args.prepare_receipt)
     expected = {
         "signature_key_sha256": sha256(args.public_key),
         "release_evidence_sha256": sha256(args.release_evidence),
@@ -251,31 +240,69 @@ def validate_cutover(value: dict[str, Any], args: argparse.Namespace) -> None:
     }
     for name, wanted in expected.items():
         if value.get(name) != wanted:
-            fail(f"edge cutover binding differs: {name}")
-    validate_pages_snapshot(value["github_pages_preflight"])
-    detach = exact(
-        value["github_pages_detach"],
-        {"method", "path", "api_version", "request_body_sha256", "response_status", "completed_at", "post_get_sha256", "post_cname"},
-        "GitHub Pages detach",
-    )
-    if detach["method"] != "PUT" or detach["path"] != "/repos/Last-emo-boy/rikune/pages" or detach["api_version"] != "2026-03-10":
-        fail("GitHub Pages detach API evidence is invalid")
-    if detach["response_status"] != 204 or detach["post_cname"] is not None:
-        fail("GitHub Pages custom domain was not proven detached")
-    for name in ("request_body_sha256", "post_get_sha256"):
-        hex64(detach[name], f"GitHub Pages detach {name}")
-    detached = moment(detach["completed_at"], "GitHub Pages detached_at")
-    patched, purged, converged = validate_cloudflare(value["cloudflare"])
-    prepare_time = moment(
-        dict(line.split("=", 1) for line in args.prepare_receipt.read_text().splitlines())["prepared_at"],
-        "open prepare time",
-    )
-    if detached < prepare_time or patched < detached:
-        fail("edge cutover was not the last step after route/runtime preparation")
-    validate_probes(value["public_probes"], max(purged, converged))
-    issued = moment(value["issued_at"], "issued_at")
-    if any(moment(item["observed_at"], "probe") > issued for item in value["public_probes"]):
-        fail("edge evidence predates its public probes")
+            fail(f"edge pre-open binding differs: {name}")
+    if (
+        prepare_value["release_evidence_sha256"] != expected["release_evidence_sha256"]
+        or prepare_value["open_evidence_sha256"] != expected["open_evidence_sha256"]
+        or prepare_value["source_grant_id"] != expected["source_grant_id"]
+    ):
+        fail("open prepare receipt differs from the release authority binding")
+    validate_edge_identity(value, "edge pre-open evidence")
+    latest_probe = validate_closed_probes(value["public_probes"], prepared_at, "edge pre-open")
+    if moment(value["issued_at"], "issued_at") < latest_probe:
+        fail("edge pre-open evidence predates its public probes")
+
+
+def validate_preopen_reference(value: dict[str, Any]) -> None:
+    if (
+        value.get("schema_version") != 2
+        or value.get("ceremony") != "holdfast-rikune-edge-preopen-v2"
+    ):
+        fail("rollback references non-v2 pre-open edge evidence")
+    validate_edge_identity(value, "referenced edge pre-open evidence")
+
+
+def validate_route_close_receipt(path: Path) -> tuple[dict[str, str], datetime]:
+    values = receipt(path)
+    required = {
+        "route_closed_at",
+        "route_down_sha256",
+        "route_down_execution_evidence_sha256",
+        "open_evidence_sha256",
+        "source_grant_id",
+        "was_public_open",
+        "preopen_edge_evidence_sha256",
+        "route_preimage_sha256",
+        "route_conflict_cleanup",
+        "route_state",
+        "public_host",
+        "edge_owner",
+        "public_ipv4_ipv6_closed_status",
+        "db_public_db_bracket",
+        "external_edge_mutation",
+    }
+    if set(values) != required:
+        fail("route-close receipt field set is not exact")
+    if (
+        values["was_public_open"] != "true"
+        or values["route_state"] != ROUTE_STATE
+        or values["public_host"] != PUBLIC_HOST
+        or values["edge_owner"] != EDGE_OWNER
+        or values["public_ipv4_ipv6_closed_status"] != "404"
+        or values["db_public_db_bracket"] != "absent-404-absent"
+        or values["route_conflict_cleanup"] != "same-name-or-analyze-root"
+        or values["external_edge_mutation"] != "none"
+    ):
+        fail("route-close receipt does not prove a formerly-open route is closed on Sluice")
+    for name in (
+        "route_down_sha256",
+        "route_down_execution_evidence_sha256",
+        "open_evidence_sha256",
+        "preopen_edge_evidence_sha256",
+        "route_preimage_sha256",
+    ):
+        hex64(values[name], f"route-close receipt {name}")
+    return values, moment(values["route_closed_at"], "route close time")
 
 
 def validate_rollback(value: dict[str, Any], args: argparse.Namespace) -> None:
@@ -284,129 +311,58 @@ def validate_rollback(value: dict[str, Any], args: argparse.Namespace) -> None:
         "ceremony",
         "issued_at",
         "signature_key_sha256",
-        "open_edge_evidence_sha256",
+        "release_evidence_sha256",
+        "preopen_edge_evidence_sha256",
         "route_close_receipt_sha256",
         "revocation_evidence_sha256",
-        "github_pages_restore",
-        "cloudflare_restore",
+        "source_grant_id",
+        "host",
+        "edge_owner",
+        "route_state",
+        "external_edge_mutations",
         "public_probes",
     }
-    if set(value) != fields or value.get("schema_version") != 1 or value.get("ceremony") != "holdfast-rikune-edge-rollback-v1":
-        fail("edge rollback field set or ceremony is invalid")
+    if (
+        set(value) != fields
+        or value.get("schema_version") != 2
+        or value.get("ceremony") != "holdfast-rikune-edge-rollback-v2"
+    ):
+        fail("edge rollback field set or v2 ceremony is invalid")
     if args.open_edge_evidence is None or args.route_close_receipt is None or args.revocation_evidence is None:
-        fail("edge rollback requires open edge, route-close, and revocation evidence")
+        fail("edge rollback requires pre-open edge, route-close, and revocation evidence")
+    preopen = load(args.open_edge_evidence)
+    validate_preopen_reference(preopen)
+    close_value, route_closed_at = validate_route_close_receipt(args.route_close_receipt)
+    revocation = load(args.revocation_evidence)
+    revocation_issued = moment(revocation.get("issued_at"), "revocation issued_at")
     expected = {
         "signature_key_sha256": sha256(args.public_key),
-        "open_edge_evidence_sha256": sha256(args.open_edge_evidence),
+        "release_evidence_sha256": sha256(args.release_evidence),
+        "preopen_edge_evidence_sha256": sha256(args.open_edge_evidence),
         "route_close_receipt_sha256": sha256(args.route_close_receipt),
         "revocation_evidence_sha256": sha256(args.revocation_evidence),
+        "source_grant_id": close_value["source_grant_id"],
     }
     for name, wanted in expected.items():
         if value.get(name) != wanted:
             fail(f"edge rollback binding differs: {name}")
-    pages = exact(
-        value["github_pages_restore"],
-        {"method", "path", "api_version", "request_body_sha256", "response_status", "completed_at", "post_get_sha256", "post_cname", "source_branch", "source_path"},
-        "GitHub Pages restore",
+    if (
+        close_value["preopen_edge_evidence_sha256"] != expected["preopen_edge_evidence_sha256"]
+        or preopen.get("source_grant_id") != expected["source_grant_id"]
+        or revocation.get("source_grant_id") != expected["source_grant_id"]
+    ):
+        fail("edge rollback does not bind the same pre-open evidence and source grant")
+    validate_edge_identity(value, "edge rollback evidence")
+    latest_probe = validate_closed_probes(
+        value["public_probes"], max(route_closed_at, revocation_issued), "edge rollback"
     )
-    if (
-        pages["method"] != "PUT"
-        or pages["path"] != "/repos/Last-emo-boy/rikune/pages"
-        or pages["api_version"] != "2026-03-10"
-        or pages["response_status"] != 204
-        or pages["post_cname"] != "rikune.w33d.xyz"
-        or pages["source_branch"] != "main"
-        or pages["source_path"] != "/docs"
-    ):
-        fail("original GitHub Pages ownership was not exactly restored")
-    for name in ("request_body_sha256", "post_get_sha256"):
-        hex64(pages[name], f"GitHub Pages restore {name}")
-    cloudflare = exact(
-        value["cloudflare_restore"],
-        {
-            "token_secret_path", "token_scopes", "zone_id_sha256", "record_id_sha256",
-            "pre_record_sha256", "post_record_sha256", "patch_method", "patch_path_sha256",
-            "patch_request_sha256", "patch_response_sha256", "patched_at", "origin",
-            "pre_ttl_seconds", "post_ttl_seconds", "ttl_wait_seconds", "ttl_converged_at",
-            "purge_method", "purge_request_sha256", "purge_response_id",
-            "purge_response_sha256", "purged_at",
-        },
-        "Cloudflare restore",
-    )
-    if (
-        not isinstance(cloudflare["token_secret_path"], str)
-        or not cloudflare["token_secret_path"].startswith("/")
-        or cloudflare["token_secret_path"].startswith("/root/w33d_infra/")
-        or cloudflare["token_scopes"] != ["Cache Purge", "DNS Write"]
-        or cloudflare["patch_method"] != "PATCH"
-        or cloudflare["purge_method"] != "POST"
-        or cloudflare["origin"] != "github-pages-original"
-    ):
-        fail("Cloudflare rollback authority or target is invalid")
-    for name in (
-        "zone_id_sha256", "record_id_sha256", "pre_record_sha256", "post_record_sha256",
-        "patch_path_sha256", "patch_request_sha256", "patch_response_sha256",
-        "purge_request_sha256", "purge_response_sha256",
-    ):
-        hex64(cloudflare[name], f"Cloudflare rollback {name}")
-    if not isinstance(cloudflare["purge_response_id"], str) or not SAFE_ID.fullmatch(cloudflare["purge_response_id"]):
-        fail("Cloudflare rollback purge response id is absent")
-    restored = moment(pages["completed_at"], "Pages restored_at")
-    patched = moment(cloudflare["patched_at"], "Cloudflare rollback patched_at")
-    converged = moment(cloudflare["ttl_converged_at"], "Cloudflare rollback ttl_converged_at")
-    purged = moment(cloudflare["purged_at"], "Cloudflare rollback purged_at")
-    revocation_issued = moment(load(args.revocation_evidence)["issued_at"], "revocation issued_at")
-    if restored < revocation_issued or patched < restored or purged < patched:
-        fail("edge rollback must follow route close, grant revoke, and tombstone acknowledgements")
-    pre_ttl = cloudflare["pre_ttl_seconds"]
-    post_ttl = cloudflare["post_ttl_seconds"]
-    ttl_wait = cloudflare["ttl_wait_seconds"]
-    if (
-        not isinstance(pre_ttl, int)
-        or isinstance(pre_ttl, bool)
-        or not 1 <= pre_ttl <= 86400
-        or not isinstance(post_ttl, int)
-        or isinstance(post_ttl, bool)
-        or not 1 <= post_ttl <= 86400
-        or not isinstance(ttl_wait, int)
-        or isinstance(ttl_wait, bool)
-        or ttl_wait < max(pre_ttl, post_ttl)
-        or ttl_wait > 86400
-        or converged < patched + timedelta(seconds=ttl_wait)
-    ):
-        fail("Cloudflare rollback TTL convergence evidence is invalid")
-    open_edge = load(args.open_edge_evidence)
-    open_cloudflare = exact(open_edge.get("cloudflare"), {
-        "token_secret_path", "token_scopes", "zone_id_sha256", "record_id_sha256",
-        "pre_record_sha256", "post_record_sha256", "patch_method", "patch_path_sha256",
-        "patch_request_sha256", "patch_response_sha256", "patched_at", "origin",
-        "pre_ttl_seconds", "post_ttl_seconds", "ttl_wait_seconds", "ttl_converged_at",
-        "purge_method", "purge_request_sha256", "purge_response_id",
-        "purge_response_sha256", "purged_at",
-    }, "open Cloudflare evidence")
-    for field in ("zone_id_sha256", "record_id_sha256", "patch_path_sha256"):
-        if cloudflare[field] != open_cloudflare[field]:
-            fail(f"Cloudflare rollback targets another record: {field}")
-    if (
-        cloudflare["pre_record_sha256"] != open_cloudflare["post_record_sha256"]
-        or cloudflare["post_record_sha256"] != open_cloudflare["pre_record_sha256"]
-    ):
-        fail("Cloudflare rollback does not restore the exact pre-cutover record")
-    probes = value["public_probes"]
-    if not isinstance(probes, list) or {item.get("family") for item in probes if isinstance(item, dict)} != {"ipv4", "ipv6"}:
-        fail("edge rollback requires IPv4/IPv6 Pages probes")
-    for probe in probes:
-        item = exact(probe, {"family", "observed_at", "origin", "cname", "response_headers_sha256"}, "Pages rollback probe")
-        if item["origin"] != "github-pages" or item["cname"] != "rikune.w33d.xyz" or moment(item["observed_at"], "Pages probe") < max(purged, converged):
-            fail("rollback probe does not prove restored Pages ownership after purge")
-        hex64(item["response_headers_sha256"], "Pages rollback headers")
-    if moment(value["issued_at"], "issued_at") < max(moment(item["observed_at"], "probe") for item in probes):
-        fail("edge rollback evidence predates its probes")
+    if moment(value["issued_at"], "issued_at") < latest_probe:
+        fail("edge rollback evidence predates its public probes")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", required=True, choices=("cutover", "rollback"))
+    parser.add_argument("--mode", required=True, choices=("preopen", "rollback"))
     parser.add_argument("--evidence", required=True, type=Path)
     parser.add_argument("--signature", required=True, type=Path)
     parser.add_argument("--public-key", required=True, type=Path)
@@ -421,14 +377,16 @@ def main() -> int:
     try:
         values = release(args.release_env)
         verify_signature(args.evidence, args.signature, args.public_key, values)
-        if args.mode == "cutover":
-            validate_cutover(load(args.evidence), args)
+        if args.mode == "preopen":
+            validate_preopen(load(args.evidence), args)
+            success = "signed v2 pre-open evidence proves the exact dual-stack 404 Sluice edge"
         else:
             validate_rollback(load(args.evidence), args)
+            success = "signed v2 rollback evidence proves the exact dual-stack 404 route-absent state"
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(f"edge evidence: {error}", file=sys.stderr)
         return 1
-    print("signed Pages/Cloudflare cutover evidence is exact")
+    print(success)
     return 0
 
 

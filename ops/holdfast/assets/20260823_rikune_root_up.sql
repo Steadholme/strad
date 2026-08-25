@@ -13,35 +13,30 @@ BEGIN
         SELECT 1
           FROM routes
          WHERE name = 'rikune-root'
-           AND (host, path_prefix, upstream, protected, auth, waf, require_group,
-                internal_only, require_permission, permission_resource, risk, require_scope)
-               IS DISTINCT FROM
-               ('rikune.w33d.xyz', '/', 'http://strad:9360', TRUE, 'sso', FALSE, '',
-                FALSE, 'rikune.console.enter', 'route:rikune-root', 'critical', '')
     ) THEN
-        RAISE EXCEPTION 'rikune-root exists with different authority';
+        RAISE EXCEPTION 'rikune-root already exists; refusing apply';
     END IF;
 
     IF EXISTS (
         SELECT 1
           FROM routes
-         WHERE host = 'rikune.w33d.xyz'
+         WHERE host = 'analyze.w33d.xyz'
            AND path_prefix = '/'
-           AND name <> 'rikune-root'
     ) THEN
-        RAISE EXCEPTION 'rikune.w33d.xyz root is already owned by another route';
+        RAISE EXCEPTION 'analyze.w33d.xyz root is already owned by another route';
     END IF;
 END
 $$;
 
 INSERT INTO routes (
     name, host, path_prefix, upstream, protected, auth, waf, require_group,
-    internal_only, require_permission, permission_resource, risk, require_scope
+    internal_only, require_permission, permission_resource, risk, require_scope,
+    step_up_resume_path
 )
-SELECT
-    'rikune-root', 'rikune.w33d.xyz', '/', 'http://strad:9360', TRUE, 'sso', FALSE, '',
-    FALSE, 'rikune.console.enter', 'route:rikune-root', 'critical', ''
-WHERE NOT EXISTS (SELECT 1 FROM routes WHERE name = 'rikune-root');
+VALUES (
+    'rikune-root', 'analyze.w33d.xyz', '/', 'http://strad:9360', TRUE, 'sso', FALSE, '',
+    FALSE, 'rikune.console.enter', 'route:rikune-root', 'critical', '', ''
+);
 
 DO $$
 DECLARE
@@ -51,7 +46,7 @@ BEGIN
       INTO exact_count
       FROM routes
      WHERE name = 'rikune-root'
-       AND host = 'rikune.w33d.xyz'
+       AND host = 'analyze.w33d.xyz'
        AND path_prefix = '/'
        AND upstream = 'http://strad:9360'
        AND protected = TRUE
@@ -62,7 +57,8 @@ BEGIN
        AND require_permission = 'rikune.console.enter'
        AND permission_resource = 'route:rikune-root'
        AND risk = 'critical'
-       AND require_scope = '';
+       AND require_scope = ''
+       AND step_up_resume_path = '';
     IF exact_count <> 1 THEN
         RAISE EXCEPTION 'rikune-root apply verification expected one exact row, got %', exact_count;
     END IF;

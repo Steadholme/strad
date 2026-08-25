@@ -286,7 +286,21 @@ def copy_stage(estate_root: Path, stage_root: Path, catalog_only: bool) -> None:
         ignore=shutil.ignore_patterns(".git", "target", "__pycache__", "*.pyc"),
     )
     (stage_root / "deploy").mkdir(mode=0o700)
-    shutil.copy2(estate_root / "deploy/routes.seed.json", stage_root / "deploy/routes.seed.json")
+    source_route_seed = estate_root / "deploy/routes.seed.json"
+    route_seed = load_object(source_route_seed)
+    routes = route_seed.get("routes")
+    if not isinstance(routes, list) or len(routes) != 147:
+        fail("route seed precondition failed")
+    if any(
+        item.get("name") == "rikune-root"
+        for item in routes
+        if isinstance(item, dict)
+    ):
+        fail("rikune-root already exists in the seed")
+    staged_route_seed = stage_root / "deploy/routes.seed.json"
+    shutil.copy2(source_route_seed, staged_route_seed)
+    if sha256_file(source_route_seed) != sha256_file(staged_route_seed):
+        fail("route seed copy differs from its estate preimage")
     if not catalog_only:
         for name in ("docker-compose.yml", ".env", "access-governance.env.example"):
             shutil.copy2(estate_root / f"deploy/{name}", stage_root / f"deploy/{name}")
@@ -695,33 +709,6 @@ def render_packages(stage_root: Path) -> None:
     for old, new, label in ui_changes:
         ui_text = replace_once(ui_text, old, new, label)
     ui_path.write_text(ui_text, encoding="utf-8")
-
-
-def render_route_seed(stage_root: Path) -> None:
-    path = stage_root / "deploy/routes.seed.json"
-    value = load_object(path)
-    routes = value.get("routes")
-    if not isinstance(routes, list) or len(routes) != 147:
-        fail("route seed precondition failed")
-    if any(item.get("name") == "rikune-root" for item in routes if isinstance(item, dict)):
-        fail("rikune-root already exists in the seed")
-    routes.append(
-        {
-            "name": "rikune-root",
-            "match": {"host": "rikune.w33d.xyz", "path_prefix": "/"},
-            "upstream": "http://strad:9360",
-            "protected": True,
-            "auth": "sso",
-            "waf": False,
-            "require_group": "",
-            "internal_only": False,
-            "require_permission": "rikune.console.enter",
-            "permission_resource": "route:rikune-root",
-            "risk": "critical",
-            "require_scope": "",
-        }
-    )
-    write_json(path, value)
 
 
 def update_env_file(path: Path, updates: dict[str, str]) -> None:
@@ -1171,7 +1158,6 @@ def main() -> int:
     render_generator(stage_root)
     render_validator(stage_root)
     render_catalog_rs(stage_root)
-    render_route_seed(stage_root)
     generator = stage_root / "access-governance/scripts/generate_permission_catalog.sh"
     run_checked([str(generator)], stage_root / "access-governance")
     render_packages(stage_root)

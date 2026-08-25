@@ -1,13 +1,12 @@
 {
   "schema_version": 2,
-  "ceremony": "holdfast-rikune-edge-rollback-v2",
+  "ceremony": "holdfast-rikune-edge-preopen-v2",
   "issued_at": "REQUIRED_UTC_AFTER_BOTH_CLOSED_PROBES",
   "signature_key_sha256": "REQUIRED_64lowerhex",
   "release_evidence_sha256": "REQUIRED_64lowerhex",
-  "preopen_edge_evidence_sha256": "REQUIRED_64lowerhex",
-  "route_close_receipt_sha256": "REQUIRED_64lowerhex_CREATED_FIRST",
-  "revocation_evidence_sha256": "REQUIRED_64lowerhex_AFTER_SEVEN_TOMBSTONES",
-  "source_grant_id": "REQUIRED_SAME_AS_OPEN_AND_REVOCATION",
+  "open_evidence_sha256": "REQUIRED_64lowerhex",
+  "source_grant_id": "REQUIRED_SAME_AS_OPEN",
+  "open_prepare_receipt_sha256": "REQUIRED_64lowerhex",
   "host": "analyze.w33d.xyz",
   "edge_owner": "existing-w33d-sluice",
   "route_state": "absent",
@@ -15,7 +14,7 @@
   "public_probes": [
     {
       "family": "ipv4",
-      "observed_at": "REQUIRED_UTC_AFTER_ROUTE_CLOSE_AND_REVOCATION",
+      "observed_at": "REQUIRED_UTC_AFTER_OPEN_PREPARE_RECEIPT",
       "url": "https://analyze.w33d.xyz/",
       "status": 404,
       "edge_owner": "existing-w33d-sluice",
@@ -24,7 +23,7 @@
     },
     {
       "family": "ipv6",
-      "observed_at": "REQUIRED_UTC_AFTER_ROUTE_CLOSE_AND_REVOCATION",
+      "observed_at": "REQUIRED_UTC_AFTER_OPEN_PREPARE_RECEIPT",
       "url": "https://analyze.w33d.xyz/",
       "status": 404,
       "edge_owner": "existing-w33d-sluice",

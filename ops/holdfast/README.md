@@ -1,9 +1,10 @@
 # Holdfast Rikune release package
 
 This package renders, verifies, applies, opens, and rolls back the Rikune estate with checksum,
-signature, and state-machine gates. Rendering is isolated. Nothing here mutates the live estate,
-route database, GitHub Pages, Cloudflare, or DNS without a separate explicit `--execute` ceremony.
-No production secret value belongs in this directory or in Git.
+signature, and state-machine gates. Rendering is isolated. Nothing here mutates the live estate or
+route database without a separate explicit `--execute` ceremony. The existing W33D wildcard edge
+and DNS are observed but never changed by this package. No production secret value belongs here or
+in Git.
 
 ## Immutable release inputs
 
@@ -86,18 +87,20 @@ rejects any third-party checksum.
 Ingress is still closed. Preserve the printed backup directory and `/var/lib/holdfast-rikune`
 state receipts.
 
-## Authority and public-domain cutover
+## Authority and route-only opening
 
 Provision the finite 30-day `pkg_rikune_analyst` request for exactly
 `user:rikune-acceptance`, through normal step-up and 2-of-2 approval. Record the exact source grant
-and all seven positive epochs/ack timestamps using `authority-open.example.json`, then detached-sign
-the JSON with the release-pinned authority key.
+and all seven positive epochs/ack timestamps using `authority-open.example.json`, then
+detached-sign the JSON with the release-pinned authority key.
 
-Public `rikune.w33d.xyz` is currently owned by GitHub Pages (`Last-emo-boy/rikune`, `main:/docs`,
-`cname=rikune.w33d.xyz`, status `built`) behind Cloudflare/Fastly. A Sluice SQL row alone does not
-take over that domain. Opening is therefore deliberately two-phase.
+`analyze.w33d.xyz` already reaches the existing W33D Sluice ingress through the managed wildcard
+Cloudflare/DNS estate. With no `rikune-root` row, both public IPv4 and IPv6 must return exact
+`404` responses carrying the expected W33D safety headers. Opening and rollback are route-only:
+they never change GitHub Pages, Cloudflare, DNS, wildcard ownership, or caches.
 
-First prepare the W33D route and prove exact runtime digests/readiness and the real NewAPI alias:
+Prepare validates the release/runtime and authority, then brackets the public closed probe with two
+independent route-database absence checks. It does not insert a route:
 
 ```sh
 ROUTES_DATABASE_URL='supplied by route authority' ./open-ingress.sh --execute --phase prepare \
@@ -109,33 +112,25 @@ ROUTES_DATABASE_URL='supplied by route authority' ./open-ingress.sh --execute --
   --authority-public-key /secure/release/release-authority.pub
 ```
 
-Only after `OPEN-PREPARE.receipt` exists may the external-domain authority perform the last-step
-cutover:
+A successful prepare atomically records `OPEN-PREPARE.receipt` and
+`edge_prepared_route_closed`. It proves `absent -> dual-stack 404 -> absent`, the
+`analyze.w33d.xyz` host, and `existing-w33d-sluice`, with
+`external_edge_mutation=none`.
 
-1. Snapshot and hash `GET /repos/Last-emo-boy/rikune/pages` and the Cloudflare DNS record.
-2. Detach only the custom domain with GitHub REST API version `2026-03-10`:
-   `PUT /repos/Last-emo-boy/rikune/pages` with
-   `{"cname":null,"source":{"branch":"main","path":"/docs"}}`; require HTTP `204`, then hash a
-   post-`GET` proving `cname=null`.
-3. Read a Cloudflare token only from an external absolute secret path. Its exact scopes are
-   `DNS Write` and `Cache Purge`. Never print or embed it in evidence. Use
-   `PATCH /zones/{zone_id}/dns_records/{record_id}` to point the record at the W33D Sluice origin;
-   record the exact pre-record, request, response, and post-`GET` record hashes. Record both old
-   and new TTLs, wait at least their maximum, and timestamp TTL convergence.
-4. Call `POST /zones/{zone_id}/purge_cache` with `{"hosts":["rikune.w33d.xyz"]}`; record the
-   response id/hash. This is mandatory because the old Pages response advertises
-   `cache-control:max-age=600`, `x-proxy-cache`, and `x-github-request-id`.
-5. Only after both purge and TTL convergence, from public IPv4 and IPv6, prove the response no
-   longer has GitHub/Fastly markers and has
-   `Cache-Control: private, no-store`. Record header hashes and timestamps.
+After prepare, copy `edge-preopen.example.json` to a protected operator directory. Record exactly
+one post-prepare IPv4 probe and one post-prepare IPv6 probe. Each probe must target
+`https://analyze.w33d.xyz/`, return `404`, identify the existing W33D Sluice edge and
+route-absent state, and include a SHA-256 of the complete response headers. Keep
+`external_edge_mutations` as the exact empty list, fill the receipt/evidence hashes and same
+`source_grant_id`, then detached-sign the v2 JSON with the same authority key.
 
-Use `edge-cutover.example.json` as the exact operator worksheet. Use a locked-down curl config or
-credential helper for the Cloudflare `Authorization` header; never place the token directly on
-the command line. The signed edge JSON is validated by
-`edge_evidence.py` and binds the Pages snapshot, Cloudflare record identities, open authority
-grant, route prepare receipt, purge, and dual-stack probes.
-
-Finalize only after the external evidence exists:
+Finalize validates that signed v2 pre-open evidence before any exposure change, repeats runtime and
+the database/public/database closed bracket, validates the pinned up/down SQL, and atomically writes
+`finalizing_route_armed`. Only then is the `rikune-root` row inserted as the final exposure
+mutation. Verification accepts only a same-round IPv4+IPv6 anonymous `302` to
+`https://sso.w33d.xyz/authorize...` where every `Cache-Control` field is exactly the
+`private,no-store` directive set. Both closed and open checks retry for at least 70 seconds to
+cover Sluice's reload window, and the open probe is bracketed by exact database route checks.
 
 ```sh
 ROUTES_DATABASE_URL='supplied by route authority' ./open-ingress.sh --execute --phase finalize \
@@ -145,24 +140,43 @@ ROUTES_DATABASE_URL='supplied by route authority' ./open-ingress.sh --execute --
   --authority-evidence /secure/release/authority-open.json \
   --authority-signature /secure/release/authority-open.sig \
   --authority-public-key /secure/release/release-authority.pub \
-  --edge-evidence /secure/release/edge-cutover.json \
-  --edge-signature /secure/release/edge-cutover.sig
+  --edge-evidence /secure/release/edge-preopen.json \
+  --edge-signature /secure/release/edge-preopen.sig
 ```
 
-Finalize rechecks the route, all seven service containers/digests, Access/Verdict/NewAPI/Sluice,
-bridge and Strad readiness, the actual model alias, and live IPv4/IPv6 origin/cache headers. The
-state machine and shared flock reject concurrent or repeated opens.
+Every ordinary failure after arming runs the exact down path plus the closed
+database/public/database bracket. It writes an immutable interrupted receipt and restores
+`edge_prepared_route_closed`. A `SIGKILL` leaves `finalizing_route_armed`; the next invocation
+closes and verifies the route before release revalidation, records the interruption, restores the
+prepared state, and refuses that invocation. If any compensation check cannot be proven, the state
+is atomically changed to `ingress_compensation_unverified`; further finalize attempts are
+prohibited until the rollback close ceremony resolves the route.
+
+For direct diagnostics, the public verifier requires an explicit mode:
+
+```sh
+./public-origin-verify.sh --mode closed --url https://analyze.w33d.xyz/
+./public-origin-verify.sh --mode open --url https://analyze.w33d.xyz/
+```
+
+Closed mode requires same-round dual-stack `404`, HSTS, `nosniff`, `SAMEORIGIN`,
+`strict-origin-when-cross-origin`, safe handling of every Cache-Control field, and no
+Pages/Fastly markers. Open mode requires the exact trusted SSO redirect and private/no-store
+contract above.
 
 ## Rollback ceremony
 
 Do **not** pre-create revocation evidence. Rollback ordering is enforced:
 
-1. close and verify the route;
-2. revoke the exact `source_grant_id` from the signed open ceremony;
-3. wait for and acknowledge all seven tombstones/epochs;
-4. if public cutover occurred, restore the original Pages `main:/docs` cname and original
-   Cloudflare record, purge again, and prove IPv4/IPv6 Pages ownership;
-5. restore PostgreSQL, six volume dispositions, and the mixed-state estate.
+1. snapshot every route row with name `rikune-root` or the `analyze.w33d.xyz` root match;
+2. delete both the same-name row and any conflicting analyze-root owner under the route advisory
+   lock, then prove `absent -> dual-stack 404 -> absent`;
+3. write the immutable route-close receipt and revoke the exact `source_grant_id`;
+4. wait for and acknowledge all seven tombstones/epochs;
+5. if the route may have been public, sign v2 rollback evidence proving only the same dual-stack
+   route-absent `404` state; no Pages, Cloudflare, or DNS restore exists;
+6. restore PostgreSQL, six volume dispositions, and the mixed-state estate while continuing to
+   verify the public route remains closed.
 
 Create the route-close receipt first:
 
@@ -175,14 +189,15 @@ ROUTES_DATABASE_URL='supplied by route authority' ./rollback.sh --execute --phas
   --authority-public-key /secure/release/release-authority.pub
 ```
 
-This phase is also valid from `applied_ingress_closed`: the down migration and absence probe still
-create the immutable first receipt before the same grant is revoked, so an operator can recover an
-applied release without ever exposing the public route.
+The close phase is valid from `ingress_open`, `finalizing_route_armed`,
+`ingress_compensation_unverified`, `edge_prepared_route_closed`, or
+`applied_ingress_closed`. `ROUTE-CLOSE-PREIMAGE.jsonl` preserves the complete pre-delete rows,
+including drift, before the fail-closed conflict cleanup.
 
-Now populate and sign `authority-rollback.example.json`. It must bind the immutable
-`ROUTE-CLOSE.receipt` hash/time and open evidence hash, name the same grant, and timestamp every
-tombstone after grant revocation. If the public edge was opened, separately sign Pages/Cloudflare
-restore evidence using `edge-rollback.example.json`. Then execute recovery:
+Populate and sign `authority-rollback.example.json` only after route close. If
+`was_public_open=true`, also populate and sign `edge-rollback.example.json`; it binds the v2
+pre-open evidence, route-close receipt, revocation evidence, same source grant, exact host/edge,
+empty external-mutation list, and two post-revocation `404` probes.
 
 ```sh
 ROUTES_DATABASE_URL='supplied by route authority' ./rollback.sh --execute --phase execute \
@@ -193,7 +208,7 @@ ROUTES_DATABASE_URL='supplied by route authority' ./rollback.sh --execute --phas
   --authority-public-key /secure/release/release-authority.pub \
   --revocation-evidence /secure/release/authority-rollback.json \
   --revocation-signature /secure/release/authority-rollback.sig \
-  --open-edge-evidence /secure/release/edge-cutover.json \
+  --open-edge-evidence /secure/release/edge-preopen.json \
   --edge-rollback-evidence /secure/release/edge-rollback.json \
   --edge-rollback-signature /secure/release/edge-rollback.sig \
   --activate-services

@@ -7,41 +7,43 @@ SET LOCAL statement_timeout = '60s';
 SELECT pg_advisory_xact_lock(hashtextextended('holdfast:rikune-root', 0));
 LOCK TABLE routes IN SHARE ROW EXCLUSIVE MODE;
 
+CREATE TEMP TABLE holdfast_rikune_root_rollback_preimage ON COMMIT DROP AS
+SELECT to_jsonb(route) AS route
+  FROM routes AS route
+ WHERE route.name = 'rikune-root'
+    OR (route.host = 'analyze.w33d.xyz' AND route.path_prefix = '/');
+
+COPY (
+    SELECT jsonb_build_object(
+               'schema_version', 1,
+               'event', 'rikune-root-rollback-predelete-summary',
+               'row_count', count(*)
+           )::TEXT
+      FROM holdfast_rikune_root_rollback_preimage
+) TO STDOUT;
+
+COPY (
+    SELECT jsonb_build_object(
+               'schema_version', 1,
+               'event', 'rikune-root-rollback-predelete-row',
+               'route', route
+           )::TEXT
+      FROM holdfast_rikune_root_rollback_preimage
+     ORDER BY route->>'name', route->>'host', route->>'path_prefix', route::TEXT
+) TO STDOUT;
+
+DELETE FROM routes
+ WHERE name = 'rikune-root'
+    OR (host = 'analyze.w33d.xyz' AND path_prefix = '/');
+
 DO $$
 BEGIN
     IF EXISTS (
         SELECT 1
           FROM routes
          WHERE name = 'rikune-root'
-           AND (host, path_prefix, upstream, protected, auth, waf, require_group,
-                internal_only, require_permission, permission_resource, risk, require_scope)
-               IS DISTINCT FROM
-               ('rikune.w33d.xyz', '/', 'http://strad:9360', TRUE, 'sso', FALSE, '',
-                FALSE, 'rikune.console.enter', 'route:rikune-root', 'critical', '')
+            OR (host = 'analyze.w33d.xyz' AND path_prefix = '/')
     ) THEN
-        RAISE EXCEPTION 'rikune-root authority drifted; refusing rollback';
-    END IF;
-END
-$$;
-
-DELETE FROM routes
- WHERE name = 'rikune-root'
-   AND host = 'rikune.w33d.xyz'
-   AND path_prefix = '/'
-   AND upstream = 'http://strad:9360'
-   AND protected = TRUE
-   AND auth = 'sso'
-   AND waf = FALSE
-   AND require_group = ''
-   AND internal_only = FALSE
-   AND require_permission = 'rikune.console.enter'
-   AND permission_resource = 'route:rikune-root'
-   AND risk = 'critical'
-   AND require_scope = '';
-
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM routes WHERE name = 'rikune-root') THEN
         RAISE EXCEPTION 'rikune-root rollback verification failed';
     END IF;
 END

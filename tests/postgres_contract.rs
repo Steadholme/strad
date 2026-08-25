@@ -1497,7 +1497,7 @@ fn bridge_test_config(database_url: &str, bridge_url: &str, root: &std::path::Pa
         rikune_file_server_api_key: "f".repeat(32),
         upload_root: root.join("uploads"),
         template_root: root.join("templates"),
-        canonical_host: "rikune.w33d.xyz".into(),
+        canonical_host: "analyze.w33d.xyz".into(),
         canonical_route: "rikune-root".into(),
         expected_zone: "external".into(),
         session_lease: std::time::Duration::from_secs(1800),
