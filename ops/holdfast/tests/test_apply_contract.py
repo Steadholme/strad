@@ -156,6 +156,77 @@ class ApplyContractTests(unittest.TestCase):
             example.read_text(encoding="utf-8"),
             "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=7\n",
         )
+        self.assertEqual(
+            render.parse_checksum_manifest(OPS_ROOT / "static-targets.sha256")[
+                "deploy/access-governance.env.example"
+            ],
+            "582a5244edabaafb82fc6214a8f6cf50abc32d232697e5acedb973aa28bb0c6c",
+        )
+
+    def test_compose_renderer_sets_access_bootstrap_version_7(self) -> None:
+        stage = self.root / "compose-stage"
+        deploy = stage / "deploy"
+        deploy.mkdir(parents=True)
+        compose = deploy / "docker-compose.yml"
+        compose.write_text(
+            "services:\n"
+            "  sluice:\n"
+            "    image: steadholme/sluice:share-room-assets-20260821\n"
+            "    environment:\n"
+            "      GATEWAY_HMAC_KEY: ${GATEWAY_HMAC_KEY}\n"
+            "      GATEWAY_ZONE_HMAC_KEY: ${GATEWAY_ZONE_HMAC_KEY}\n"
+            "  sluice-internal:\n"
+            "    image: steadholme/sluice:share-room-assets-20260821\n"
+            "    environment:\n"
+            "      GATEWAY_HMAC_KEY: ${GATEWAY_HMAC_KEY}\n"
+            "      GATEWAY_ZONE_HMAC_KEY: ${GATEWAY_ZONE_HMAC_KEY}\n"
+            "  newapi:\n"
+            "    image: steadholme/newapi@sha256:"
+            "b864dc5a347c91ee60b5bab045fefc60f116bda75eb4c695d0c1305ef4981a7f\n"
+            "    environment:\n"
+            "      RELAY_SERVICE_KEYS: grimoire=${GRIMOIRE_RELAY_KEY},"
+            "familiar=${FAMILIAR_RELAY_KEY},warden=${WARDEN_RELAY_KEY},"
+            "canvas=${CANVAS_RELAY_KEY}\n"
+            "  verdict:\n"
+            "    image: steadholme/verdict:web-assets-20260821\n"
+            "    networks:\n"
+            "      - hf-cpa-mgmt\n"
+            "  access-governance:\n"
+            "    build:\n"
+            "      context: ../access-governance\n"
+            "    image: steadholme/access-governance:uiux-20260823-r2\n"
+            "    environment:\n"
+            "      GATEWAY_HMAC_KEY: ${GATEWAY_HMAC_KEY}\n"
+            "      GATEWAY_ZONE_HMAC_KEY: ${GATEWAY_ZONE_HMAC_KEY}\n"
+            "      ACCESS_GOVERNANCE_BOOTSTRAP_VERSION: "
+            "${ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-5}\n"
+            "  ark:\n"
+            "    image: fixture\n"
+            "networks:\n"
+            "  # Access capability snapshots are shared only with managed downstream PEPs.\n"
+            "  hf-iga:\n"
+            "    driver: bridge\n"
+            "    internal: true\n"
+            "volumes:\n"
+            "  pgdata:\n",
+            encoding="utf-8",
+        )
+
+        render.render_compose(stage)
+
+        rendered = compose.read_text(encoding="utf-8")
+        self.assertIn(
+            "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION: "
+            "${ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-7}",
+            rendered,
+        )
+        self.assertNotIn("ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-5", rendered)
+        self.assertEqual(
+            render.parse_checksum_manifest(OPS_ROOT / "static-targets.sha256")[
+                "deploy/docker-compose.yml"
+            ],
+            "f95398a0f7a383e51797c67595e0097f0905b9f187fb9ed5fce3423da1f0eec0",
+        )
 
     def test_repository_package_shape_is_part_of_the_frozen_render_contract(self) -> None:
         relative = "access-governance/src/repository/postgres.rs"
