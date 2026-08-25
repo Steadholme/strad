@@ -52,7 +52,7 @@ jobs:
       - name: Test frontend contracts
         run: node --test tests/frontend/*.test.js
       - name: Test Holdfast tooling
-        run: python3 -m unittest discover -s ops/holdfast/tests -v
+        run: sudo python3 -m unittest discover -s ops/holdfast/tests -v
 
   postgres-contract:
     name: PostgreSQL / ${{ matrix.test }}
