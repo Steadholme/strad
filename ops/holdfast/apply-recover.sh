@@ -812,6 +812,114 @@ fi
 
 runtime_restore=$(test_override HOLDFAST_RUNTIME_RESTORE_BIN "$script_dir/runtime-restore.sh")
 runtime_verify=$(test_override HOLDFAST_RUNTIME_VERIFY_BIN "$script_dir/runtime-verify.sh")
+recovery_compose_root="$estate_root"
+
+validate_recovery_stage_authority() {
+  local armed_dry caller_dry recovery_stage resolved_config expected key value
+  local target_line target_path
+  local -A target_paths=()
+
+  [[ "$early_bound_contract" == "true" ]] || \
+    holdfast_die "armed recovery lacks an early-bound staged Compose authority"
+  require_root_file "$runtime_caller_receipt"
+  grep -Fqx "$(holdfast_sha256 "$runtime_caller_receipt")  RUNTIME-BACKUP-CALLER-ARMED.receipt" \
+    "$backup/CONTROL.sha256" || \
+    holdfast_die "CONTROL does not bind the runtime backup caller receipt"
+
+  armed_dry=$(holdfast_receipt_value "$armed_receipt" dry_run_dir)
+  caller_dry=$(holdfast_receipt_value "$runtime_caller_receipt" dry_run_dir)
+  holdfast_require_absolute "$armed_dry"
+  holdfast_require_absolute "$caller_dry"
+  [[ "$armed_dry" == "$caller_dry" ]] || \
+    holdfast_die "armed recovery staged Compose roots differ"
+  recovery_stage="$armed_dry/stage"
+  [[ "$(readlink -m -- "$recovery_stage")" == "$recovery_stage" ]] || \
+    holdfast_die "recovery staged Compose root is not canonical"
+
+  [[ "$(holdfast_receipt_value "$armed_receipt" runtime_backup_caller_armed_sha256)" == \
+    "$(holdfast_sha256 "$runtime_caller_receipt")" ]] || \
+    holdfast_die "armed runtime backup caller authority differs"
+  [[ "$(holdfast_receipt_value "$armed_receipt" runtime_backup_stop_authority_sha256)" == \
+    "$(holdfast_sha256 "$backup/runtime/RUNTIME-BACKUP-ARMED.receipt")" ]] || \
+    holdfast_die "armed runtime stop authority differs"
+  for expected in \
+    "schema_version=2" "estate_root=$estate_root" "dry_run_dir=$armed_dry" \
+    "backup_dir=$backup" "runtime_backup_dir=$backup/runtime" \
+    "release_env_sha256=$release_env_sha" \
+    "release_evidence_sha256=$release_evidence_sha" \
+    "dry_run_receipt_sha256=$dry_receipt_sha" \
+    "targets_sha256=$(holdfast_sha256 "$backup/TARGETS.sha256")" \
+    "apply_preimages_sha256=$(holdfast_sha256 "$backup/APPLY-PREIMAGES.sha256")" \
+    "apply_absent_sha256=$(holdfast_sha256 "$backup/APPLY-ABSENT.paths")" \
+    "render_inputs_sha256=$(holdfast_sha256 "$backup/RENDER-INPUTS.sha256")" \
+    "runtime_backup_armed_receipt=runtime/RUNTIME-BACKUP-ARMED.receipt" \
+    "stop_authority_contract=absence-means-stop-not-started" "ingress_opened=false"; do
+    key=${expected%%=*}
+    value=${expected#*=}
+    [[ "$(holdfast_receipt_value "$runtime_caller_receipt" "$key")" == "$value" ]] || \
+      holdfast_die "runtime backup caller staged authority differs: $key"
+  done
+
+  for directory in "$armed_dry" "$recovery_stage" "$recovery_stage/deploy"; do
+    require_canonical_root_dir "$directory"
+    [[ -z "$(find "$directory" -maxdepth 0 -perm /077 -print -quit)" ]] || \
+      holdfast_die "recovery staged Compose directories must be private"
+  done
+  [[ -z "$(find "$recovery_stage" -xdev -type l -print -quit)" ]] || \
+    holdfast_die "recovery stage contains a symlink"
+  [[ -z "$(find "$recovery_stage" -xdev ! -user root -print -quit)" ]] || \
+    holdfast_die "recovery stage contains a non-root-owned entry"
+  [[ -z "$(find "$recovery_stage" -xdev ! -type d ! -type f -print -quit)" ]] || \
+    holdfast_die "recovery stage contains a special file"
+  for file in "$recovery_stage/TARGETS.sha256" \
+    "$recovery_stage/deploy/docker-compose.yml" "$recovery_stage/deploy/.env"; do
+    require_root_file "$file"
+  done
+  cmp -s -- "$recovery_stage/TARGETS.sha256" "$backup/TARGETS.sha256" || \
+    holdfast_die "recovery stage target manifest differs from its armed copy"
+
+  while IFS= read -r target_line; do
+    [[ "$target_line" =~ ^[0-9a-f]{64}[[:space:]][[:space:]]([A-Za-z0-9._/-]+)$ ]] || \
+      holdfast_die "recovery stage target manifest contains an invalid line"
+    target_path=${BASH_REMATCH[1]}
+    [[ "$target_path" != /* && "$target_path" != ".." && "$target_path" != *"../"* ]] || \
+      holdfast_die "recovery stage target manifest contains an unsafe path"
+    [[ -z "${target_paths[$target_path]:-}" ]] || \
+      holdfast_die "recovery stage target manifest repeats a path"
+    target_paths[$target_path]=1
+  done <"$recovery_stage/TARGETS.sha256"
+  [[ -n "${target_paths[deploy/docker-compose.yml]:-}" && \
+    -n "${target_paths[deploy/.env]:-}" ]] || \
+    holdfast_die "recovery stage target manifest does not bind Compose and its env"
+  (cd "$recovery_stage" && sha256sum --check TARGETS.sha256)
+
+  umask 077
+  resolved_config=$(mktemp "${TMPDIR:-/var/tmp}/holdfast-recovery-compose.XXXXXX")
+  if ! "$docker_bin" compose --env-file "$recovery_stage/deploy/.env" \
+    -f "$recovery_stage/deploy/docker-compose.yml" config --format json >"$resolved_config"; then
+    rm -f -- "$resolved_config"
+    holdfast_die "could not resolve the recovery staged Compose authority"
+  fi
+  if ! python3 - "$resolved_config" "$backup/runtime/compose-config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def load(path: str) -> object:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+raise SystemExit(0 if load(sys.argv[1]) == load(sys.argv[2]) else 1)
+PY
+  then
+    rm -f -- "$resolved_config"
+    holdfast_die "recovery staged Compose differs from the frozen runtime authority"
+  fi
+  rm -f -- "$resolved_config"
+  recovery_compose_root="$recovery_stage"
+}
+
 compose=("$docker_bin" compose --env-file "$estate_root/deploy/.env" -f "$estate_root/deploy/docker-compose.yml")
 application_writers=(
   access-governance verdict newapi rikune-analyzer strad sluice sluice-internal
@@ -1728,6 +1836,11 @@ if [[ -n "$completed_state_match" ]]; then
   exit 0
 fi
 
+if [[ "$prior_state" != "apply_recovery_armed" && "$mode" == "restore" && \
+  "$transaction_is_preimage" != "true" && "$legacy_orphan" == "false" ]]; then
+  validate_recovery_stage_authority
+fi
+
 restore_running_writers=()
 restore_writers_manifest="none"
 restore_writers_sha="none"
@@ -2149,6 +2262,11 @@ else
   sync -f "$state_file"
 fi
 
+if [[ "$prior_state" == "apply_recovery_armed" && "$mode" == "restore" && \
+  "$transaction_is_preimage" != "true" && "$legacy_orphan" == "false" ]]; then
+  validate_recovery_stage_authority
+fi
+
 recovery_complete="false"
 failure_stage="recovery_armed"
 record_recovery_failure() {
@@ -2259,7 +2377,7 @@ if [[ "$mode" == "restore" ]]; then
     verify_live_disposition preimage
   else
     failure_stage="runtime_restore_after_writer_stop"
-    runtime_restore_args=(--execute --compose-root "$estate_root" --backup-dir "$backup/runtime")
+    runtime_restore_args=(--execute --compose-root "$recovery_compose_root" --backup-dir "$backup/runtime")
     if [[ "$legacy_empty_strad" == "true" ]]; then runtime_restore_args+=(--legacy-empty-strad); fi
     "$runtime_restore" "${runtime_restore_args[@]}"
     require_root_file "$backup/runtime/RESTORE.receipt"
@@ -2278,9 +2396,25 @@ if [[ "$mode" == "restore" ]]; then
     [[ "$(holdfast_receipt_value "$backup/runtime/RESTORE.receipt" database_restore)" == \
       "$expected_database_restore" ]] || holdfast_die "runtime restore database disposition differs"
     [[ "$(holdfast_receipt_value "$backup/runtime/RESTORE.receipt" runtime_writers_removed)" == "passed" && \
+      "$(holdfast_receipt_value "$backup/runtime/RESTORE.receipt" postgres_container_attestation)" == "passed" && \
+      "$(holdfast_receipt_value "$backup/runtime/RESTORE.receipt" postgres_pgdata_mount)" == "passed" && \
+      "$(holdfast_receipt_value "$backup/runtime/RESTORE.receipt" postgres_runtime_epoch_attestation)" == "passed" && \
       "$(holdfast_receipt_value "$backup/runtime/RESTORE.receipt" volume_mount_release)" == "passed" && \
       "$(holdfast_receipt_value "$backup/runtime/RESTORE.receipt" volume_count)" == "6" ]] || \
-      holdfast_die "runtime restore receipt lacks writer or volume proof"
+      holdfast_die "runtime restore receipt lacks writer, PostgreSQL, or volume proof"
+    runtime_postgres_container_id=$(holdfast_receipt_value \
+      "$backup/runtime/RESTORE.receipt" postgres_container_id)
+    runtime_postgres_config_hash=$(holdfast_receipt_value \
+      "$backup/runtime/RESTORE.receipt" postgres_config_hash)
+    runtime_postgres_started_at=$(holdfast_receipt_value \
+      "$backup/runtime/RESTORE.receipt" postgres_started_at)
+    runtime_postgres_restart_count=$(holdfast_receipt_value \
+      "$backup/runtime/RESTORE.receipt" postgres_restart_count)
+    [[ "$runtime_postgres_container_id" =~ ^[0-9a-f]{64}$ && \
+      "$runtime_postgres_config_hash" =~ ^[0-9a-f]{64}$ && \
+      "$runtime_postgres_started_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?Z$ && \
+      "$runtime_postgres_restart_count" =~ ^(0|[1-9][0-9]*)$ ]] || \
+      holdfast_die "runtime restore receipt has an invalid PostgreSQL epoch proof"
     runtime_restore_copy="$state_dir/RUNTIME-RESTORE-${attempt_id}-$(date -u +%Y%m%dT%H%M%S%N).receipt"
     [[ ! -e "$runtime_restore_copy" && ! -L "$runtime_restore_copy" ]] || holdfast_die "runtime restore snapshot already exists"
     install -o 0 -g 0 -m 0600 -- "$backup/runtime/RESTORE.receipt" "$runtime_restore_copy"

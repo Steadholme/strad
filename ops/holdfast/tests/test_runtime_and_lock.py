@@ -12,6 +12,8 @@ from pathlib import Path
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
+POSTGRES_CONTAINER_ID = "1" * 64
+REPLACEMENT_POSTGRES_CONTAINER_ID = "2" * 64
 
 
 def sha256(path: Path) -> str:
@@ -44,6 +46,9 @@ state_root = Path(os.environ.get("FAKE_DOCKER_STATE", "/tmp/holdfast-fake-docker
 stopped_file = state_root.with_suffix(".stopped")
 removed_file = state_root.with_suffix(".removed")
 health_inspects_file = state_root.with_suffix(".health-inspects")
+postgres_ps_count_file = state_root.with_suffix(".postgres-ps-count")
+default_postgres_container_id = "1" * 64
+replacement_postgres_container_id = "2" * 64
 
 
 def names(path):
@@ -72,6 +77,12 @@ def service_state(service):
 
 
 if args and args[0] == "compose":
+    if "config" in args and "--hash" in args:
+        print(
+            "postgres "
+            + os.environ.get("FAKE_FROZEN_POSTGRES_CONFIG_HASH", "c" * 64)
+        )
+        sys.exit(0)
     if "config" in args and "--format" in args:
         digest = "sha256:" + "a" * 64
         strad_dsn = os.environ.get(
@@ -82,18 +93,32 @@ if args and args[0] == "compose":
             "postgres": {
                 "image": "registry.invalid/postgres@" + digest,
                 "environment": {"POSTGRES_DB": "steadholme"},
+                "volumes": [
+                    {
+                        "type": "volume",
+                        "source": "pgdata",
+                        "target": "/var/lib/postgresql",
+                        "read_only": False,
+                    }
+                ],
             },
             "strad": {"environment": {"STRAD_DATABASE_URL": strad_dsn}},
             "rikune-analyzer": {"environment": {}},
         }
+        compose_pgdata = os.environ.get("FAKE_COMPOSE_PGDATA")
+        if compose_pgdata is not None:
+            services["postgres"]["environment"]["PGDATA"] = compose_pgdata
         if os.environ.get("FAKE_DUPLICATE_STRAD_DSN") == "1":
             services["unexpected-writer"] = {
                 "environment": {"DATABASE_URL": strad_dsn}
             }
+        if os.environ.get("FAKE_COMPOSE_SEMANTIC_DRIFT") == "1":
+            services["semantically-drifted-but-unrelated"] = {"environment": {}}
         print(json.dumps({
             "name": "steadholme",
             "services": services,
             "volumes": {name: {} for name in [
+                "pgdata",
                 "strad_uploads", "rikune_workspaces", "rikune_storage",
                 "rikune_state", "rikune_cache", "rikune_audit"
             ]},
@@ -140,20 +165,105 @@ if args and args[0] == "compose":
                 print(os.environ.get("FAKE_STRAD_USER_RELATIONS", "0"))
         sys.exit(0)
     sys.exit(0)
+if args[:2] == ["image", "inspect"]:
+    template = args[args.index("--format") + 1]
+    if "Config.Env" in template:
+        print(
+            os.environ.get(
+                "FAKE_POSTGRES_IMAGE_ENV",
+                json.dumps(["PGDATA=/var/lib/postgresql/18/docker"]),
+            )
+        )
+    else:
+        print(os.environ.get("FAKE_POSTGRES_IMAGE_ID", "sha256:" + "f" * 64))
+    sys.exit(0)
 if args and args[0] == "inspect":
     template = args[args.index("-f") + 1]
-    service = args[-1].removeprefix("cid-")
+    container = args[-1]
+    service = (
+        "postgres"
+        if len(container) == 64 and all(character in "0123456789abcdef" for character in container)
+        else container.removeprefix("cid-")
+    )
     if "State.Status" in template:
         print(service_state(service))
+    elif "State.StartedAt" in template:
+        count = (
+            int(postgres_ps_count_file.read_text(encoding="utf-8"))
+            if postgres_ps_count_file.exists()
+            else 0
+        )
+        change_at = int(os.environ.get("FAKE_POSTGRES_EPOCH_CHANGE_AT_PS", "-1"))
+        changed = change_at >= 0 and count >= change_at
+        print(
+            os.environ.get(
+                "FAKE_POSTGRES_CHANGED_STARTED_AT"
+                if changed
+                else "FAKE_POSTGRES_STARTED_AT",
+                "2026-08-25T12:00:01.000000000Z"
+                if changed
+                else "2026-08-25T12:00:00.000000000Z",
+            )
+        )
+    elif "RestartCount" in template:
+        count = (
+            int(postgres_ps_count_file.read_text(encoding="utf-8"))
+            if postgres_ps_count_file.exists()
+            else 0
+        )
+        change_at = int(os.environ.get("FAKE_POSTGRES_EPOCH_CHANGE_AT_PS", "-1"))
+        changed = change_at >= 0 and count >= change_at
+        print(
+            os.environ.get(
+                "FAKE_POSTGRES_CHANGED_RESTART_COUNT"
+                if changed
+                else "FAKE_POSTGRES_RESTART_COUNT",
+                "1" if changed else "0",
+            )
+        )
+    elif "com.docker.compose.config-hash" in template:
+        print(os.environ.get("FAKE_POSTGRES_CONFIG_HASH", "c" * 64))
     elif "State.Health" in template:
         delayed = int(os.environ.get("FAKE_HEALTH_STARTING_INSPECTIONS", "0"))
         count = int(health_inspects_file.read_text()) if health_inspects_file.exists() else 0
         health_inspects_file.write_text(str(count + 1), encoding="utf-8")
         print("starting" if count < delayed else "healthy")
     elif "Config.Image" in template:
-        print(images[service])
+        print(
+            images.get(
+                service,
+                os.environ.get(
+                    "FAKE_POSTGRES_CONTAINER_REF",
+                    "registry.invalid/postgres@sha256:" + "a" * 64,
+                ),
+            )
+        )
     elif ".Image" in template:
-        print("sha256:" + "f" * 64)
+        print(os.environ.get("FAKE_POSTGRES_CONTAINER_IMAGE_ID", "sha256:" + "f" * 64))
+    elif "json .Config.Env" in template:
+        print(
+            os.environ.get(
+                "FAKE_POSTGRES_CONTAINER_ENV",
+                json.dumps(["PGDATA=/var/lib/postgresql/18/docker"]),
+            )
+        )
+    elif "json .Mounts" in template:
+        print(
+            os.environ.get(
+                "FAKE_POSTGRES_MOUNTS",
+                json.dumps(
+                    [
+                        {
+                            "Type": "volume",
+                            "Name": "steadholme_pgdata",
+                            "Source": "/fake/steadholme_pgdata/_data",
+                            "Destination": "/var/lib/postgresql",
+                            "RW": True,
+                        }
+                    ]
+                ),
+            )
+        )
     sys.exit(0)
 if args[:2] == ["volume", "inspect"]:
     sys.exit(0 if os.environ.get("FAKE_VOLUME_STUCK") == "1" else 1)
@@ -163,15 +273,43 @@ if args[:2] == ["volume", "create"]:
 if args[:2] == ["volume", "rm"]:
     sys.exit(0)
 if args and args[0] == "ps" and "--filter" in args:
-    holder = os.environ.get("FAKE_VOLUME_HOLDER")
-    if holder:
-        print(holder)
+    filters = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "--filter"]
+    if "label=com.docker.compose.service=postgres" in filters:
+        containers = os.environ.get(
+            "FAKE_POSTGRES_CONTAINERS", default_postgres_container_id
+        )
+        count = int(postgres_ps_count_file.read_text()) if postgres_ps_count_file.exists() else 0
+        postgres_ps_count_file.write_text(str(count + 1), encoding="utf-8")
+        replace_after = int(os.environ.get("FAKE_POSTGRES_REPLACE_AFTER_PS", "-1"))
+        if replace_after >= 0 and count >= replace_after:
+            containers = os.environ.get(
+                "FAKE_REPLACEMENT_POSTGRES_CONTAINERS",
+                replacement_postgres_container_id,
+            )
+        for container in containers.split():
+            print(container)
+    else:
+        holder = os.environ.get("FAKE_VOLUME_HOLDER")
+        if holder:
+            print(holder)
     sys.exit(0)
 if args and args[0] == "run":
     if "-d" in args:
         print("probe-container")
     sys.exit(0)
-if args and args[0] in {"exec", "cp", "rm"}:
+if args and args[0] == "exec":
+    if "psql" in " ".join(args):
+        query = sys.stdin.read()
+        if "pg_stat_activity" in query:
+            print(os.environ.get("FAKE_STRAD_CONNECTIONS", "0"))
+        elif "pg_database" in query:
+            print(os.environ.get("FAKE_STRAD_DATABASE_COUNT", "1"))
+        elif "pg_tables" in query:
+            print(os.environ.get("FAKE_STRAD_PUBLIC_TABLES", "0"))
+        elif "pg_class" in query:
+            print(os.environ.get("FAKE_STRAD_USER_RELATIONS", "0"))
+    sys.exit(0)
+if args and args[0] in {"cp", "rm"}:
     sys.exit(0)
 sys.exit(0)
 '''
@@ -576,6 +714,8 @@ class RuntimeAndLockTests(unittest.TestCase):
         restore_receipt = (backup / "RESTORE.receipt").read_text()
         self.assertIn("database_restore=restored", restore_receipt)
         self.assertIn("runtime_writers_removed=passed", restore_receipt)
+        self.assertIn("postgres_container_attestation=passed", restore_receipt)
+        self.assertIn("postgres_pgdata_mount=passed", restore_receipt)
         calls = self.docker_log.read_text(encoding="utf-8")
         self.assertIn('exec pg_dump -U \\"$POSTGRES_USER\\" -d strad -Fc', calls)
         self.assertIn('dropdb --if-exists --maintenance-db postgres -U \\"$POSTGRES_USER\\" strad;', calls)
@@ -875,6 +1015,504 @@ class RuntimeAndLockTests(unittest.TestCase):
         calls = self.docker_log.read_text()
         self.assertNotIn('"stop"', calls)
         self.assertNotIn('["volume", "rm"', calls)
+
+    def test_runtime_restore_attests_postgres_container_before_mutation(self) -> None:
+        backup = self.root / "runtime-backup-postgres-attestation"
+        base_env = self.runtime_environment(FAKE_NO_SERVICES="1")
+        made = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-backup.sh"),
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=base_env,
+        )
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+
+        digest = "sha256:" + "b" * 64
+        image_id = "sha256:" + "e" * 64
+        correct_mount = {
+            "Type": "volume",
+            "Name": "steadholme_pgdata",
+            "Source": "/fake/steadholme_pgdata/_data",
+            "Destination": "/var/lib/postgresql",
+            "RW": True,
+        }
+        cases = (
+            ("zero-container", {"FAKE_POSTGRES_CONTAINERS": ""}, "exactly one"),
+            (
+                "multi-line-frozen-config-hash",
+                {
+                    "FAKE_FROZEN_POSTGRES_CONFIG_HASH": (
+                        f"{'c' * 64}\npostgres {'c' * 64}"
+                    )
+                },
+                "frozen PostgreSQL Compose config hash is invalid",
+            ),
+            (
+                "unsafe-container-id",
+                {"FAKE_POSTGRES_CONTAINERS": "cid-postgres"},
+                "identity is unsafe",
+            ),
+            (
+                "two-containers",
+                {
+                    "FAKE_POSTGRES_CONTAINERS": (
+                        f"{POSTGRES_CONTAINER_ID} {REPLACEMENT_POSTGRES_CONTAINER_ID}"
+                    )
+                },
+                "exactly one",
+            ),
+            (
+                "not-running",
+                {"FAKE_SERVICE_STATES": json.dumps({"postgres": "exited"})},
+                "is not running",
+            ),
+            (
+                "wrong-image-ref",
+                {"FAKE_POSTGRES_CONTAINER_REF": f"registry.invalid/postgres@{digest}"},
+                "image reference differs",
+            ),
+            (
+                "wrong-image-id",
+                {"FAKE_POSTGRES_CONTAINER_IMAGE_ID": image_id},
+                "image ID differs",
+            ),
+            (
+                "missing-config-hash",
+                {"FAKE_POSTGRES_CONFIG_HASH": ""},
+                "Compose config hash is missing or invalid",
+            ),
+            (
+                "wrong-config-hash",
+                {"FAKE_POSTGRES_CONFIG_HASH": "d" * 64},
+                "Compose config hash differs from frozen authority",
+            ),
+            (
+                "wrong-mount-source",
+                {
+                    "FAKE_POSTGRES_MOUNTS": json.dumps(
+                        [{**correct_mount, "Name": "retargeted_pgdata"}]
+                    )
+                },
+                "expected exactly one pgdata named-volume source",
+            ),
+            (
+                "wrong-mount-target",
+                {
+                    "FAKE_POSTGRES_MOUNTS": json.dumps(
+                        [{**correct_mount, "Destination": "/retargeted"}]
+                    )
+                },
+                "source, target, type, or RW disposition differs",
+            ),
+            (
+                "read-only-mount",
+                {
+                    "FAKE_POSTGRES_MOUNTS": json.dumps(
+                        [{**correct_mount, "RW": False}]
+                    )
+                },
+                "source, target, type, or RW disposition differs",
+            ),
+            (
+                "image-pgdata-missing",
+                {"FAKE_POSTGRES_IMAGE_ENV": "[]"},
+                "immutable image environment lacks PGDATA",
+            ),
+            (
+                "container-pgdata-missing",
+                {"FAKE_POSTGRES_CONTAINER_ENV": "[]"},
+                "container environment must contain exactly one PGDATA",
+            ),
+            (
+                "pgdata-drift",
+                {
+                    "FAKE_POSTGRES_CONTAINER_ENV": json.dumps(
+                        ["PGDATA=/retargeted/postgresql"]
+                    )
+                },
+                "container PGDATA differs",
+            ),
+            (
+                "pgdata-exact-shadow-mount",
+                {
+                    "FAKE_POSTGRES_MOUNTS": json.dumps(
+                        [
+                            correct_mount,
+                            {
+                                "Type": "volume",
+                                "Name": "shadow_pgdata",
+                                "Source": "/fake/shadow_pgdata/_data",
+                                "Destination": "/var/lib/postgresql/18/docker",
+                                "RW": True,
+                            },
+                        ]
+                    )
+                },
+                "additional container mount overlaps PGDATA",
+            ),
+            (
+                "pgdata-nested-shadow-mount",
+                {
+                    "FAKE_POSTGRES_MOUNTS": json.dumps(
+                        [
+                            correct_mount,
+                            {
+                                "Type": "volume",
+                                "Name": "nested_pgdata",
+                                "Source": "/fake/nested_pgdata/_data",
+                                "Destination": "/var/lib/postgresql/18/docker/nested",
+                                "RW": True,
+                            },
+                        ]
+                    )
+                },
+                "additional container mount overlaps PGDATA",
+            ),
+        )
+        command = [
+            "bash",
+            str(OPS_ROOT / "runtime-restore.sh"),
+            "--execute",
+            "--compose-root",
+            str(self.compose_root),
+            "--backup-dir",
+            str(backup),
+        ]
+        for name, extra, message in cases:
+            with self.subTest(name=name):
+                self.docker_log.write_text("", encoding="utf-8")
+                restored = subprocess.run(
+                    command,
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={**base_env, **extra},
+                )
+                self.assertNotEqual(
+                    restored.returncode, 0, restored.stdout + restored.stderr
+                )
+                self.assertIn(message, restored.stderr)
+                calls = self.docker_log.read_text(encoding="utf-8")
+                self.assertNotIn('"stop"', calls)
+                self.assertNotIn('["volume", "rm"', calls)
+                self.assertNotIn('"dropdb', calls)
+
+        self.docker_log.write_text("", encoding="utf-8")
+        restored = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=base_env,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        calls = [
+            json.loads(line)
+            for line in self.docker_log.read_text(encoding="utf-8").splitlines()
+        ]
+        mount_attestations = [
+            index
+            for index, args in enumerate(calls)
+            if args[:3] == ["inspect", "-f", "{{json .Mounts}}"]
+        ]
+        self.assertEqual(len(mount_attestations), 2)
+        writer_stop = next(
+            index
+            for index, args in enumerate(calls)
+            if args and args[0] == "compose" and "stop" in args
+        )
+        writer_remove = next(
+            index
+            for index, args in enumerate(calls)
+            if args and args[0] == "compose" and "rm" in args
+        )
+        first_database_command = next(
+            index
+            for index, args in enumerate(calls)
+            if args and args[0] == "exec"
+        )
+        first_volume_remove = next(
+            index for index, args in enumerate(calls) if args[:2] == ["volume", "rm"]
+        )
+        self.assertLess(mount_attestations[0], writer_stop)
+        self.assertLess(writer_remove, mount_attestations[1])
+        self.assertLess(mount_attestations[1], first_database_command)
+        self.assertLess(mount_attestations[1], first_volume_remove)
+        direct_database_execs = [args for args in calls if args and args[0] == "exec"]
+        self.assertTrue(direct_database_execs)
+        self.assertTrue(
+            all(args[2] == POSTGRES_CONTAINER_ID for args in direct_database_execs)
+        )
+        self.assertFalse(
+            any(
+                args and args[0] == "compose" and "exec" in args and "postgres" in args
+                for args in calls
+            )
+        )
+        postgres_enumerations = [
+            args
+            for args in calls
+            if args
+            and args[0] == "ps"
+            and "label=com.docker.compose.service=postgres" in args
+        ]
+        self.assertTrue(postgres_enumerations)
+        self.assertTrue(all("--no-trunc" in args for args in postgres_enumerations))
+
+    def test_runtime_restore_accepts_explicit_pgdata_over_image_default(self) -> None:
+        backup = self.root / "runtime-backup-explicit-pgdata"
+        pgdata = "/var/lib/postgresql/compose-override"
+        env = self.runtime_environment(
+            FAKE_NO_SERVICES="1",
+            FAKE_COMPOSE_PGDATA=pgdata,
+            FAKE_POSTGRES_IMAGE_ENV="[]",
+            FAKE_POSTGRES_CONTAINER_ENV=json.dumps([f"PGDATA={pgdata}"]),
+        )
+        made = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-backup.sh"),
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+
+        restored = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-restore.sh"),
+                "--execute",
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+
+    def test_runtime_restore_rejects_epoch_change_at_second_gate_before_data_mutation(
+        self,
+    ) -> None:
+        backup = self.root / "runtime-backup-second-gate-epoch"
+        base_env = self.runtime_environment(FAKE_NO_SERVICES="1")
+        made = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-backup.sh"),
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=base_env,
+        )
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        self.docker_log.write_text("", encoding="utf-8")
+
+        restored = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-restore.sh"),
+                "--execute",
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**base_env, "FAKE_POSTGRES_EPOCH_CHANGE_AT_PS": "2"},
+        )
+        self.assertNotEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        self.assertIn("epoch changed between attestations", restored.stderr)
+        calls = [
+            json.loads(line)
+            for line in self.docker_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertFalse(any(args and args[0] == "exec" for args in calls))
+        self.assertFalse(any(args[:2] == ["volume", "rm"] for args in calls))
+        self.assertFalse((backup / "RESTORE.receipt").exists())
+
+    def test_runtime_restore_rejects_epoch_change_after_destructive_exec_without_receipt(
+        self,
+    ) -> None:
+        backup = self.root / "runtime-backup-post-exec-epoch"
+        base_env = self.runtime_environment(FAKE_NO_SERVICES="1")
+        made = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-backup.sh"),
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=base_env,
+        )
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        self.docker_log.write_text("", encoding="utf-8")
+
+        restored = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-restore.sh"),
+                "--execute",
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**base_env, "FAKE_POSTGRES_EPOCH_CHANGE_AT_PS": "6"},
+        )
+        self.assertNotEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        self.assertIn("attested PostgreSQL container epoch changed", restored.stderr)
+        calls = [
+            json.loads(line)
+            for line in self.docker_log.read_text(encoding="utf-8").splitlines()
+        ]
+        destructive_execs = [
+            args
+            for args in calls
+            if args and args[0] == "exec" and "pg_restore" in " ".join(args)
+        ]
+        self.assertEqual(len(destructive_execs), 1)
+        self.assertEqual(destructive_execs[0][1:3], ["-i", POSTGRES_CONTAINER_ID])
+        self.assertFalse((backup / "RESTORE.receipt").exists())
+        self.assertEqual(list(backup.glob(".RESTORE.receipt.*")), [])
+
+    def test_runtime_restore_rejects_final_resolve_drift_before_mutation(self) -> None:
+        backup = self.root / "runtime-backup-final-resolve-drift"
+        base_env = self.runtime_environment(FAKE_NO_SERVICES="1")
+        made = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-backup.sh"),
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=base_env,
+        )
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        self.docker_log.write_text("", encoding="utf-8")
+
+        restored = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-restore.sh"),
+                "--execute",
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**base_env, "FAKE_COMPOSE_SEMANTIC_DRIFT": "1"},
+        )
+        self.assertNotEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        self.assertIn("resolved Compose differs from frozen authority", restored.stderr)
+        calls = [
+            json.loads(line)
+            for line in self.docker_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertFalse(any(args and args[0] == "exec" for args in calls))
+        self.assertFalse(
+            any(args and args[0] == "compose" and "stop" in args for args in calls)
+        )
+        self.assertFalse(any(args[:2] == ["volume", "rm"] for args in calls))
+
+    def test_runtime_restore_never_follows_a_replaced_postgres_container(self) -> None:
+        backup = self.root / "runtime-backup-postgres-replaced"
+        base_env = self.runtime_environment(FAKE_NO_SERVICES="1")
+        made = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-backup.sh"),
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=base_env,
+        )
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        self.docker_log.write_text("", encoding="utf-8")
+
+        restored = subprocess.run(
+            [
+                "bash",
+                str(OPS_ROOT / "runtime-restore.sh"),
+                "--execute",
+                "--compose-root",
+                str(self.compose_root),
+                "--backup-dir",
+                str(backup),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**base_env, "FAKE_POSTGRES_REPLACE_AFTER_PS": "2"},
+        )
+        self.assertNotEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        self.assertIn("attested PostgreSQL container identity changed", restored.stderr)
+        calls = [
+            json.loads(line)
+            for line in self.docker_log.read_text(encoding="utf-8").splitlines()
+        ]
+        direct_execs = [args for args in calls if args and args[0] == "exec"]
+        self.assertFalse(direct_execs)
+        self.assertFalse(any(args[:2] == ["volume", "rm"] for args in calls))
 
     def test_runtime_restore_adopts_the_callers_exact_lock_fd_without_deadlock(self) -> None:
         backup = self.root / "runtime-backup-inherited-lock"

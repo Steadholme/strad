@@ -13,6 +13,8 @@ from pathlib import Path
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
 RECOVER = OPS_ROOT / "apply-recover.sh"
+POSTGRES_CONTAINER_ID = "1" * 64
+POSTGRES_CONFIG_HASH = "c" * 64
 
 
 def sha256(path: Path) -> str:
@@ -193,10 +195,97 @@ class ApplyRecoveryTests(unittest.TestCase):
             )
         if (self.backup / "APPLY-ARMED.receipt").exists():
             names.append("APPLY-ARMED.receipt")
+        if (self.backup / "RUNTIME-BACKUP-CALLER-ARMED.receipt").exists():
+            names.append("RUNTIME-BACKUP-CALLER-ARMED.receipt")
         (self.backup / "CONTROL.sha256").write_text(
             "".join(f"{sha256(self.backup / name)}  {name}\n" for name in names),
             encoding="utf-8",
         )
+
+    @staticmethod
+    def replace_receipt_value(path: Path, key: str, value: str) -> None:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        matches = [index for index, line in enumerate(lines) if line.startswith(f"{key}=")]
+        if len(matches) != 1:
+            raise AssertionError(f"receipt key is not unique: {key}")
+        lines[matches[0]] = f"{key}={value}"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def install_modern_stage_authority(self) -> Path:
+        dry = self.root / "dry-run-modern"
+        stage = dry / "stage"
+        deploy = stage / "deploy"
+        deploy.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for directory in (dry, stage, deploy):
+            directory.chmod(0o700)
+
+        live_env = self.estate / "deploy/.env"
+        preimage_env = self.backup / "estate/tree/deploy/.env"
+        live_env.write_text("SAFE_STAGE=1\n", encoding="utf-8")
+        preimage_env.write_text("SAFE_STAGE=0\n", encoding="utf-8")
+        (deploy / "docker-compose.yml").write_bytes(self.new_content)
+        (deploy / ".env").write_bytes(live_env.read_bytes())
+
+        applied = self.backup / "estate/APPLIED-TARGETS.sha256"
+        preimages = self.backup / "estate/PREIMAGES.sha256"
+        applied.write_text(
+            f"{sha256(self.estate / 'deploy/docker-compose.yml')}  deploy/docker-compose.yml\n"
+            f"{sha256(live_env)}  deploy/.env\n",
+            encoding="utf-8",
+        )
+        preimages.write_text(
+            f"{sha256(self.backup / 'estate/tree/deploy/docker-compose.yml')}  deploy/docker-compose.yml\n"
+            f"{sha256(preimage_env)}  deploy/.env\n",
+            encoding="utf-8",
+        )
+        (self.backup / "estate/TRANSACTION.json").write_text(
+            json.dumps({"schema_version": 1, "state": "applied", "target_count": 2})
+            + "\n",
+            encoding="utf-8",
+        )
+        (self.backup / "TARGETS.sha256").write_bytes(applied.read_bytes())
+        (self.backup / "APPLY-PREIMAGES.sha256").write_bytes(preimages.read_bytes())
+        (stage / "TARGETS.sha256").write_bytes(applied.read_bytes())
+        (dry / "DRY-RUN.receipt").write_bytes(
+            (self.backup / "DRY-RUN.receipt").read_bytes()
+        )
+
+        self.replace_receipt_value(
+            self.backup / "DRY-RUN.receipt", "targets_sha256", sha256(applied)
+        )
+        self.replace_receipt_value(
+            self.backup / "DRY-RUN.receipt",
+            "apply_preimages_sha256",
+            sha256(self.backup / "APPLY-PREIMAGES.sha256"),
+        )
+        (dry / "DRY-RUN.receipt").write_bytes(
+            (self.backup / "DRY-RUN.receipt").read_bytes()
+        )
+
+        caller = self.backup / "RUNTIME-BACKUP-CALLER-ARMED.receipt"
+        caller_values = {
+            "schema_version": "2",
+            "armed_at": "2026-08-25T00:00:00Z",
+            "estate_root": str(self.estate),
+            "dry_run_dir": str(dry),
+            "backup_dir": str(self.backup),
+            "runtime_backup_dir": str(self.backup / "runtime"),
+            "release_env_sha256": sha256(self.backup / "release.env"),
+            "release_evidence_sha256": sha256(self.backup / "RELEASE-EVIDENCE.json"),
+            "dry_run_receipt_sha256": sha256(self.backup / "DRY-RUN.receipt"),
+            "targets_sha256": sha256(self.backup / "TARGETS.sha256"),
+            "apply_preimages_sha256": sha256(self.backup / "APPLY-PREIMAGES.sha256"),
+            "apply_absent_sha256": sha256(self.backup / "APPLY-ABSENT.paths"),
+            "render_inputs_sha256": sha256(self.backup / "RENDER-INPUTS.sha256"),
+            "runtime_backup_armed_receipt": "runtime/RUNTIME-BACKUP-ARMED.receipt",
+            "stop_authority_contract": "absence-means-stop-not-started",
+            "ingress_opened": "false",
+        }
+        caller.write_text(
+            "".join(f"{key}={value}\n" for key, value in caller_values.items()),
+            encoding="utf-8",
+        )
+        return dry
 
     def install_legacy_runtime(self) -> None:
         runtime = self.backup / "runtime"
@@ -347,6 +436,7 @@ class ApplyRecoveryTests(unittest.TestCase):
         )
 
     def install_activation_failed_state(self) -> Path:
+        dry = self.install_modern_stage_authority()
         armed = self.backup / "APPLY-ARMED.receipt"
         armed.write_text(
             "".join(
@@ -355,15 +445,18 @@ class ApplyRecoveryTests(unittest.TestCase):
                     "armed_at=2026-08-25T00:00:00Z\n",
                     f"estate_root={self.estate}\n",
                     f"backup_dir={self.backup}\n",
+                    f"dry_run_dir={dry}\n",
                     f"release_env_sha256={sha256(self.backup / 'release.env')}\n",
                     f"release_evidence_sha256={sha256(self.backup / 'RELEASE-EVIDENCE.json')}\n",
                     f"dry_run_receipt_sha256={sha256(self.backup / 'DRY-RUN.receipt')}\n",
-                    f"targets_sha256={sha256(self.backup / 'estate/APPLIED-TARGETS.sha256')}\n",
+                    f"targets_sha256={sha256(self.backup / 'TARGETS.sha256')}\n",
                     f"apply_preimages_sha256={sha256(self.backup / 'APPLY-PREIMAGES.sha256')}\n",
                     f"apply_absent_sha256={sha256(self.backup / 'APPLY-ABSENT.paths')}\n",
                     f"render_inputs_sha256={sha256(self.backup / 'RENDER-INPUTS.sha256')}\n",
                     f"runtime_backup_receipt_sha256={sha256(self.backup / 'runtime/BACKUP.receipt')}\n",
                     f"runtime_backup_manifest_sha256={sha256(self.backup / 'runtime/SHA256SUMS')}\n",
+                    f"runtime_backup_caller_armed_sha256={sha256(self.backup / 'RUNTIME-BACKUP-CALLER-ARMED.receipt')}\n",
+                    f"runtime_backup_stop_authority_sha256={sha256(self.backup / 'runtime/RUNTIME-BACKUP-ARMED.receipt')}\n",
                     "ingress_opened=false\n",
                 ]
             ),
@@ -415,6 +508,9 @@ class ApplyRecoveryTests(unittest.TestCase):
         )
         failure = self.install_activation_failed_state()
         (self.estate / "deploy/docker-compose.yml").write_bytes(self.old_content)
+        (self.estate / "deploy/.env").write_bytes(
+            (self.backup / "estate/tree/deploy/.env").read_bytes()
+        )
         (self.backup / "estate/TRANSACTION.json").write_text(
             json.dumps(
                 {
@@ -568,6 +664,10 @@ class ApplyRecoveryTests(unittest.TestCase):
             '  for service in $services; do printf "%s\\n" "$service"; done\n'
             '  exit 0\n'
             'fi\n'
+            'if [[ " $* " == *" compose "* && " $* " == *" config --format json "* ]]; then\n'
+            '  if [[ "${HOLDFAST_TEST_RESOLVED_CONFIG_DRIFT:-0}" == "1" ]]; then printf "{\\"name\\":\\"drift\\",\\"services\\":{},\\"volumes\\":{}}\\n"; else cat "$HOLDFAST_TEST_RUNTIME_CONFIG"; fi\n'
+            '  exit 0\n'
+            'fi\n'
             'if [[ " $* " == *" compose "* && " $* " == *" ps -aq "* ]]; then\n'
             '  service=${!#}\n'
             '  [[ "${HOLDFAST_TEST_DOCKER_PS_FAIL_SERVICE:-}" != "$service" ]] || exit 44\n'
@@ -628,7 +728,9 @@ class ApplyRecoveryTests(unittest.TestCase):
             'restore_mode="schema-v2"; database_restore="restored"\n'
             'if [[ "$legacy" == "true" ]]; then restore_mode="legacy-empty-strad"; database_restore="skipped_proven_empty"; fi\n'
             'if [[ "${HOLDFAST_TEST_BAD_RESTORE_RECEIPT:-0}" == "1" ]]; then database_restore="shared-database-restored"; fi\n'
-            'printf "schema_version=2\\nrestore_mode=%s\\ndatabase_identity=postgres:5432/strad\\ndatabase_restore=%s\\nruntime_writers_removed=passed\\nvolume_mount_release=passed\\nvolume_count=6\\n" "$restore_mode" "$database_restore" >"$backup/RESTORE.receipt"\n'
+            'postgres_started_at="2026-08-25T12:00:00.000000000Z"\n'
+            'if [[ "${HOLDFAST_TEST_BAD_RUNTIME_EPOCH_RECEIPT:-0}" == "1" ]]; then postgres_started_at="invalid"; fi\n'
+            f'printf "schema_version=2\\nrestore_mode=%s\\ndatabase_identity=postgres:5432/strad\\ndatabase_restore=%s\\nruntime_writers_removed=passed\\npostgres_container_attestation=passed\\npostgres_pgdata_mount=passed\\npostgres_runtime_epoch_attestation=passed\\npostgres_container_id={POSTGRES_CONTAINER_ID}\\npostgres_config_hash={POSTGRES_CONFIG_HASH}\\npostgres_started_at=%s\\npostgres_restart_count=0\\nvolume_mount_release=passed\\nvolume_count=6\\n" "$restore_mode" "$database_restore" "$postgres_started_at" >"$backup/RESTORE.receipt"\n'
             'chmod 0600 "$backup/RESTORE.receipt"\n',
         )
         self.runtime_verify = self.make_fake(
@@ -649,6 +751,9 @@ class ApplyRecoveryTests(unittest.TestCase):
             "HOLDFAST_RUNTIME_RESTORE_BIN": str(self.runtime_restore),
             "HOLDFAST_RUNTIME_VERIFY_BIN": str(self.runtime_verify),
             "HOLDFAST_TEST_LOG": str(self.log),
+            "HOLDFAST_TEST_RUNTIME_CONFIG": str(
+                self.backup / "runtime/compose-config.json"
+            ),
             "ROUTES_DATABASE_URL": "postgres://route-authority.invalid/routes",
             **extra,
         }
@@ -903,6 +1008,163 @@ class ApplyRecoveryTests(unittest.TestCase):
         final = json.loads((self.state / "CURRENT.json").read_text(encoding="utf-8"))
         self.assertEqual(final["state"], "applied_ingress_closed")
 
+    def test_modern_restore_uses_revalidated_staged_compose_authority(self) -> None:
+        dry = self.install_modern_stage_authority()
+        self.install_activation_failed_state()
+
+        restored = self.recover("restore")
+        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        runtime_call = next(
+            line
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+            if line.startswith("runtime-restore ")
+        )
+        self.assertIn(f"--compose-root {dry / 'stage'}", runtime_call)
+        self.assertNotIn(f"--compose-root {self.estate} ", runtime_call)
+
+    def test_modern_stage_path_hash_and_resolved_drift_fail_before_recovery_arm(
+        self,
+    ) -> None:
+        dry = self.install_modern_stage_authority()
+        self.install_activation_failed_state()
+        stage_compose = dry / "stage/deploy/docker-compose.yml"
+        original_compose = stage_compose.read_bytes()
+
+        cases = (
+            (
+                "path",
+                lambda: dry.chmod(0o755),
+                lambda: dry.chmod(0o700),
+                {},
+                "directories must be private",
+            ),
+            (
+                "target-hash",
+                lambda: stage_compose.write_bytes(b"name: changed-stage\n"),
+                lambda: stage_compose.write_bytes(original_compose),
+                {},
+                "FAILED",
+            ),
+            (
+                "resolved-config",
+                lambda: None,
+                lambda: None,
+                {"HOLDFAST_TEST_RESOLVED_CONFIG_DRIFT": "1"},
+                "staged Compose differs from the frozen runtime authority",
+            ),
+        )
+        for name, mutate, restore, extra_env, message in cases:
+            with self.subTest(name=name):
+                mutate()
+                rejected = self.recover("restore", env=self.environment(**extra_env))
+                restore()
+                self.assertNotEqual(
+                    rejected.returncode, 0, rejected.stdout + rejected.stderr
+                )
+                self.assertIn(message, rejected.stdout + rejected.stderr)
+                self.assertFalse(list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")))
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertFalse(any(line.startswith("runtime-restore ") for line in calls))
+
+    def test_modern_stage_roots_must_match_both_control_bound_receipts(self) -> None:
+        failure = self.install_activation_failed_state()
+        (self.state / "CURRENT.json").unlink()
+        failure.unlink()
+        caller = self.backup / "RUNTIME-BACKUP-CALLER-ARMED.receipt"
+        armed = self.backup / "APPLY-ARMED.receipt"
+        self.replace_receipt_value(
+            caller, "dry_run_dir", str(self.root / "different-dry-run")
+        )
+        self.replace_receipt_value(
+            armed, "runtime_backup_caller_armed_sha256", sha256(caller)
+        )
+        self.write_control()
+
+        rejected = self.recover("restore")
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn("staged Compose roots differ", rejected.stderr)
+        self.assertFalse(list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")))
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertFalse(any(line.startswith("runtime-restore ") for line in calls))
+
+    def test_modern_reconciled_restore_failure_retries_with_stage_authority(self) -> None:
+        dry = self.install_modern_stage_authority()
+        self.install_activation_failed_state()
+        running = "verdict rikune-analyzer sluice sluice-internal"
+        first = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES="rikune-analyzer",
+            ),
+        )
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        first_current = json.loads(
+            (self.state / "CURRENT.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            first_current["recovery_failure_stage"], "restore_prior_running_writers"
+        )
+        source_attempt = first_current["recovery_attempt_id"]
+        source_state = self.state / f"APPLY-RECOVERY-FAILED-{source_attempt}.json"
+        source_bytes = source_state.read_bytes()
+
+        second = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_PREIMAGE_COMPOSE_SERVICES="access-governance verdict newapi strad sluice sluice-internal",
+                HOLDFAST_TEST_RESTORE_FAIL="1",
+            ),
+        )
+        self.assertNotEqual(second.returncode, 0, second.stdout + second.stderr)
+        second_current = json.loads(
+            (self.state / "CURRENT.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            second_current["recovery_failure_stage"],
+            "runtime_restore_after_writer_stop",
+        )
+        self.assertTrue(second_current["writer_set_reconciled"])
+        self.assertEqual(second_current["writer_set_source_attempt"], source_attempt)
+        self.assertEqual(source_state.read_bytes(), source_bytes)
+        runtime_calls = [
+            line
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+            if line.startswith("runtime-restore ")
+        ]
+        self.assertEqual(len(runtime_calls), 2)
+        self.assertTrue(
+            all(f"--compose-root {dry / 'stage'}" in line for line in runtime_calls)
+        )
+
+    def test_sigkill_reentry_revalidates_stage_before_runtime_restore(self) -> None:
+        dry = self.install_modern_stage_authority()
+        self.install_activation_failed_state()
+        killed = self.recover(
+            "restore", env=self.environment(HOLDFAST_TEST_SIGKILL_RECOVERY="1")
+        )
+        self.assertNotEqual(killed.returncode, 0, killed.stdout + killed.stderr)
+        current = self.state / "CURRENT.json"
+        frozen_current = current.read_bytes()
+        runtime_calls_before = sum(
+            line.startswith("runtime-restore ")
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+        )
+        (dry / "stage/deploy/docker-compose.yml").write_text(
+            "name: tampered-after-sigkill\n", encoding="utf-8"
+        )
+
+        rejected = self.recover("restore")
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn("FAILED", rejected.stdout + rejected.stderr)
+        self.assertEqual(current.read_bytes(), frozen_current)
+        runtime_calls_after = sum(
+            line.startswith("runtime-restore ")
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(runtime_calls_after, runtime_calls_before)
+
     def test_control_live_and_runtime_drift_fail_before_recovery_arm(self) -> None:
         cases = (
             ("control", self.backup / "SUPPLY-CHAIN.json", b"tampered-control\n"),
@@ -940,6 +1202,17 @@ class ApplyRecoveryTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("database disposition differs", result.stderr)
+        current = json.loads((self.state / "CURRENT.json").read_text(encoding="utf-8"))
+        self.assertEqual(current["state"], "restore_failed")
+        self.assertFalse(list(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt")))
+
+    def test_runtime_restore_receipt_must_bind_a_valid_postgres_epoch(self) -> None:
+        result = self.recover(
+            "restore",
+            env=self.environment(HOLDFAST_TEST_BAD_RUNTIME_EPOCH_RECEIPT="1"),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid PostgreSQL epoch proof", result.stderr)
         current = json.loads((self.state / "CURRENT.json").read_text(encoding="utf-8"))
         self.assertEqual(current["state"], "restore_failed")
         self.assertFalse(list(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt")))
@@ -1653,11 +1926,11 @@ class ApplyRecoveryTests(unittest.TestCase):
 
         self.tearDown()
         self.setUp()
-        (self.backup / "TARGETS.sha256").write_bytes(
-            (self.backup / "estate/APPLIED-TARGETS.sha256").read_bytes()
-        )
-        (self.estate / "deploy/docker-compose.yml").write_bytes(self.old_content)
         failure = self.install_activation_failed_state()
+        (self.estate / "deploy/docker-compose.yml").write_bytes(self.old_content)
+        (self.estate / "deploy/.env").write_bytes(
+            (self.backup / "estate/tree/deploy/.env").read_bytes()
+        )
         (self.state / "CURRENT.json").unlink()
         failure.unlink()
         shutil.rmtree(self.backup / "estate")
@@ -1684,6 +1957,31 @@ class ApplyRecoveryTests(unittest.TestCase):
         self.assertIn("original_estate_transaction_state=rolled_back_after_failure", receipt)
         self.assertIn("runtime_restore_receipt_sha256=not-required", receipt)
         self.assertIn("estate_restore_state_sha256=not-required", receipt)
+
+    def test_preimage_writer_recovery_does_not_require_expired_stage(self) -> None:
+        self.install_estate_rollback_recovery_state()
+        armed = self.backup / "APPLY-ARMED.receipt"
+        dry = Path(
+            next(
+                line.split("=", 1)[1]
+                for line in armed.read_text(encoding="utf-8").splitlines()
+                if line.startswith("dry_run_dir=")
+            )
+        )
+        shutil.rmtree(dry)
+
+        restored = self.recover(
+            "restore",
+            env=self.environment(HOLDFAST_TEST_RUNNING_SERVICES="access-governance"),
+        )
+        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertFalse(any(line.startswith("runtime-restore ") for line in calls))
+        receipt = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt")).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("runtime_restore_receipt_sha256=not-required", receipt)
+        self.assertIn("writers_reactivated=passed", receipt)
 
     def test_interrupted_apply_finalization_converges_at_all_receipt_boundaries(self) -> None:
         for index, shape in enumerate(

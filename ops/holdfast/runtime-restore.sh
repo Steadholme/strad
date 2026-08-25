@@ -265,13 +265,38 @@ fi
 compose_source=("$docker_bin" compose --env-file "$compose_root/deploy/.env" -f "$compose_root/deploy/docker-compose.yml")
 umask 077
 current_config_temp=$(mktemp "${TMPDIR:-/var/tmp}/holdfast-runtime-restore-compose.XXXXXX")
-cleanup_current_config() { rm -f -- "$current_config_temp"; }
-trap cleanup_current_config EXIT
+restore_receipt_tmp=""
+cleanup_restore_temps() {
+  rm -f -- "$current_config_temp"
+  if [[ -n "$restore_receipt_tmp" ]]; then rm -f -- "$restore_receipt_tmp"; fi
+}
+trap cleanup_restore_temps EXIT
 "${compose_source[@]}" config --format json >"$current_config_temp"
 [[ "$(validate_strad_database_contract "$current_config_temp")" == "postgres:5432/strad" ]] || \
   holdfast_die "live Strad database identity differs"
-# Bind every mutation to the protected resolved document that passed validation.
-compose=("$docker_bin" compose -f "$current_config_temp")
+python3 - "$current_config_temp" "$backup/compose-config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def load(path: str) -> object:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+if load(sys.argv[1]) != load(sys.argv[2]):
+    raise SystemExit("runtime restore resolved Compose differs from frozen authority")
+PY
+# Bind every mutation to the checksum-protected frozen document after proving
+# that the caller's final resolve is semantically identical to it.
+compose=("$docker_bin" compose -f "$backup/compose-config.json")
+frozen_postgres_config_hash_output=$("${compose[@]}" config --hash postgres) || \
+  holdfast_die "could not resolve the frozen PostgreSQL Compose config hash"
+[[ "$frozen_postgres_config_hash_output" != *$'\n'* && \
+  "$frozen_postgres_config_hash_output" != *$'\r'* && \
+  "$frozen_postgres_config_hash_output" =~ ^postgres[[:space:]]([0-9a-f]{64})$ ]] || \
+  holdfast_die "frozen PostgreSQL Compose config hash is invalid"
+frozen_postgres_config_hash=${BASH_REMATCH[1]}
 volume_image=$(jq -er '.services["rikune-volume-init"].image' "$backup/compose-config.json")
 [[ "$volume_image" =~ @sha256:[0-9a-f]{64}$ ]] || holdfast_die "volume restore image is not immutable"
 
@@ -285,6 +310,296 @@ for logical in "${expected_volumes[@]}"; do
   [[ "${observed_actuals[$frozen_actual]:-}" == "$logical" ]] || \
     holdfast_die "runtime backup physical volume identity differs: $logical"
 done
+
+postgres_container_attestation="not-run"
+postgres_pgdata_mount="not-run"
+attested_postgres_id=""
+attested_postgres_project=""
+attested_postgres_config_hash=""
+attested_postgres_started_at=""
+attested_postgres_restart_count=""
+validate_postgres_runtime_authority() {
+  local frozen_config="$backup/compose-config.json"
+  local compose_project frozen_image_ref frozen_image_id container_output container_id
+  local container_status container_image_ref container_image_id container_config_hash
+  local container_started_at container_restart_count
+  local -a postgres_containers=() pgdata_contract=()
+
+  compose_project=$(jq -er '.name' "$frozen_config")
+  [[ "$compose_project" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]+$ ]] || \
+    holdfast_die "frozen PostgreSQL Compose project is unsafe"
+  frozen_image_ref=$(jq -er '.services.postgres.image' "$frozen_config")
+  [[ "$frozen_image_ref" =~ @sha256:[0-9a-f]{64}$ ]] || \
+    holdfast_die "frozen PostgreSQL image reference is not immutable"
+  frozen_image_id=$("$docker_bin" image inspect --format '{{.Id}}' "$frozen_image_ref") || \
+    holdfast_die "could not resolve the frozen PostgreSQL image ID"
+  [[ "$frozen_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+    holdfast_die "frozen PostgreSQL image ID is invalid"
+
+  container_output=$("$docker_bin" ps -aq --no-trunc \
+    --filter "label=com.docker.compose.project=$compose_project" \
+    --filter 'label=com.docker.compose.service=postgres') || \
+    holdfast_die "could not enumerate the PostgreSQL runtime authority"
+  if [[ -n "$container_output" ]]; then mapfile -t postgres_containers <<<"$container_output"; fi
+  ((${#postgres_containers[@]} == 1)) || \
+    holdfast_die "restore requires exactly one PostgreSQL container"
+  container_id=${postgres_containers[0]}
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || \
+    holdfast_die "PostgreSQL container identity is unsafe"
+
+  container_status=$("$docker_bin" inspect -f '{{.State.Status}}' "$container_id") || \
+    holdfast_die "could not inspect PostgreSQL container state"
+  [[ "$container_status" == "running" ]] || \
+    holdfast_die "PostgreSQL container is not running"
+  container_started_at=$("$docker_bin" inspect -f '{{.State.StartedAt}}' "$container_id") || \
+    holdfast_die "could not inspect PostgreSQL container start epoch"
+  [[ "$container_started_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?Z$ ]] || \
+    holdfast_die "PostgreSQL container start epoch is invalid"
+  container_restart_count=$("$docker_bin" inspect -f '{{.RestartCount}}' "$container_id") || \
+    holdfast_die "could not inspect PostgreSQL container restart count"
+  [[ "$container_restart_count" =~ ^(0|[1-9][0-9]*)$ ]] || \
+    holdfast_die "PostgreSQL container restart count is invalid"
+  container_config_hash=$("$docker_bin" inspect -f \
+    '{{ index .Config.Labels "com.docker.compose.config-hash" }}' "$container_id") || \
+    holdfast_die "could not inspect PostgreSQL container Compose config hash"
+  [[ "$container_config_hash" =~ ^[0-9a-f]{64}$ ]] || \
+    holdfast_die "PostgreSQL container Compose config hash is missing or invalid"
+  [[ "$container_config_hash" == "$frozen_postgres_config_hash" ]] || \
+    holdfast_die "PostgreSQL container Compose config hash differs from frozen authority"
+  container_image_ref=$("$docker_bin" inspect -f '{{.Config.Image}}' "$container_id") || \
+    holdfast_die "could not inspect PostgreSQL container image reference"
+  [[ "$container_image_ref" == "$frozen_image_ref" ]] || \
+    holdfast_die "PostgreSQL container image reference differs from frozen authority"
+  container_image_id=$("$docker_bin" inspect -f '{{.Image}}' "$container_id") || \
+    holdfast_die "could not inspect PostgreSQL container image ID"
+  [[ "$container_image_id" == "$frozen_image_id" ]] || \
+    holdfast_die "PostgreSQL container image ID differs from frozen authority"
+
+  mapfile -t pgdata_contract < <(python3 - "$frozen_config" \
+    <("$docker_bin" image inspect --format '{{json .Config.Env}}' "$frozen_image_ref") <<'PY'
+import json
+import posixpath
+import re
+import sys
+from pathlib import Path
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"runtime PostgreSQL contract: {message}")
+
+
+def canonical_path(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.startswith("/"):
+        fail(f"{label} must be an absolute path")
+    normalized = posixpath.normpath(value)
+    if normalized != value or any(ord(character) < 32 for character in value):
+        fail(f"{label} must be canonical")
+    return value
+
+
+def env_value(values: object, label: str) -> str | None:
+    if values is None:
+        values = []
+    if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+        fail(f"{label} environment is malformed")
+    matches = [item.split("=", 1)[1] for item in values if item.startswith("PGDATA=")]
+    if len(matches) > 1:
+        fail(f"{label} environment repeats PGDATA")
+    return matches[0] if matches else None
+
+
+def overlaps(left: str, right: str) -> bool:
+    return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+
+
+document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+image_environment = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+project = document.get("name")
+services = document.get("services")
+volumes = document.get("volumes")
+if not isinstance(project, str) or not isinstance(services, dict) or not isinstance(volumes, dict):
+    fail("frozen Compose document is malformed")
+postgres = services.get("postgres")
+mounts = postgres.get("volumes") if isinstance(postgres, dict) else None
+if not isinstance(mounts, list):
+    fail("frozen PostgreSQL service lacks a volume contract")
+environment = postgres.get("environment") if isinstance(postgres, dict) else None
+if not isinstance(environment, dict):
+    fail("frozen PostgreSQL environment is malformed")
+compose_pgdata = environment.get("PGDATA")
+if compose_pgdata is not None:
+    expected_pgdata = canonical_path(compose_pgdata, "frozen PostgreSQL PGDATA")
+else:
+    image_pgdata = env_value(image_environment, "immutable image")
+    if image_pgdata is None:
+        fail("immutable image environment lacks PGDATA")
+    expected_pgdata = canonical_path(image_pgdata, "immutable image PGDATA")
+
+normalized_mounts: list[tuple[dict[str, object], str]] = []
+for mount in mounts:
+    if not isinstance(mount, dict):
+        fail("frozen PostgreSQL mount is malformed")
+    target = canonical_path(mount.get("target"), "frozen PostgreSQL mount target")
+    normalized_mounts.append((mount, target))
+matches = [
+    (mount, target)
+    for mount, target in normalized_mounts
+    if mount.get("source") == "pgdata"
+    and mount.get("type") == "volume"
+    and mount.get("read_only", False) is False
+    and (target == expected_pgdata or expected_pgdata.startswith(target + "/"))
+]
+if len(matches) != 1:
+    fail("expected exactly one writable pgdata volume covering PGDATA")
+mount, expected_target = matches[0]
+for candidate, target in normalized_mounts:
+    if candidate is not mount and overlaps(target, expected_pgdata):
+        fail("frozen PostgreSQL mount overlaps PGDATA")
+definition = volumes.get("pgdata")
+if not isinstance(definition, dict):
+    fail("frozen Compose lacks the pgdata named volume")
+actual = definition.get("name", f"{project}_pgdata")
+if not isinstance(actual, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]+", actual) is None:
+    fail("frozen pgdata physical volume identity is unsafe")
+print(actual)
+print(expected_target)
+print(expected_pgdata)
+PY
+  )
+  ((${#pgdata_contract[@]} == 3)) || \
+    holdfast_die "frozen PostgreSQL pgdata contract is incomplete"
+  python3 - "${pgdata_contract[0]}" "${pgdata_contract[1]}" \
+    "${pgdata_contract[2]}" \
+    <("$docker_bin" inspect -f '{{json .Config.Env}}' "$container_id") \
+    <("$docker_bin" inspect -f '{{json .Mounts}}' "$container_id") <<'PY'
+import json
+import posixpath
+import sys
+from pathlib import Path
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"runtime PostgreSQL mount: {message}")
+
+
+def canonical_path(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.startswith("/"):
+        fail(f"{label} must be an absolute path")
+    normalized = posixpath.normpath(value)
+    if normalized != value or any(ord(character) < 32 for character in value):
+        fail(f"{label} must be canonical")
+    return value
+
+
+def overlaps(left: str, right: str) -> bool:
+    return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+
+
+expected_source, expected_target, expected_pgdata = sys.argv[1:4]
+container_environment = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+mounts = json.loads(Path(sys.argv[5]).read_text(encoding="utf-8"))
+if container_environment is None:
+    container_environment = []
+if not isinstance(container_environment, list) or not all(
+    isinstance(item, str) for item in container_environment
+):
+    fail("container environment inspection is malformed")
+pgdata_values = [
+    item.split("=", 1)[1]
+    for item in container_environment
+    if item.startswith("PGDATA=")
+]
+if len(pgdata_values) != 1:
+    fail("container environment must contain exactly one PGDATA")
+actual_pgdata = canonical_path(pgdata_values[0], "container PGDATA")
+if actual_pgdata != expected_pgdata:
+    fail("container PGDATA differs from frozen authority")
+if not isinstance(mounts, list):
+    fail("container mount inspection is not a list")
+normalized_mounts = []
+for mount in mounts:
+    if not isinstance(mount, dict):
+        fail("container mount inspection contains a malformed entry")
+    target = canonical_path(mount.get("Destination"), "container mount target")
+    normalized_mounts.append((mount, target))
+source_mounts = [
+    (mount, target)
+    for mount, target in normalized_mounts
+    if mount.get("Name") == expected_source
+]
+if len(source_mounts) != 1:
+    fail("expected exactly one pgdata named-volume source")
+mount, target = source_mounts[0]
+if (
+    mount.get("Type") != "volume"
+    or target != expected_target
+    or mount.get("RW") is not True
+):
+    fail("pgdata source, target, type, or RW disposition differs")
+overlapping = [
+    mount
+    for mount, target in normalized_mounts
+    if mount is not source_mounts[0][0] and overlaps(target, expected_pgdata)
+]
+if overlapping:
+    fail("an additional container mount overlaps PGDATA")
+PY
+  if [[ -n "$attested_postgres_id" ]] && \
+    [[ "$container_id" != "$attested_postgres_id" || \
+      "$container_config_hash" != "$attested_postgres_config_hash" || \
+      "$container_started_at" != "$attested_postgres_started_at" || \
+      "$container_restart_count" != "$attested_postgres_restart_count" ]]; then
+    holdfast_die "PostgreSQL container epoch changed between attestations"
+  fi
+  attested_postgres_id="$container_id"
+  attested_postgres_project="$compose_project"
+  attested_postgres_config_hash="$container_config_hash"
+  attested_postgres_started_at="$container_started_at"
+  attested_postgres_restart_count="$container_restart_count"
+  postgres_container_attestation="passed"
+  postgres_pgdata_mount="passed"
+}
+
+require_attested_postgres_identity() {
+  local container_output container_status container_config_hash
+  local container_started_at container_restart_count
+  local -a postgres_containers=()
+  [[ -n "$attested_postgres_id" && -n "$attested_postgres_project" ]] || \
+    holdfast_die "PostgreSQL container has not been attested"
+  container_output=$("$docker_bin" ps -aq --no-trunc \
+    --filter "label=com.docker.compose.project=$attested_postgres_project" \
+    --filter 'label=com.docker.compose.service=postgres') || \
+    holdfast_die "could not re-enumerate the attested PostgreSQL container"
+  if [[ -n "$container_output" ]]; then mapfile -t postgres_containers <<<"$container_output"; fi
+  ((${#postgres_containers[@]} == 1)) || \
+    holdfast_die "attested PostgreSQL container set changed"
+  [[ "${postgres_containers[0]}" == "$attested_postgres_id" ]] || \
+    holdfast_die "attested PostgreSQL container identity changed"
+  container_status=$("$docker_bin" inspect -f '{{.State.Status}}' "$attested_postgres_id") || \
+    holdfast_die "attested PostgreSQL container disappeared"
+  [[ "$container_status" == "running" ]] || \
+    holdfast_die "attested PostgreSQL container is not running"
+  container_started_at=$("$docker_bin" inspect -f '{{.State.StartedAt}}' \
+    "$attested_postgres_id") || holdfast_die "attested PostgreSQL container disappeared"
+  container_restart_count=$("$docker_bin" inspect -f '{{.RestartCount}}' \
+    "$attested_postgres_id") || holdfast_die "attested PostgreSQL container disappeared"
+  container_config_hash=$("$docker_bin" inspect -f \
+    '{{ index .Config.Labels "com.docker.compose.config-hash" }}' \
+    "$attested_postgres_id") || holdfast_die "attested PostgreSQL container disappeared"
+  [[ "$container_started_at" == "$attested_postgres_started_at" && \
+    "$container_restart_count" == "$attested_postgres_restart_count" && \
+    "$container_config_hash" == "$attested_postgres_config_hash" && \
+    "$container_config_hash" == "$frozen_postgres_config_hash" ]] || \
+    holdfast_die "attested PostgreSQL container epoch changed"
+}
+
+attested_postgres_exec() {
+  require_attested_postgres_identity
+  "$docker_bin" exec -i "$attested_postgres_id" "$@"
+}
+
+# No writer stop, database command, or volume mutation may precede this proof.
+validate_postgres_runtime_authority
 
 # Stop and remove every container that can own Strad or Rikune persistent state.
 runtime_writers=(strad rikune-analyzer rikune-volume-init)
@@ -313,11 +628,15 @@ while IFS=$'\t' read -r logical state actual; do
   [[ -z "$holder_output" ]] || holdfast_die "a container still holds runtime volume: $actual"
 done <"$backup/VOLUMES.tsv"
 
+# Re-attest after writer removal and holder proof, immediately before the
+# first database command or volume replacement can cross the destructive gate.
+validate_postgres_runtime_authority
+
 strad_connection_count() {
   local observed
   # The variable is expanded by the shell inside the PostgreSQL container.
   # shellcheck disable=SC2016
-  observed=$("${compose[@]}" exec -T postgres sh -ceu \
+  observed=$(attested_postgres_exec sh -ceu \
     'exec psql -U "$POSTGRES_USER" -d postgres -XAtq -v ON_ERROR_STOP=1' <<'SQL'
 SELECT count(*) FROM pg_stat_activity WHERE datname = 'strad';
 SQL
@@ -335,21 +654,21 @@ database_restore="restored"
 if [[ "$legacy_empty_strad" == "true" ]]; then
   # The variable is expanded by the shell inside the PostgreSQL container.
   # shellcheck disable=SC2016
-  database_exists=$("${compose[@]}" exec -T postgres sh -ceu \
+  database_exists=$(attested_postgres_exec sh -ceu \
     'exec psql -U "$POSTGRES_USER" -d postgres -XAtq -v ON_ERROR_STOP=1' <<'SQL'
 SELECT count(*) FROM pg_database WHERE datname = 'strad';
 SQL
   ) || holdfast_die "could not prove the legacy Strad database identity"
   [[ "$database_exists" == "1" ]] || holdfast_die "legacy recovery requires one existing Strad database"
   # shellcheck disable=SC2016
-  legacy_public_tables=$("${compose[@]}" exec -T postgres sh -ceu \
+  legacy_public_tables=$(attested_postgres_exec sh -ceu \
     'exec psql -U "$POSTGRES_USER" -d strad -XAtq -v ON_ERROR_STOP=1' <<'SQL'
 SELECT count(*) FROM pg_tables WHERE schemaname = 'public';
 SQL
   ) || holdfast_die "could not prove the legacy Strad public schema is empty"
   [[ "$legacy_public_tables" == "0" ]] || holdfast_die "legacy Strad database contains public tables"
   # shellcheck disable=SC2016
-  legacy_user_relations=$("${compose[@]}" exec -T postgres sh -ceu \
+  legacy_user_relations=$(attested_postgres_exec sh -ceu \
     'exec psql -U "$POSTGRES_USER" -d strad -XAtq -v ON_ERROR_STOP=1' <<'SQL'
 SELECT count(*)
   FROM pg_class AS c
@@ -381,11 +700,10 @@ if [[ "$legacy_empty_strad" != "true" ]]; then
   # These literal identities are the schema-v2 safety boundary.  Never use the
   # shared POSTGRES_DB or any Access/Verdict/NewAPI database here.
   # shellcheck disable=SC2016
-  "${compose[@]}" exec -T postgres sh -ceu \
-    'dropdb --if-exists --maintenance-db postgres -U "$POSTGRES_USER" strad; createdb -T template0 -U "$POSTGRES_USER" strad'
-  # shellcheck disable=SC2016
-  "${compose[@]}" exec -T postgres sh -ceu \
-    'exec pg_restore -U "$POSTGRES_USER" -d strad --exit-on-error --no-owner --no-acl' \
+  attested_postgres_exec sh -ceu \
+    'dropdb --if-exists --maintenance-db postgres -U "$POSTGRES_USER" strad;
+createdb -T template0 -U "$POSTGRES_USER" strad;
+exec pg_restore -U "$POSTGRES_USER" -d strad --exit-on-error --no-owner --no-acl' \
     <"$backup/strad.dump"
   [[ "$(strad_connection_count)" == "0" ]] || \
     holdfast_die "a client connected to the Strad database during restore"
@@ -406,10 +724,21 @@ restore_receipt_tmp="$backup/.RESTORE.receipt.$$"
   printf 'database_connections_before_restore=0\n'
   printf 'runtime_writer_count=3\n'
   printf 'runtime_writers_removed=passed\n'
+  printf 'postgres_container_attestation=%s\n' "$postgres_container_attestation"
+  printf 'postgres_pgdata_mount=%s\n' "$postgres_pgdata_mount"
+  printf 'postgres_runtime_epoch_attestation=passed\n'
+  printf 'postgres_container_id=%s\n' "$attested_postgres_id"
+  printf 'postgres_config_hash=%s\n' "$attested_postgres_config_hash"
+  printf 'postgres_started_at=%s\n' "$attested_postgres_started_at"
+  printf 'postgres_restart_count=%s\n' "$attested_postgres_restart_count"
   printf 'volume_mount_release=passed\n'
   printf 'volume_count=6\n'
 } >"$restore_receipt_tmp"
 chmod 0600 "$restore_receipt_tmp"
+# Publish no success evidence if the fixed PostgreSQL runtime epoch changed
+# after the final database command or while the receipt was being prepared.
+require_attested_postgres_identity
 mv -fT -- "$restore_receipt_tmp" "$restore_receipt"
+restore_receipt_tmp=""
 sync -f "$restore_receipt"
 echo "Strad database disposition and six volumes restored; runtime writers remain removed"
