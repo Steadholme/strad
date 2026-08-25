@@ -14,6 +14,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from render_input_binding import (
+    FROZEN_STATIC_PATHS,
+    access_build_input_sha,
+    write_binding,
+)
+
 
 OPS_ROOT = Path(__file__).resolve().parent
 STRAD_ROOT = OPS_ROOT.parent.parent
@@ -39,11 +45,6 @@ MUTATED_PATHS = (
 FULL_ONLY_PATHS = (
     "deploy/docker-compose.yml",
     "deploy/.env",
-    "deploy/access-governance.env.example",
-)
-
-FROZEN_STATIC_PATHS = MUTATED_PATHS + (
-    "deploy/docker-compose.yml",
     "deploy/access-governance.env.example",
 )
 
@@ -115,6 +116,56 @@ def parse_checksum_manifest(path: Path) -> dict[str, str]:
     if not result:
         fail("preimage manifest is empty")
     return result
+
+
+def parse_path_manifest(path: Path) -> set[str]:
+    require_regular(path)
+    result: set[str] = set()
+    for line_number, relative in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not relative:
+            continue
+        if (
+            not re.fullmatch(r"[A-Za-z0-9._/-]+", relative)
+            or relative.startswith("/")
+            or ".." in Path(relative).parts
+            or relative in result
+        ):
+            fail(f"invalid or duplicate path manifest line {line_number}")
+        result.add(relative)
+    return result
+
+
+def write_apply_manifests(stage_root: Path, paths: list[str]) -> None:
+    source_preimages = parse_checksum_manifest(OPS_ROOT / "preimages.sha256")
+    source_absent = parse_path_manifest(OPS_ROOT / "absent.paths")
+    target_set = set(paths)
+    if len(target_set) != len(paths):
+        fail("apply target paths contain duplicates")
+    if set(source_preimages) & source_absent:
+        fail("source preimage and absent manifests overlap")
+    missing = target_set - (set(source_preimages) | source_absent)
+    if missing:
+        fail(f"apply targets lack preimage dispositions: {', '.join(sorted(missing))}")
+    apply_preimages = [
+        f"{source_preimages[relative]}  {relative}"
+        for relative in paths
+        if relative in source_preimages
+    ]
+    apply_absent = [relative for relative in paths if relative in source_absent]
+    if target_set != {
+        line.split("  ", 1)[1] for line in apply_preimages
+    } | set(apply_absent):
+        fail("generated apply manifests do not exactly cover the target set")
+    preimages_path = stage_root / "APPLY-PREIMAGES.sha256"
+    absent_path = stage_root / "APPLY-ABSENT.paths"
+    preimages_path.write_text("\n".join(apply_preimages) + "\n", encoding="utf-8")
+    absent_path.write_text(
+        "".join(f"{relative}\n" for relative in apply_absent), encoding="utf-8"
+    )
+    os.chmod(preimages_path, 0o600)
+    os.chmod(absent_path, 0o600)
 
 
 def verify_preimages(estate_root: Path) -> None:
@@ -673,26 +724,6 @@ def render_route_seed(stage_root: Path) -> None:
     write_json(path, value)
 
 
-def access_build_input_sha(stage_root: Path) -> str:
-    base = stage_root / "access-governance"
-    digest = hashlib.sha256()
-    files: list[Path] = []
-    for root, directories, names in os.walk(base, followlinks=False):
-        directories[:] = sorted(name for name in directories if name not in {".git", "target", "__pycache__"})
-        for name in sorted(names):
-            path = Path(root) / name
-            if path.is_symlink() or not path.is_file() or name.endswith(".pyc"):
-                continue
-            files.append(path)
-    for path in sorted(files, key=lambda item: item.relative_to(base).as_posix()):
-        relative = path.relative_to(base).as_posix()
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(sha256_file(path).encode("ascii"))
-        digest.update(b"\n")
-    return digest.hexdigest()
-
-
 def update_env_file(path: Path, updates: dict[str, str]) -> None:
     lines = path.read_text(encoding="utf-8").splitlines()
     observed: dict[str, int] = {}
@@ -737,13 +768,13 @@ COMPOSE_SERVICES = r'''
           test "$$(stat -c '%u:%g' "$$target")" = "$$uid:$$gid"
         }
         ensure_dir /var/lib/strad/uploads 65532 65532
-        ensure_dir /data/workspaces 10001 10001
-        ensure_dir /data/storage 10001 10001
-        ensure_dir /data/state 10001 10001
-        ensure_dir /data/cache 10001 10001
-        ensure_dir /data/audit 10001 10001
-        ensure_dir /data/workspaces/.ghidra-projects 10001 10001
-        ensure_dir /data/audit/ghidra 10001 10001
+        ensure_dir /data/workspaces 1000 1000
+        ensure_dir /data/storage 1000 1000
+        ensure_dir /data/state 1000 1000
+        ensure_dir /data/cache 1000 1000
+        ensure_dir /data/audit 1000 1000
+        ensure_dir /data/workspaces/.ghidra-projects 1000 1000
+        ensure_dir /data/audit/ghidra 1000 1000
     volumes:
       - strad_uploads:/var/lib/strad/uploads
       - rikune_workspaces:/data/workspaces
@@ -755,7 +786,7 @@ COMPOSE_SERVICES = r'''
 
   rikune-analyzer:
     image: ${STRAD_ANALYZER_IMAGE:?STRAD_ANALYZER_IMAGE immutable digest is required}
-    user: "10001:10001"
+    user: "1000:1000"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -777,7 +808,7 @@ COMPOSE_SERVICES = r'''
       - rikune_cache:/data/cache
       - rikune_audit:/data/audit
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=512m,uid=10001,gid=10001,mode=0700
+      - /tmp:rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700
     networks:
       - hf-rikune
     cpus: 8
@@ -971,7 +1002,7 @@ def render_full_env(stage_root: Path, release: dict[str, str], secrets: dict[str
         "SLUICE_IMAGE": release["SLUICE_IMAGE"],
         "STRAD_NEWAPI_MODEL": release["STRAD_NEWAPI_MODEL"],
         "STRAD_NEWAPI_CONTEXT_TOKENS": "32768",
-        "STRAD_TOKENIZER_VOCAB_SHA256": "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+        "STRAD_TOKENIZER_VOCAB_SHA256": "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",  # gitleaks:allow
         **secrets,
     }
     update_env_file(env_path, updates)
@@ -1045,6 +1076,8 @@ def write_evidence(
     targets = stage_root / "TARGETS.sha256"
     lines = [f"{sha256_file(stage_root / relative)}  {relative}" for relative in paths]
     targets.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_apply_manifests(stage_root, paths)
+    write_binding(OPS_ROOT, stage_root / "RENDER-INPUTS.sha256")
     permission_digest = sha256_file(stage_root / "access-governance/catalog/permissions.snapshot.json")
     package_digest = sha256_file(stage_root / "access-governance/catalog/packages.snapshot.json")
     build_input = access_build_input_sha(stage_root)

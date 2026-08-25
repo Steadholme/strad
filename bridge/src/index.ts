@@ -17,6 +17,8 @@ async function main(): Promise<void> {
   await prepareSpoolRoot(config.spoolRoot)
   const journal = new OperationJournal(config.journalPath)
   const recovery = journal.recoverAfterCrash()
+  // Orphan sweeping is startup-only. Running it while the server accepts uploads
+  // can race the live .part -> .bin transition and destroy an in-flight spool.
   await cleanOrphanSpools(config.spoolRoot, journal)
 
   let server: Server | null = null
@@ -47,7 +49,6 @@ async function main(): Promise<void> {
       if (reconciliationInFlight || shuttingDown) return
       reconciliationInFlight = true
       void reconcileUnknownUploads(config, journal)
-        .then(() => cleanOrphanSpools(config.spoolRoot, journal))
         .catch(() => fatal())
         .finally(() => {
           reconciliationInFlight = false

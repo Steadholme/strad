@@ -98,23 +98,22 @@ test('operation id must be a canonical UUID', () => {
   )
 })
 
-test('static lock must contain the exact ordered 100-plugin positive list', () => {
-  assert.equal(
-    STATIC_PROFILE_LOCK_SHA256,
-    '32e3ea5103ff73c413062b17ad3bb4e7270fbcd6fd1325f6a7f3dc831bee83ef'
-  )
-  const digest = createHash('sha256').update(STATIC_PLUGINS.join(',')).digest('hex')
-  const lock = {
+function staticLockFixture(
+  javaEnvironment: readonly unknown[] = [
+    { name: 'JAVA_HOME', value: '/java-home', required: true },
+  ]
+) {
+  return {
     schema_version: 1,
     profile: 'static',
     plugins: [...STATIC_PLUGINS],
-    ordered_csv_sha256: digest,
+    ordered_csv_sha256: createHash('sha256').update(STATIC_PLUGINS.join(',')).digest('hex'),
     static_workflow_stages: ['fast_profile', 'enrich_static', 'function_map'],
     required_backends: [
       {
         name: 'java',
         path: '/java',
-        environment: [{ name: 'JAVA_HOME', value: '/java-home', required: true }],
+        environment: [...javaEnvironment],
         version_args: ['-version'],
         allowed_exit_codes: [0],
         version_pattern: '21',
@@ -143,6 +142,14 @@ test('static lock must contain the exact ordered 100-plugin positive list', () =
     generated_by: 'scripts/generate-docker.mjs',
     generator_version: 1,
   }
+}
+
+test('static lock must contain the exact ordered 100-plugin positive list', () => {
+  assert.equal(
+    STATIC_PROFILE_LOCK_SHA256,
+    '32e3ea5103ff73c413062b17ad3bb4e7270fbcd6fd1325f6a7f3dc831bee83ef'
+  )
+  const lock = staticLockFixture()
   assert.equal(validateStaticLock(lock).plugins.length, 100)
   const wrong = { ...lock, plugins: [...lock.plugins] }
   wrong.plugins[0] = 'wrong'
@@ -168,5 +175,73 @@ test('static lock must contain the exact ordered 100-plugin positive list', () =
       GHIDRA_PATH: '/wrong',
       RIZIN_PATH: '/rizin',
     })
+  )
+})
+
+test('static lock accepts the Rikune v1.4.1 environment union and enforces it fail closed', () => {
+  const javaEnvironment = [
+    { name: 'JAVA_HOME', value: '/opt/java/openjdk', required: true },
+    {
+      name: 'PATH',
+      value: '/opt/java/openjdk/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin',
+      required: true,
+    },
+    { name: 'PYTHON_PATH', value: '/usr/local/bin/python3.12', required: true },
+    { name: 'PYTHONPATH', value: '/app/workers', required: true },
+    { name: 'HOME', value: '/tmp/rikune-home', required: true },
+    { name: 'XDG_CONFIG_HOME', value: '/tmp/rikune-home/.config', required: true },
+    { name: 'XDG_CACHE_HOME', value: '/tmp/rikune-home/.cache', required: true },
+    { name: 'CONFIG_PATH', must_be_unset: true },
+    { name: 'NODE_OPTIONS', must_be_unset: true },
+    { name: 'NODE_PATH', must_be_unset: true },
+    { name: 'LD_PRELOAD', must_be_unset: true },
+    { name: 'PYTHONHOME', must_be_unset: true },
+  ] as const
+  const lock = staticLockFixture(javaEnvironment)
+  const validated = validateStaticLock(lock)
+  assert.equal(validated.required_backends[0]?.environment.length, 12)
+
+  const matchingEnvironment = {
+    JAVA_HOME: '/opt/java/openjdk',
+    PATH: '/opt/java/openjdk/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin',
+    PYTHON_PATH: '/usr/local/bin/python3.12',
+    PYTHONPATH: '/app/workers',
+    HOME: '/tmp/rikune-home',
+    XDG_CONFIG_HOME: '/tmp/rikune-home/.config',
+    XDG_CACHE_HOME: '/tmp/rikune-home/.cache',
+    GHIDRA_INSTALL_DIR: '/ghidra-home',
+    RIZIN_PATH: '/rizin',
+  }
+  assert.doesNotThrow(() => validateStaticBackendEnvironment(validated, matchingEnvironment))
+  assert.throws(
+    () =>
+      validateStaticBackendEnvironment(validated, {
+        ...matchingEnvironment,
+        NODE_OPTIONS: '',
+      }),
+    /NODE_OPTIONS must be unset/
+  )
+
+  assert.throws(
+    () => validateStaticLock(staticLockFixture([...javaEnvironment, javaEnvironment[0]])),
+    /duplicate backend environment bindings/
+  )
+  assert.throws(() =>
+    validateStaticLock(
+      staticLockFixture([
+        ...javaEnvironment.slice(0, -1),
+        { name: 'PYTHONHOME', must_be_unset: true, required: false },
+      ])
+    )
+  )
+  assert.throws(() =>
+    validateStaticLock(
+      staticLockFixture(
+        Array.from({ length: 17 }, (_, index) => ({
+          name: `BOUNDED_ENV_${index}`,
+          must_be_unset: true,
+        }))
+      )
+    )
   )
 })

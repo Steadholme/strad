@@ -349,7 +349,8 @@ async fn postgres_owner_delete_and_sample_lifecycle_are_transactional() {
         ("forwarding".into(), Some("cancel_requested".into()), 1)
     );
 
-    // A succeeded unknown upload is finalized locally, then detached under the digest lock.
+    // A succeeded unknown upload becomes non-analyzable in the finalize transaction, then
+    // remains durably discoverable for disposition after a crash.
     let unknown_owner = format!("user:test-{}", Uuid::new_v4());
     let unknown = store
         .create_upload(
@@ -383,6 +384,35 @@ async fn postgres_owner_delete_and_sample_lifecycle_are_transactional() {
         )
         .await
         .unwrap();
+    let crash_safe_unknown: (String, Option<String>, String, Option<String>) = sqlx::query_as(
+        "SELECT u.state,u.error_code,a.state,a.sample_id FROM upload_sessions u JOIN analyses a \
+         ON a.id=u.analysis_id WHERE u.id=$1",
+    )
+    .bind(unknown.upload.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        crash_safe_unknown,
+        (
+            "finalized".into(),
+            Some("unknown_file_disposition_waiting".into()),
+            "failed".into(),
+            Some(format!("sha256:{unknown_digest}")),
+        )
+    );
+    assert!(store
+        .disposition_uploads(100)
+        .await
+        .unwrap()
+        .iter()
+        .any(|upload| upload.id == unknown.upload.id));
+    sqlx::query("UPDATE analyses SET state='degraded' WHERE state='uploaded' AND id<>$1")
+        .bind(unknown.analysis.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(store.claim_start().await.unwrap().is_none());
     assert!(!store
         .dispose_finalized_unknown(&unknown_owner, unknown.upload.id, &unknown_digest)
         .await
@@ -433,6 +463,62 @@ async fn postgres_owner_delete_and_sample_lifecycle_are_transactional() {
             .unwrap();
     assert_eq!(unknown_state, ("failed".into(), None, "failed".into(), 0));
     assert_eq!(unknown_sample, (0, "deleted".into()));
+
+    // Re-uploading identical content starts a fresh physical-delete operation. Reusing a
+    // digest-derived operation ID would make the bridge journal replay the first deletion.
+    let reuploaded = store
+        .create_upload(
+            &unknown_owner,
+            "unknown-reuploaded.bin",
+            1,
+            Uuid::new_v4(),
+            &"d".repeat(64),
+        )
+        .await
+        .unwrap();
+    let reuploaded_lease = Uuid::new_v4();
+    sqlx::query(
+        "UPDATE upload_sessions SET state='forwarding',assembled_sha256=$2,lease_token=$3,\
+         leased_at=now(),lease_until=now()+interval '5 minutes' WHERE id=$1",
+    )
+    .bind(reuploaded.upload.id)
+    .bind(&unknown_digest)
+    .bind(reuploaded_lease)
+    .execute(&pool)
+    .await
+    .unwrap();
+    store
+        .complete_finalize(
+            &unknown_owner,
+            reuploaded.upload.id,
+            Some(reuploaded_lease),
+            &unknown_digest,
+            "unknown",
+        )
+        .await
+        .unwrap();
+    assert!(!store
+        .dispose_finalized_unknown(&unknown_owner, reuploaded.upload.id, &unknown_digest)
+        .await
+        .unwrap());
+    let reuploaded_delete = store.claim_sample_delete().await.unwrap().unwrap();
+    assert_eq!(reuploaded_delete.sample_id, unknown_delete.sample_id);
+    assert_ne!(
+        reuploaded_delete.delete_operation_id,
+        unknown_delete.delete_operation_id
+    );
+    store
+        .finish_sample_delete(&reuploaded_delete, true, None)
+        .await
+        .unwrap();
+    let reuploaded_disposition = store
+        .get_upload(&unknown_owner, reuploaded.upload.id)
+        .await
+        .unwrap();
+    assert!(store
+        .complete_unknown_disposition(&reuploaded_disposition)
+        .await
+        .unwrap());
 
     // A pending same-digest session gates deletion; a stale deleting lease is recoverable.
     let gated_digest = hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()));
@@ -567,6 +653,75 @@ async fn postgres_24h_disposition_preserves_spool_authority_until_physical_delet
     .await
     .unwrap();
     assert_eq!(terminal, ("failed".into(), 0, "deleted".into()));
+
+    // Once the retained sample tombstone is reaped, the uncertain-upload disposition path
+    // must also mint a fresh operation ID for identical content.
+    sqlx::query("DELETE FROM sample_objects WHERE sha256=$1")
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let replay_owner = format!("user:test-{}", Uuid::new_v4());
+    let replay = store
+        .create_upload(
+            &replay_owner,
+            "ambiguous-reuploaded.bin",
+            7,
+            Uuid::new_v4(),
+            &"f".repeat(64),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE upload_sessions SET state='upstream_uncertain',assembled_sha256=$2,\
+         updated_at=now()-interval '25 hours' WHERE id=$1",
+    )
+    .bind(replay.upload.id)
+    .bind(&digest)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let replay_upload = store
+        .get_upload(&replay_owner, replay.upload.id)
+        .await
+        .unwrap();
+    assert!(!store
+        .expire_uncertain_upload(&replay_upload, false)
+        .await
+        .unwrap());
+    let replay_delete_operation: Uuid =
+        sqlx::query_scalar("SELECT delete_operation_id FROM sample_objects WHERE sha256=$1")
+            .bind(&digest)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(replay_delete_operation, pending.4);
+    sqlx::query(
+        "UPDATE sample_objects SET lifecycle='deleting',delete_after=now()+interval '10 minutes' \
+         WHERE sha256=$1 AND delete_operation_id=$2",
+    )
+    .bind(&digest)
+    .bind(replay_delete_operation)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let replay_claim = SampleDeleteClaim {
+        sample_id: format!("sha256:{digest}"),
+        sha256: digest.clone(),
+        delete_operation_id: replay_delete_operation,
+    };
+    store
+        .finish_sample_delete(&replay_claim, true, None)
+        .await
+        .unwrap();
+    let replay_disposition = store
+        .get_upload(&replay_owner, replay.upload.id)
+        .await
+        .unwrap();
+    assert!(store
+        .complete_unknown_disposition(&replay_disposition)
+        .await
+        .unwrap());
 
     let dead_owner = format!("user:test-{}", Uuid::new_v4());
     let dead = store

@@ -12,19 +12,27 @@ const execFileAsync = promisify(execFile)
 export const STATIC_PROFILE_LOCK_SHA256 =
   '32e3ea5103ff73c413062b17ad3bb4e7270fbcd6fd1325f6a7f3dc831bee83ef'
 
-const backendEnvironmentSchema = z
-  .object({
-    name: z.string().regex(/^[A-Z][A-Z0-9_]*$/),
-    value: z.string().startsWith('/').max(512),
-    required: z.boolean(),
-  })
-  .strict()
+const backendEnvironmentSchema = z.union([
+  z
+    .object({
+      name: z.string().regex(/^[A-Z][A-Z0-9_]*$/),
+      value: z.string().startsWith('/').max(512),
+      required: z.boolean(),
+    })
+    .strict(),
+  z
+    .object({
+      name: z.string().regex(/^[A-Z][A-Z0-9_]*$/),
+      must_be_unset: z.literal(true),
+    })
+    .strict(),
+])
 
 const backendSchema = z
   .object({
     name: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
     path: z.string().startsWith('/').max(512),
-    environment: z.array(backendEnvironmentSchema).min(1).max(4),
+    environment: z.array(backendEnvironmentSchema).min(1).max(16),
     version_args: z.array(z.string().min(1).max(128)).max(8),
     allowed_exit_codes: z.array(z.number().int().min(0).max(255)).min(1).max(8),
     version_file: z.string().startsWith('/').max(512).optional(),
@@ -108,6 +116,14 @@ export function validateStaticBackendEnvironment(
   for (const backend of lock.required_backends) {
     for (const binding of backend.environment) {
       const actual = environment[binding.name]
+      if ('must_be_unset' in binding) {
+        if (actual !== undefined) {
+          throw new Error(
+            `backend environment mismatch for ${backend.name}: ${binding.name} must be unset`
+          )
+        }
+        continue
+      }
       if (
         (binding.required && actual !== binding.value) ||
         (!binding.required && actual !== undefined && actual !== binding.value)

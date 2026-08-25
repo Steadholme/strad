@@ -117,6 +117,7 @@ bash -n \
   "$script_dir/runtime-verify.sh"
 python3 -m py_compile \
   "$script_dir/render.py" \
+  "$script_dir/render_input_binding.py" \
   "$script_dir/redact_env_diff.py" \
   "$script_dir/authority_evidence.py" \
   "$script_dir/edge_evidence.py" \
@@ -132,6 +133,9 @@ release_env_digest=$(sha256sum "$release_env" | cut -d' ' -f1)
   printf 'targets_sha256=%s\n' "$targets_digest"
   printf 'release_evidence_sha256=%s\n' "$evidence_digest"
   printf 'release_env_sha256=%s\n' "$release_env_digest"
+  printf 'apply_preimages_sha256=%s\n' "$(sha256sum "$output/stage/APPLY-PREIMAGES.sha256" | cut -d' ' -f1)"
+  printf 'apply_absent_sha256=%s\n' "$(sha256sum "$output/stage/APPLY-ABSENT.paths" | cut -d' ' -f1)"
+  printf 'render_inputs_sha256=%s\n' "$(sha256sum "$output/stage/RENDER-INPUTS.sha256" | cut -d' ' -f1)"
   printf 'supply_chain_evidence_sha256=%s\n' "$(sha256sum "$output/stage/evidence/SUPPLY-CHAIN.json" | cut -d' ' -f1)"
   printf 'supply_chain_signature_sha256=%s\n' "$(sha256sum "$output/stage/evidence/SUPPLY-CHAIN.sig" | cut -d' ' -f1)"
   printf 'supply_chain_public_key_sha256=%s\n' "$(sha256sum "$output/stage/evidence/SUPPLY-CHAIN.pub" | cut -d' ' -f1)"

@@ -62,8 +62,8 @@ class EstateTransactionTests(unittest.TestCase):
         self.temp.cleanup()
 
     def command(self, action: str, backup: Path, *extra: str) -> subprocess.CompletedProcess[str]:
-        args = ["python3", str(TRANSACTION), action, "--estate-root", str(self.estate), "--backup-dir", str(backup)]
-        if action == "apply":
+        args = ["python3", str(TRANSACTION), action, "--estate-root", str(self.estate)]
+        if action in {"apply", "preflight"}:
             args += [
                 "--stage-root",
                 str(self.stage),
@@ -74,6 +74,8 @@ class EstateTransactionTests(unittest.TestCase):
                 "--absent",
                 str(self.absent),
             ]
+        if action in {"apply", "restore"}:
+            args += ["--backup-dir", str(backup)]
         args += list(extra)
         return subprocess.run(
             args,
@@ -97,6 +99,23 @@ class EstateTransactionTests(unittest.TestCase):
         self.assert_preimage()
         state = json.loads((backup / "TRANSACTION.json").read_text(encoding="utf-8"))
         self.assertEqual(state["state"], "rolled_back_after_failure")
+
+    def test_preflight_validates_every_input_without_creating_a_backup(self) -> None:
+        backup = self.root / "backup-must-not-exist"
+        result = self.command("preflight", backup)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(backup.exists())
+
+    def test_preflight_rejects_non_exact_manifest_coverage(self) -> None:
+        self.preimages.write_text(
+            self.preimages.read_text(encoding="utf-8")
+            + f"{'0' * 64}  deploy/unrelated.txt\n",
+            encoding="utf-8",
+        )
+        result = self.command("preflight", self.root / "unused-backup")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("do not exactly cover", result.stderr)
+        self.assert_preimage()
 
     def test_restore_accepts_mixed_old_new_and_absent_dispositions(self) -> None:
         backup = self.root / "backup-mixed"

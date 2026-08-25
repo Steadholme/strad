@@ -252,12 +252,13 @@ def restore_mixed(estate: Path, backup: Path) -> None:
     verify_preimage(estate, targets, preimages, absent)
 
 
-def apply_transaction(args: argparse.Namespace) -> None:
+def verified_apply_inputs(
+    args: argparse.Namespace,
+) -> tuple[Path, Path, dict[str, str], dict[str, str], set[str]]:
     # Preserve the caller-visible path for lstat/realpath checks.  Resolving
     # first would turn a symlinked root into an apparently safe directory.
     estate = safe_root(args.estate_root.absolute())
     stage = safe_root(args.stage_root.absolute())
-    backup = safe_root(args.backup_dir.absolute(), must_exist=False)
     targets = manifest(args.targets.absolute())
     preimages = manifest(args.preimages.absolute())
     absent = absent_paths(args.absent.absolute())
@@ -266,6 +267,16 @@ def apply_transaction(args: argparse.Namespace) -> None:
         if disposition(source, expected) != "expected":
             fail(f"staged target checksum mismatch: {relative}")
     verify_preimage(estate, targets, preimages, absent)
+    return estate, stage, targets, preimages, absent
+
+
+def preflight_transaction(args: argparse.Namespace) -> None:
+    verified_apply_inputs(args)
+
+
+def apply_transaction(args: argparse.Namespace) -> None:
+    estate, stage, targets, preimages, absent = verified_apply_inputs(args)
+    backup = safe_root(args.backup_dir.absolute(), must_exist=False)
     snapshot(estate, backup, targets, preimages, absent)
     write_json(backup / "TRANSACTION.json", {"schema_version": 1, "state": "prepared"})
     fault_after = args.test_fault_after
@@ -321,12 +332,19 @@ def restore_transaction(args: argparse.Namespace) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_apply_inputs(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--estate-root", required=True, type=Path)
+        command_parser.add_argument("--stage-root", required=True, type=Path)
+        command_parser.add_argument("--targets", required=True, type=Path)
+        command_parser.add_argument("--preimages", required=True, type=Path)
+        command_parser.add_argument("--absent", required=True, type=Path)
+
+    preflight_parser = subparsers.add_parser("preflight")
+    add_apply_inputs(preflight_parser)
+    preflight_parser.set_defaults(handler=preflight_transaction)
     apply_parser = subparsers.add_parser("apply")
-    apply_parser.add_argument("--estate-root", required=True, type=Path)
-    apply_parser.add_argument("--stage-root", required=True, type=Path)
-    apply_parser.add_argument("--targets", required=True, type=Path)
-    apply_parser.add_argument("--preimages", required=True, type=Path)
-    apply_parser.add_argument("--absent", required=True, type=Path)
+    add_apply_inputs(apply_parser)
     apply_parser.add_argument("--backup-dir", required=True, type=Path)
     apply_parser.add_argument("--test-fault-after", type=int)
     apply_parser.set_defaults(handler=apply_transaction)

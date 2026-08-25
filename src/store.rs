@@ -691,41 +691,72 @@ impl Store {
         .ok_or(AppError::Invariant(
             "owner quota would underflow on finalize",
         ))?;
-        let frozen_body = json!({
-            "analysis_id": upload.analysis_id,
-            "sample_id": sample_id,
-            "state": "uploaded"
-        });
-        sqlx::query(
-            "UPDATE upload_sessions SET state='finalized',sample_id=$3,lease_token=NULL,leased_at=NULL,\
-             lease_until=NULL,frozen_status=202,frozen_location=$4,frozen_body=$5,\
-             error_code=CASE WHEN error_code='cancel_requested' THEN error_code ELSE NULL END,updated_at=now() \
-             WHERE id=$1 AND owner_sub=$2",
-        )
-        .bind(upload_id)
-        .bind(owner_sub)
-        .bind(&sample_id)
-        .bind(format!("/analyses/{}", upload.analysis_id))
-        .bind(&frozen_body)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE analyses SET sample_id=$3,state='uploaded',updated_at=now() \
-             WHERE id=$1 AND owner_sub=$2",
-        )
-        .bind(upload.analysis_id)
-        .bind(owner_sub)
-        .bind(&sample_id)
-        .execute(&mut *tx)
-        .await?;
-        insert_outbox(
-            &mut tx,
-            upload.analysis_id,
-            owner_sub,
-            "analysis.uploaded",
-            json!({"analysis_id":upload.analysis_id,"state":"uploaded"}),
-        )
-        .await?;
+        if file_type == "unknown" {
+            sqlx::query(
+                "UPDATE upload_sessions SET state='finalized',sample_id=$3,lease_token=NULL,leased_at=NULL,\
+                 lease_until=NULL,frozen_status=NULL,frozen_location=NULL,frozen_body=NULL,\
+                 error_code='unknown_file_disposition_waiting',updated_at=now() \
+                 WHERE id=$1 AND owner_sub=$2",
+            )
+            .bind(upload_id)
+            .bind(owner_sub)
+            .bind(&sample_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE analyses SET sample_id=$3,state='failed',updated_at=now() \
+                 WHERE id=$1 AND owner_sub=$2",
+            )
+            .bind(upload.analysis_id)
+            .bind(owner_sub)
+            .bind(&sample_id)
+            .execute(&mut *tx)
+            .await?;
+            insert_outbox(
+                &mut tx,
+                upload.analysis_id,
+                owner_sub,
+                "analysis.failed",
+                json!({"analysis_id":upload.analysis_id,"state":"failed","error_code":"unknown_file_type"}),
+            )
+            .await?;
+        } else {
+            let frozen_body = json!({
+                "analysis_id": upload.analysis_id,
+                "sample_id": sample_id,
+                "state": "uploaded"
+            });
+            sqlx::query(
+                "UPDATE upload_sessions SET state='finalized',sample_id=$3,lease_token=NULL,leased_at=NULL,\
+                 lease_until=NULL,frozen_status=202,frozen_location=$4,frozen_body=$5,\
+                 error_code=CASE WHEN error_code='cancel_requested' THEN error_code ELSE NULL END,updated_at=now() \
+                 WHERE id=$1 AND owner_sub=$2",
+            )
+            .bind(upload_id)
+            .bind(owner_sub)
+            .bind(&sample_id)
+            .bind(format!("/analyses/{}", upload.analysis_id))
+            .bind(&frozen_body)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE analyses SET sample_id=$3,state='uploaded',updated_at=now() \
+                 WHERE id=$1 AND owner_sub=$2",
+            )
+            .bind(upload.analysis_id)
+            .bind(owner_sub)
+            .bind(&sample_id)
+            .execute(&mut *tx)
+            .await?;
+            insert_outbox(
+                &mut tx,
+                upload.analysis_id,
+                owner_sub,
+                "analysis.uploaded",
+                json!({"analysis_id":upload.analysis_id,"state":"uploaded"}),
+            )
+            .await?;
+        }
         if file_type != "unknown" && used_bytes >= OWNER_BYTES.saturating_mul(80) / 100 {
             let claimed = sqlx::query(
                 "INSERT INTO notification_claims(owner_sub,kind,window_start) \
@@ -828,7 +859,6 @@ impl Store {
         let stored_sample: Option<String> = upload.get("sample_id");
         let analysis_id: Uuid = upload.get("analysis_id");
         let total_bytes: i64 = upload.get("total_bytes");
-        let delete_operation = server_operation_id("sample-delete", &sample_id);
         if state == "failed" {
             tx.commit().await?;
             return Ok(true);
@@ -862,16 +892,25 @@ impl Store {
                 "unknown sample disposition violated reference invariants",
             ));
         }
-        let analysis_changed = sqlx::query(
-            "UPDATE analyses SET state='failed',sample_id=NULL,updated_at=now() \
-             WHERE id=$1 AND owner_sub=$2 AND state<>'failed'",
+        let disposition_waiting = pending || lifecycle == "deleting";
+        let analysis_was_failed: bool = sqlx::query_scalar(
+            "SELECT state='failed' FROM analyses WHERE id=$1 AND owner_sub=$2 FOR UPDATE",
         )
         .bind(analysis_id)
         .bind(owner_sub)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE analyses SET state='failed',sample_id=CASE WHEN $3 THEN sample_id ELSE NULL END,\
+             updated_at=now() \
+             WHERE id=$1 AND owner_sub=$2",
+        )
+        .bind(analysis_id)
+        .bind(owner_sub)
+        .bind(disposition_waiting)
         .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if analysis_changed == 1 {
+        .await?;
+        if !analysis_was_failed {
             insert_outbox(
                 &mut tx,
                 analysis_id,
@@ -881,7 +920,7 @@ impl Store {
             )
             .await?;
         }
-        if pending || lifecycle == "deleting" {
+        if disposition_waiting {
             sqlx::query(
                 "UPDATE upload_sessions SET error_code='unknown_file_disposition_waiting',\
                  frozen_status=NULL,frozen_location=NULL,frozen_body=NULL,updated_at=now() WHERE id=$1",
@@ -893,6 +932,7 @@ impl Store {
             return Ok(false);
         }
         if ref_count == 1 {
+            let delete_operation = Uuid::new_v4();
             sqlx::query(
                 "UPDATE sample_objects SET ref_count=0,lifecycle='delete_pending',delete_after=now(),\
                  delete_operation_id=$2,updated_at=now() WHERE sample_id=$1",
@@ -1017,7 +1057,7 @@ impl Store {
             tx.commit().await?;
             return Ok(true);
         }
-        let delete_operation = server_operation_id("sample-delete", &sample_id);
+        let delete_operation = Uuid::new_v4();
         match sample {
             None => {
                 sqlx::query(

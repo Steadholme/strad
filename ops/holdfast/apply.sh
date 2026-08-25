@@ -38,12 +38,39 @@ done
 holdfast_acquire_lock
 stage="$dry_run_dir/stage"
 receipt="$dry_run_dir/DRY-RUN.receipt"
+apply_preimages="$stage/APPLY-PREIMAGES.sha256"
+apply_absent="$stage/APPLY-ABSENT.paths"
+render_inputs="$stage/RENDER-INPUTS.sha256"
 [[ -d "$estate_root/access-governance" && -d "$stage" && -f "$receipt" && ! -L "$receipt" ]] || \
   holdfast_die "estate or dry-run package is incomplete"
 [[ -z "$(find "$dry_run_dir" -maxdepth 0 -perm /077 -print -quit)" ]] || \
   holdfast_die "dry-run directory must not be group/world accessible"
+for directory in "$dry_run_dir" "$stage"; do
+  [[ ! -L "$directory" && "$(readlink -f -- "$directory")" == "$directory" && "$(stat -c '%u' -- "$directory")" == "0" ]] || \
+    holdfast_die "dry-run package directories must be canonical and root-owned"
+done
+for file in "$receipt" "$stage/TARGETS.sha256" "$stage/RELEASE-EVIDENCE.json" \
+  "$apply_preimages" "$apply_absent" "$render_inputs"; do
+  [[ -f "$file" && ! -L "$file" && "$(stat -c '%u' -- "$file")" == "0" ]] || \
+    holdfast_die "dry-run control file must be regular and root-owned: $file"
+done
 [[ "$(holdfast_receipt_value "$receipt" cargo_gate)" == "passed" ]] || \
   holdfast_die "production apply refuses a dry-run without the Rust gate"
+
+verify_render_bindings() {
+  [[ "$(holdfast_receipt_value "$receipt" apply_preimages_sha256)" == "$(holdfast_sha256 "$apply_preimages")" ]] || \
+    holdfast_die "apply preimage manifest differs from the dry-run receipt"
+  [[ "$(holdfast_receipt_value "$receipt" apply_absent_sha256)" == "$(holdfast_sha256 "$apply_absent")" ]] || \
+    holdfast_die "apply absent manifest differs from the dry-run receipt"
+  [[ "$(holdfast_receipt_value "$receipt" render_inputs_sha256)" == "$(holdfast_sha256 "$render_inputs")" ]] || \
+    holdfast_die "render-input manifest differs from the dry-run receipt"
+  python3 "$script_dir/render_input_binding.py" verify \
+    --ops-root "$script_dir" --manifest "$render_inputs" \
+    --stage-root "$stage" --release-evidence "$stage/RELEASE-EVIDENCE.json" \
+    --require-root-owner
+}
+
+verify_render_bindings
 
 python3 "$script_dir/validate_release_evidence.py" --evidence "$stage/RELEASE-EVIDENCE.json"
 [[ "$(holdfast_receipt_value "$receipt" targets_sha256)" == "$(holdfast_sha256 "$stage/TARGETS.sha256")" ]] || \
@@ -82,6 +109,14 @@ fi
 (cd "$stage" && sha256sum --check TARGETS.sha256)
 docker compose --env-file "$stage/deploy/.env" -f "$stage/deploy/docker-compose.yml" config --quiet
 
+# Complete the non-mutating transaction gate before any runtime backup side effect.
+python3 "$script_dir/estate_transaction.py" preflight \
+  --estate-root "$estate_root" \
+  --stage-root "$stage" \
+  --targets "$stage/TARGETS.sha256" \
+  --preimages "$apply_preimages" \
+  --absent "$apply_absent"
+
 mkdir -p -- "$backup_root" "$state_dir"
 chmod 0700 -- "$backup_root" "$state_dir"
 [[ ! -e "$state_dir/CURRENT.json" && ! -L "$state_dir/CURRENT.json" ]] || \
@@ -93,12 +128,14 @@ mkdir -m 0700 -- "$backup"
 
 # Runtime backup plus isolated restore probes are mandatory before file mutation.
 "$script_dir/runtime-backup.sh" --compose-root "$stage" --backup-dir "$backup/runtime"
+# Rebind authority and staged transaction inputs after the long-running backup window.
+verify_render_bindings
 python3 "$script_dir/estate_transaction.py" apply \
   --estate-root "$estate_root" \
   --stage-root "$stage" \
   --targets "$stage/TARGETS.sha256" \
-  --preimages "$script_dir/preimages.sha256" \
-  --absent "$script_dir/absent.paths" \
+  --preimages "$apply_preimages" \
+  --absent "$apply_absent" \
   --backup-dir "$backup/estate"
 
 install -m 0600 -- "$stage/RELEASE-EVIDENCE.json" "$backup/RELEASE-EVIDENCE.json"
@@ -107,12 +144,16 @@ install -m 0600 -- "$receipt" "$backup/DRY-RUN.receipt"
 install -m 0600 -- "$stage/evidence/SUPPLY-CHAIN.json" "$backup/SUPPLY-CHAIN.json"
 install -m 0600 -- "$stage/evidence/SUPPLY-CHAIN.sig" "$backup/SUPPLY-CHAIN.sig"
 install -m 0600 -- "$stage/evidence/SUPPLY-CHAIN.pub" "$backup/SUPPLY-CHAIN.pub"
+install -m 0600 -- "$apply_preimages" "$backup/APPLY-PREIMAGES.sha256"
+install -m 0600 -- "$apply_absent" "$backup/APPLY-ABSENT.paths"
+install -m 0600 -- "$render_inputs" "$backup/RENDER-INPUTS.sha256"
 rollback_image=$(jq -er '.release.ACCESS_GOVERNANCE_ROLLBACK_IMAGE' "$stage/RELEASE-EVIDENCE.json")
 printf 'services:\n  access-governance:\n    image: %s\n' "$rollback_image" >"$backup/rollback.override.yml"
 (
   cd "$backup"
-  sha256sum RELEASE-EVIDENCE.json release.env DRY-RUN.receipt SUPPLY-CHAIN.json \
-    SUPPLY-CHAIN.sig SUPPLY-CHAIN.pub rollback.override.yml \
+    sha256sum RELEASE-EVIDENCE.json release.env DRY-RUN.receipt SUPPLY-CHAIN.json \
+    SUPPLY-CHAIN.sig SUPPLY-CHAIN.pub APPLY-PREIMAGES.sha256 APPLY-ABSENT.paths \
+    RENDER-INPUTS.sha256 rollback.override.yml \
     estate/APPLIED-TARGETS.sha256 estate/PREIMAGES.sha256 estate/ABSENT.before estate/TRANSACTION.json \
     runtime/SHA256SUMS runtime/BACKUP.receipt
 ) >"$backup/CONTROL.sha256"
@@ -131,6 +172,7 @@ apply_receipt="$backup/APPLY.receipt"
   printf 'backup_dir=%s\n' "$backup"
   printf 'release_env_sha256=%s\n' "$release_env_sha"
   printf 'release_evidence_sha256=%s\n' "$(holdfast_sha256 "$backup/RELEASE-EVIDENCE.json")"
+  printf 'render_inputs_sha256=%s\n' "$(holdfast_sha256 "$backup/RENDER-INPUTS.sha256")"
   printf 'cargo_gate=passed\n'
   printf 'runtime_backup=passed\n'
   printf 'ingress_opened=false\n'
