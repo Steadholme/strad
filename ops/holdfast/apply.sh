@@ -734,14 +734,16 @@ rollback_tmp="$backup/.rollback.override.yml.$$"
 printf 'services:\n  access-governance:\n    image: %s\n' "$rollback_image" >"$rollback_tmp"
 commit_atomic_file "$rollback_tmp" "$backup/rollback.override.yml"
 
-# Validate only the immutable copies from this point onward. The transaction
-# consumes these CONTROL-bound manifests rather than the mutable dry-run paths.
+# Validate the immutable copies and their byte-identical canonical staged
+# identity. The transaction consumes CONTROL-bound manifests from this point.
 [[ "$(holdfast_receipt_value "$backup/DRY-RUN.receipt" cargo_gate)" == "passed" ]] || \
   holdfast_die "persisted dry-run receipt lacks the Rust gate"
 [[ "$(holdfast_receipt_value "$backup/DRY-RUN.receipt" targets_sha256)" == "$(holdfast_sha256 "$backup/TARGETS.sha256")" ]] || \
   holdfast_die "persisted targets differ from the dry-run receipt"
 [[ "$(holdfast_receipt_value "$backup/DRY-RUN.receipt" release_evidence_sha256)" == "$(holdfast_sha256 "$backup/RELEASE-EVIDENCE.json")" ]] || \
   holdfast_die "persisted release evidence differs from the dry-run receipt"
+[[ "$(holdfast_sha256 "$backup/RELEASE-EVIDENCE.json")" == "$(holdfast_sha256 "$stage/RELEASE-EVIDENCE.json")" ]] || \
+  holdfast_die "persisted release evidence differs from the canonical staged control file"
 [[ "$(holdfast_receipt_value "$backup/DRY-RUN.receipt" release_env_sha256)" == "$(holdfast_sha256 "$backup/release.env")" ]] || \
   holdfast_die "persisted release env differs from the dry-run receipt"
 [[ "$(holdfast_receipt_value "$backup/DRY-RUN.receipt" apply_preimages_sha256)" == "$(holdfast_sha256 "$backup/APPLY-PREIMAGES.sha256")" ]] || \
@@ -772,7 +774,7 @@ python3 "$script_dir/supply_chain_evidence.py" \
   --release-evidence "$backup/RELEASE-EVIDENCE.json"
 python3 "$script_dir/render_input_binding.py" verify \
   --ops-root "$script_dir" --manifest "$backup/RENDER-INPUTS.sha256" \
-  --stage-root "$stage" --release-evidence "$backup/RELEASE-EVIDENCE.json" \
+  --stage-root "$stage" --release-evidence "$stage/RELEASE-EVIDENCE.json" \
   --require-root-owner
 (cd "$stage" && sha256sum --check "$backup/TARGETS.sha256")
 

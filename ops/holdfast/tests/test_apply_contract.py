@@ -246,6 +246,35 @@ class ApplyContractTests(unittest.TestCase):
         )
         self.assertLess(persisted_receipt, pinned_receipt)
 
+    def test_post_backup_render_binding_uses_canonical_staged_evidence(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        persisted_start = script.index(
+            '# Validate the immutable copies and their byte-identical canonical staged'
+        )
+        armed_start = script.index(
+            '# Persist the exact recovery intent before estate_transaction.py',
+            persisted_start,
+        )
+        persisted = script[persisted_start:armed_start]
+        equality = persisted.index(
+            'persisted release evidence differs from the canonical staged control file'
+        )
+        render_start = persisted.index(
+            'python3 "$script_dir/render_input_binding.py" verify'
+        )
+        render_end = persisted.index('(cd "$stage"', render_start)
+        render_call = persisted[render_start:render_end]
+
+        self.assertLess(equality, render_start)
+        self.assertIn('--manifest "$backup/RENDER-INPUTS.sha256"', render_call)
+        self.assertIn('--stage-root "$stage"', render_call)
+        self.assertIn(
+            '--release-evidence "$stage/RELEASE-EVIDENCE.json"', render_call
+        )
+        self.assertNotIn(
+            '--release-evidence "$backup/RELEASE-EVIDENCE.json"', render_call
+        )
+
     def test_apply_uses_safe_control_directories_and_frozen_digests(self) -> None:
         script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
         directory_helper = script[
