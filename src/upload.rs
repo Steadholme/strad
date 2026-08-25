@@ -567,25 +567,9 @@ impl UploadService {
         let chunks = self.store.recovery_chunks().await?;
         let known: HashSet<String> = chunks.iter().map(|row| row.storage_key.clone()).collect();
         let root = self.root.clone();
-        let paths = tokio::task::spawn_blocking(move || {
-            let mut paths = Vec::new();
-            for entry in WalkDir::new(root.as_ref()).follow_links(false) {
-                let entry = entry.map_err(|_| AppError::Invariant("upload tree is unreadable"))?;
-                let metadata = entry.path().symlink_metadata().map_err(AppError::Io)?;
-                if metadata.file_type().is_symlink()
-                    || (!metadata.is_dir() && !metadata.is_file())
-                    || (metadata.is_file() && has_multiple_links(&metadata))
-                {
-                    return Err(AppError::Invariant("upload tree contains an unsafe inode"));
-                }
-                if metadata.is_file() {
-                    paths.push(entry.path().to_path_buf());
-                }
-            }
-            Ok::<_, AppError>(paths)
-        })
-        .await
-        .map_err(|_| AppError::Invariant("upload recovery task failed"))??;
+        let paths = tokio::task::spawn_blocking(move || scan_upload_tree(root.as_ref()))
+            .await
+            .map_err(|_| AppError::Invariant("upload recovery task failed"))??;
         for path in paths {
             let relative = path
                 .strip_prefix(self.root.as_ref())
@@ -746,6 +730,27 @@ impl UploadService {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+fn scan_upload_tree(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    // `root` is the trusted O_NOFOLLOW fd anchor `/proc/self/fd/<n>`, which is
+    // represented by procfs as a symlink. It was already validated when opened;
+    // scan only descendants so nested links and other unsafe inodes still fail closed.
+    for entry in WalkDir::new(root).follow_links(false).min_depth(1) {
+        let entry = entry.map_err(|_| AppError::Invariant("upload tree is unreadable"))?;
+        let metadata = entry.path().symlink_metadata().map_err(AppError::Io)?;
+        if metadata.file_type().is_symlink()
+            || (!metadata.is_dir() && !metadata.is_file())
+            || (metadata.is_file() && has_multiple_links(&metadata))
+        {
+            return Err(AppError::Invariant("upload tree contains an unsafe inode"));
+        }
+        if metadata.is_file() {
+            paths.push(entry.path().to_path_buf());
+        }
+    }
+    Ok(paths)
 }
 
 async fn ensure_directory(path: &Path) -> Result<()> {
@@ -942,6 +947,66 @@ mod tests {
         assert!(reject_unsafe_existing(&anchored.join("linked.bin"))
             .await
             .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_scan_skips_trusted_fd_root_and_rejects_unsafe_descendants() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let configured = temporary.path().join("uploads");
+        std::fs::create_dir(&configured).unwrap();
+        let (_fd, anchored) = open_anchored_root(&configured).unwrap();
+
+        assert!(anchored
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(scan_upload_tree(&anchored).unwrap().is_empty());
+
+        let regular = configured.join("regular.bin");
+        std::fs::write(&regular, b"trusted").unwrap();
+        let scanned = scan_upload_tree(&anchored).unwrap();
+        assert_eq!(scanned, vec![anchored.join("regular.bin")]);
+
+        let nested = configured.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("nested.bin"), b"nested").unwrap();
+        let scanned = scan_upload_tree(&anchored).unwrap();
+        assert!(scanned.contains(&anchored.join("nested/nested.bin")));
+
+        let directory_link = configured.join("directory-link");
+        symlink(&nested, &directory_link).unwrap();
+        assert!(matches!(
+            scan_upload_tree(&anchored),
+            Err(AppError::Invariant("upload tree contains an unsafe inode"))
+        ));
+        std::fs::remove_file(&directory_link).unwrap();
+
+        let nested_link = configured.join("nested-link");
+        symlink(&regular, &nested_link).unwrap();
+        assert!(matches!(
+            scan_upload_tree(&anchored),
+            Err(AppError::Invariant("upload tree contains an unsafe inode"))
+        ));
+        std::fs::remove_file(&nested_link).unwrap();
+
+        let hardlink = configured.join("hardlink.bin");
+        std::fs::hard_link(&regular, &hardlink).unwrap();
+        assert!(matches!(
+            scan_upload_tree(&anchored),
+            Err(AppError::Invariant("upload tree contains an unsafe inode"))
+        ));
+        std::fs::remove_file(&hardlink).unwrap();
+
+        let socket = configured.join("socket");
+        let _listener = UnixListener::bind(socket).unwrap();
+        assert!(matches!(
+            scan_upload_tree(&anchored),
+            Err(AppError::Invariant("upload tree contains an unsafe inode"))
+        ));
     }
 
     #[tokio::test]
