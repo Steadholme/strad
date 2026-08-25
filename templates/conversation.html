@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>{{ title }} · Rikune Workbench</title>
+<link rel="stylesheet" href="/static/rikune.css">
+</head>
+<body data-wb-page="conversation">
+<a class="wb-skip" href="#main-content">Skip to main content</a>
+
+<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="Rikune Workbench home">
+    <span class="app-tile" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6M9 13h6M9 17h3"/></svg>
+    </span>
+    <span class="appbar__name"><b>Rikune</b><span>Analysis workbench</span></span>
+  </a>
+  <nav class="appbar__nav" aria-label="Primary">
+    <a class="appnav" href="/">Overview</a>
+    <a class="appnav is-active" href="/analyses" aria-current="page">Analyses</a>
+  </nav>
+  <div class="appbar__right">
+    <span class="chip" title="Signed in">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      <span class="sr-only">Signed in.</span>Account
+    </span>
+  </div>
+</header>
+
+<main id="main-content" tabindex="-1">
+  <div class="page wb-root" data-wb-analysis-id="{{ analysis_id }}" data-wb-conversation-id="{{ selected_conversation_id }}">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="/analyses">Analyses</a>
+      <span class="breadcrumb__sep" aria-hidden="true">/</span>
+      <a class="mono" href="/analyses/{{ analysis_id }}">{{ title }}</a>
+      <span class="breadcrumb__sep" aria-hidden="true">/</span>
+      <span aria-current="page">Conversation</span>
+    </nav>
+
+    <nav class="tabs" role="tablist" aria-label="Analysis sections">
+      <a class="tab" role="tab" href="/analyses/{{ analysis_id }}/summary">Summary</a>
+      <a class="tab" role="tab" href="/analyses/{{ analysis_id }}/evidence">Evidence</a>
+      <a class="tab is-active" role="tab" aria-current="page" href="/analyses/{{ analysis_id }}/conversation">Conversation</a>
+      <a class="tab" role="tab" href="/analyses/{{ analysis_id }}/stages">Activity</a>
+    </nav>
+
+    <div class="wb-chatgrid">
+      <aside aria-labelledby="wb-sessions-title">
+        <div class="card">
+          <div class="card__head"><h2 id="wb-sessions-title">Sessions</h2></div>
+          <div class="card__body">
+            <form class="wb-newsession" method="post" action="/api/analyses/{{ analysis_id }}/conversations" data-wb-new-session>
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="operation_id" value="{{ create_conversation_operation_id }}">
+              <div class="field">
+                <label for="wb-session-title">New session</label>
+                <input id="wb-session-title" name="title" type="text" maxlength="240" required placeholder="e.g. Triage" autocomplete="off">
+              </div>
+              <div class="field">
+                <label for="wb-session-persona">Persona</label>
+                <select id="wb-session-persona" name="persona_id" data-wb-persona-select>
+                  <option value="binary-analyst">General analyst</option>
+                  <option value="malware-analyst">Malware triage</option>
+                  <option value="reverse-engineer">Vulnerability researcher</option>
+                  <option value="incident-responder">Incident responder</option>
+                </select>
+              </div>
+              <div class="actions">
+                <button type="submit" class="btn btn-primary btn-sm">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                  Create session
+                </button>
+              </div>
+            </form>
+          </div>
+          <div class="card__body--list">
+            <div data-wb-sessions hidden></div>
+            <div class="empty" data-wb-sessions-empty hidden>
+              <p>No sessions yet. Create one to ask the AI about this analysis.</p>
+            </div>
+          </div>
+          <details class="wb-rawdata" open>
+            <summary>Session data</summary>
+            <div class="card__body"><pre class="wb-datapre mono" data-wb-data="conversations" id="wb-data-conversations">{{ conversations_json }}</pre></div>
+          </details>
+        </div>
+      </aside>
+
+      <section aria-labelledby="wb-thread-title" data-wb-thread-region>
+        <h2 class="sr-only" id="wb-thread-title">Conversation</h2>
+
+        <div class="alert alert--info" role="note" data-wb-select-note hidden>
+          <div class="alert__body"><span class="alert__title">Select a session</span><span>Choose a session on the left, or create one, to ask questions.</span></div>
+        </div>
+
+        <div class="card">
+          <div class="card__head">
+            <h3>Thread</h3>
+            <div class="pagehead__actions">
+              <form class="wb-inline-form" method="post" action="/api/analyses/{{ analysis_id }}/conversations/{{ selected_conversation_id }}/persona" data-wb-persona-form>
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="operation_id" value="{{ persona_operation_id }}">
+                <label class="sr-only" for="wb-thread-persona">Persona</label>
+                <select id="wb-thread-persona" class="select" name="persona_id" data-wb-persona-select>
+                  <option value="binary-analyst">General analyst</option>
+                  <option value="malware-analyst">Malware triage</option>
+                  <option value="reverse-engineer">Vulnerability researcher</option>
+                  <option value="incident-responder">Incident responder</option>
+                </select>
+                <button type="submit" class="btn btn-subtle btn-sm">Apply</button>
+              </form>
+            </div>
+          </div>
+          <div class="card__body">
+            <div class="wb-thread" data-wb-thread aria-live="polite"></div>
+            <div class="empty" data-wb-thread-empty hidden>
+              <h3>Ask a question about this binary</h3>
+              <p>The AI answers using the analysis evidence and cites the evidence it relies on.</p>
+            </div>
+            <details class="wb-rawdata" open>
+              <summary>Message data</summary>
+              <pre class="wb-datapre mono" data-wb-data="messages" id="wb-data-messages">{{ messages_json }}</pre>
+            </details>
+          </div>
+
+          <div class="card__body">
+            <details class="wb-context-preview" data-wb-context-preview>
+              <summary>What will be sent to the AI</summary>
+              <div class="wb-context" data-wb-context-body>
+                <p class="hint">A grounded, bounded context pack is assembled from the analysis evidence before each question. <a href="/api/analyses/{{ analysis_id }}/context-preview">Open the full context preview</a>.</p>
+              </div>
+            </details>
+
+            <form class="wb-composer" method="post" action="/api/analyses/{{ analysis_id }}/conversations/{{ selected_conversation_id }}/turns" data-wb-turn>
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="operation_id" value="{{ turn_operation_id }}">
+              <input type="hidden" name="client_seq" value="{{ next_client_seq }}" data-wb-client-seq>
+              <label class="sr-only" for="wb-message">Your question</label>
+              <textarea id="wb-message" name="message" rows="3" maxlength="8192" required placeholder="Ask about this binary…" data-wb-message></textarea>
+              <div class="wb-composer__row">
+                <span class="charcount" data-wb-charcount aria-hidden="true">0 / 8192</span>
+                <button type="submit" class="btn btn-primary btn-sm" data-wb-send>
+                  Send
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+                </button>
+              </div>
+            </form>
+            <p class="hint">The AI may be temporarily unavailable; your message is always saved so you can try again.</p>
+          </div>
+        </div>
+
+        <details class="wb-rawdata">
+          <summary>Analysis data</summary>
+          <pre class="wb-datapre mono" data-wb-data="analysis" id="wb-data-analysis">{{ analysis_json }}</pre>
+        </details>
+      </section>
+    </div>
+  </div>
+</main>
+
+<footer class="site-foot">
+  <span>Steadholme · Rikune Workbench</span>
+  <span class="muted">Static binary analysis</span>
+</footer>
+
+<div class="toast-region" data-wb-toasts aria-live="polite" aria-atomic="false"></div>
+
+<script src="/static/rikune.js" defer></script>
+</body>
+</html>

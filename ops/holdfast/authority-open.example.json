@@ -1,0 +1,30 @@
+{
+  "schema_version": 2,
+  "ceremony": "holdfast-rikune-open-v2",
+  "issued_at": "REQUIRED_UTC_AFTER_ALL_ACKS",
+  "expires_at": "REQUIRED_UTC_FINITE_EXPIRY",
+  "release_env_sha256": "REQUIRED_64lowerhex",
+  "release_evidence_sha256": "REQUIRED_64lowerhex",
+  "dry_run_receipt_sha256": "REQUIRED_64lowerhex",
+  "signature_key_sha256": "REQUIRED_64lowerhex",
+  "candidate_image_digest": "REQUIRED_repo@sha256:64lowerhex",
+  "build_input_sha256": "REQUIRED_64lowerhex",
+  "permission_catalog_sha256": "REQUIRED_64lowerhex",
+  "package_catalog_sha256": "REQUIRED_64lowerhex",
+  "bootstrap_version": 6,
+  "package_id": "pkg_rikune_analyst",
+  "requestable_version": 2,
+  "beneficiary": "user:rikune-acceptance",
+  "promotion_ceremony_id": "REQUIRED",
+  "package_request_id": "REQUIRED",
+  "source_grant_id": "REQUIRED",
+  "projection_edges": [
+    {"permission": "rikune.analysis.create", "epoch": 0, "ack": false, "acknowledged_at": "REQUIRED"},
+    {"permission": "rikune.analysis.delete", "epoch": 0, "ack": false, "acknowledged_at": "REQUIRED"},
+    {"permission": "rikune.analysis.promote", "epoch": 0, "ack": false, "acknowledged_at": "REQUIRED"},
+    {"permission": "rikune.analysis.read", "epoch": 0, "ack": false, "acknowledged_at": "REQUIRED"},
+    {"permission": "rikune.console.enter", "epoch": 0, "ack": false, "acknowledged_at": "REQUIRED"},
+    {"permission": "rikune.conversation.use", "epoch": 0, "ack": false, "acknowledged_at": "REQUIRED"},
+    {"permission": "rikune.upload.cancel", "epoch": 0, "ack": false, "acknowledged_at": "REQUIRED"}
+  ]
+}

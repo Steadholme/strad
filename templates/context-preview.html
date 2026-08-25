@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>{{ title }} · Rikune Workbench</title>
+<link rel="stylesheet" href="/static/rikune.css">
+</head>
+<body data-wb-page="context-preview">
+<a class="wb-skip" href="#main-content">Skip to main content</a>
+
+<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="Rikune Workbench home">
+    <span class="app-tile" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6M9 13h6M9 17h3"/></svg>
+    </span>
+    <span class="appbar__name"><b>Rikune</b><span>Analysis workbench</span></span>
+  </a>
+  <nav class="appbar__nav" aria-label="Primary">
+    <a class="appnav" href="/">Overview</a>
+    <a class="appnav is-active" href="/analyses" aria-current="page">Analyses</a>
+  </nav>
+  <div class="appbar__right">
+    <span class="chip" title="Signed in">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      <span class="sr-only">Signed in.</span>Account
+    </span>
+  </div>
+</header>
+
+<main id="main-content" tabindex="-1">
+  <div class="page page--narrow">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="/analyses">Analyses</a>
+      <span class="breadcrumb__sep" aria-hidden="true">/</span>
+      <a class="mono" href="/analyses/{{ analysis_id }}">{{ title }}</a>
+      <span class="breadcrumb__sep" aria-hidden="true">/</span>
+      <a href="/analyses/{{ analysis_id }}/conversation">Conversation</a>
+      <span class="breadcrumb__sep" aria-hidden="true">/</span>
+      <span aria-current="page">Context preview</span>
+    </nav>
+
+    <div class="pagehead">
+      <div>
+        <p class="pagehead__eyebrow">Grounding</p>
+        <h1>What will be sent to the AI</h1>
+        <p>This is the exact, bounded context pack assembled from the analysis evidence. It is generated deterministically on the server; no raw binary or private data is included.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card__head"><h2>Context pack</h2></div>
+      <div class="card__body">
+        <div data-wb-context hidden></div>
+        <div class="empty" data-wb-context-empty hidden>
+          <h3>No evidence available yet</h3>
+          <p>Analysis must complete before AI grounding is available.</p>
+        </div>
+        <details class="wb-rawdata wb-context" open>
+          <summary>Context data</summary>
+          <pre class="wb-datapre mono" data-wb-data="context" id="wb-data-context">{{ context_json }}</pre>
+        </details>
+      </div>
+      <div class="card__foot">
+        <a class="btn btn-ghost btn-sm" href="/analyses/{{ analysis_id }}/conversation">Back to conversation</a>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer class="site-foot">
+  <span>Steadholme · Rikune Workbench</span>
+  <span class="muted">Static binary analysis</span>
+</footer>
+
+<script src="/static/rikune.js" defer></script>
+</body>
+</html>

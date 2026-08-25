@@ -1,0 +1,52 @@
+[package]
+name = "strad"
+version = "0.1.0"
+edition = "2021"
+description = "Rikune AI binary analysis workbench for HOLDFAST"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "strad"
+path = "src/lib.rs"
+
+[[bin]]
+name = "strad"
+path = "src/main.rs"
+
+[dependencies]
+async-stream = "0.3"
+axum = { version = "0.8", features = ["form", "json", "multipart"] }
+bytes = "1"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+http-body-util = "0.1"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rustix = { version = "1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "time", "json", "macros"] }
+subtle = "2"
+thiserror = "2"
+tiktoken-rs = "0.7"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["limit", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

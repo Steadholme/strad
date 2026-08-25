@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: strad-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run Rust unit tests
+        run: cargo test --locked --lib --bins
+
+  node-and-holdfast:
+    name: Bridge, frontend, and Holdfast
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+      - name: Install bridge dependencies
+        working-directory: bridge
+        run: npm ci
+      - name: Typecheck bridge
+        working-directory: bridge
+        run: npm run typecheck
+      - name: Test bridge
+        working-directory: bridge
+        run: npm test
+      - name: Test frontend contracts
+        run: node --test tests/frontend/*.test.js
+      - name: Test Holdfast tooling
+        run: python3 -m unittest discover -s ops/holdfast/tests -v
+
+  postgres-contract:
+    name: PostgreSQL / ${{ matrix.test }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - postgres_owner_delete_and_sample_lifecycle_are_transactional
+          - postgres_24h_disposition_preserves_spool_authority_until_physical_delete
+          - postgres_quota_warning_claims_once_per_owner_and_utc_day
+          - postgres_promote_and_checkpoint_uncertain_reconcile_the_original_operations
+          - postgres_chat_terminal_citation_retry_delete_replay_and_promote_order
+          - postgres_ssr_projection_and_server_operation_claims_are_owner_scoped
+    services:
+      postgres:
+        image: postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: strad_test
+          POSTGRES_DB: strad_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d strad_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      STRAD_TEST_DATABASE_URL: postgres://postgres:strad_test@127.0.0.1:5432/strad_test
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run isolated PostgreSQL contract
+        run: cargo test --locked --test postgres_contract "${{ matrix.test }}" -- --exact
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Scan source
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo
+          ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          dir . --no-banner --redact

@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "ceremony": "holdfast-rikune-edge-cutover-v1",
+  "issued_at": "REQUIRED_UTC_AFTER_PUBLIC_PROBES",
+  "signature_key_sha256": "REQUIRED_64lowerhex",
+  "release_evidence_sha256": "REQUIRED_64lowerhex",
+  "open_evidence_sha256": "REQUIRED_64lowerhex",
+  "source_grant_id": "REQUIRED_SAME_AS_OPEN",
+  "open_prepare_receipt_sha256": "REQUIRED_64lowerhex",
+  "github_pages_preflight": {
+    "repository": "Last-emo-boy/rikune",
+    "source_branch": "main",
+    "source_path": "/docs",
+    "cname": "rikune.w33d.xyz",
+    "status": "built",
+    "api_response_sha256": "REQUIRED_64lowerhex",
+    "observed_at": "REQUIRED_UTC"
+  },
+  "github_pages_detach": {
+    "method": "PUT",
+    "path": "/repos/Last-emo-boy/rikune/pages",
+    "api_version": "2026-03-10",
+    "request_body_sha256": "REQUIRED_64lowerhex",
+    "response_status": 204,
+    "completed_at": "REQUIRED_UTC_AFTER_PREPARE",
+    "post_get_sha256": "REQUIRED_64lowerhex",
+    "post_cname": null
+  },
+  "cloudflare": {
+    "token_secret_path": "/secure/release/cloudflare-rikune.token",
+    "token_scopes": ["Cache Purge", "DNS Write"],
+    "zone_id_sha256": "REQUIRED_64lowerhex",
+    "record_id_sha256": "REQUIRED_64lowerhex",
+    "pre_record_sha256": "REQUIRED_64lowerhex",
+    "post_record_sha256": "REQUIRED_64lowerhex",
+    "patch_method": "PATCH",
+    "patch_path_sha256": "REQUIRED_64lowerhex",
+    "patch_request_sha256": "REQUIRED_64lowerhex",
+    "patch_response_sha256": "REQUIRED_64lowerhex",
+    "patched_at": "REQUIRED_UTC_AFTER_PAGES_DETACH",
+    "origin": "w33d-sluice-ingress",
+    "pre_ttl_seconds": 300,
+    "post_ttl_seconds": 300,
+    "ttl_wait_seconds": 300,
+    "ttl_converged_at": "REQUIRED_UTC_AFTER_TTL_WAIT",
+    "purge_method": "POST",
+    "purge_request_sha256": "REQUIRED_64lowerhex",
+    "purge_response_id": "REQUIRED_CLOUDFLARE_RESPONSE_ID",
+    "purge_response_sha256": "REQUIRED_64lowerhex",
+    "purged_at": "REQUIRED_UTC_AFTER_PATCH"
+  },
+  "public_probes": [
+    {
+      "family": "ipv4",
+      "observed_at": "REQUIRED_UTC_AFTER_PURGE_AND_TTL",
+      "status": 302,
+      "cache_control": "private, no-store",
+      "github_request_id": null,
+      "proxy_cache": null,
+      "fastly_via": null,
+      "origin": "sluice-strad",
+      "response_headers_sha256": "REQUIRED_64lowerhex"
+    },
+    {
+      "family": "ipv6",
+      "observed_at": "REQUIRED_UTC_AFTER_PURGE_AND_TTL",
+      "status": 302,
+      "cache_control": "private, no-store",
+      "github_request_id": null,
+      "proxy_cache": null,
+      "fastly_via": null,
+      "origin": "sluice-strad",
+      "response_headers_sha256": "REQUIRED_64lowerhex"
+    }
+  ]
+}

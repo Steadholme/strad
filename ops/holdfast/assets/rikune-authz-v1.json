@@ -1,0 +1,766 @@
+{
+  "schema_version": 1,
+  "service": "rikune",
+  "owner": "team-rikune",
+  "owner_sub": "user:u_admin",
+  "manifest_id": "rikune-authz-v1",
+  "generated_at": 1787443200,
+  "digest_scope": "authz-manifest-v1",
+  "permissions": [
+    {
+      "key": "rikune.analysis.create",
+      "risk": "high",
+      "principal_class": "human",
+      "owner_sub": "user:u_admin",
+      "approval": {
+        "minimum_approvals": 2
+      },
+      "recertification": {
+        "interval_days": 180
+      }
+    },
+    {
+      "key": "rikune.analysis.delete",
+      "risk": "high",
+      "principal_class": "human",
+      "owner_sub": "user:u_admin",
+      "approval": {
+        "minimum_approvals": 2
+      },
+      "recertification": {
+        "interval_days": 180
+      }
+    },
+    {
+      "key": "rikune.analysis.promote",
+      "risk": "high",
+      "principal_class": "human",
+      "owner_sub": "user:u_admin",
+      "approval": {
+        "minimum_approvals": 2
+      },
+      "recertification": {
+        "interval_days": 180
+      }
+    },
+    {
+      "key": "rikune.analysis.read",
+      "risk": "medium",
+      "principal_class": "human",
+      "owner_sub": "user:u_admin",
+      "approval": {
+        "minimum_approvals": 1
+      },
+      "recertification": {
+        "interval_days": 365
+      }
+    },
+    {
+      "key": "rikune.console.enter",
+      "risk": "critical",
+      "principal_class": "human",
+      "owner_sub": "user:u_admin",
+      "approval": {
+        "minimum_approvals": 2
+      },
+      "recertification": {
+        "interval_days": 90
+      }
+    },
+    {
+      "key": "rikune.conversation.use",
+      "risk": "medium",
+      "principal_class": "human",
+      "owner_sub": "user:u_admin",
+      "approval": {
+        "minimum_approvals": 1
+      },
+      "recertification": {
+        "interval_days": 365
+      }
+    },
+    {
+      "key": "rikune.upload.cancel",
+      "risk": "medium",
+      "principal_class": "human",
+      "owner_sub": "user:u_admin",
+      "approval": {
+        "minimum_approvals": 1
+      },
+      "recertification": {
+        "interval_days": 365
+      }
+    }
+  ],
+  "entries": [
+    {
+      "method": "GET",
+      "path": "/",
+      "handler": "workbench-root",
+      "action": "rikune.console.enter",
+      "permission": "rikune.console.enter",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "route",
+        "source": "static",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "id": "rikune-root"
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 2
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "workbench-root",
+        "severity": "info"
+      }
+    }
+  ],
+  "functions": [
+    {
+      "method": "GET",
+      "path": "/analyses",
+      "handler": "analyses-list",
+      "action": "rikune.analysis.read",
+      "permission": "rikune.analysis.read",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "collection",
+        "resolution": "pre-handler",
+        "cardinality": "single"
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "analyses-list",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/analyses",
+      "handler": "analysis-create",
+      "action": "rikune.analysis.create",
+      "permission": "rikune.analysis.create",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-upload",
+        "source": "collection",
+        "resolution": "pre-handler",
+        "cardinality": "single"
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 2
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "analysis-create",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/uploads/:rid",
+      "handler": "upload-status",
+      "action": "rikune.analysis.create",
+      "permission": "rikune.analysis.create",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-upload",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "rid",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 2
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "upload-status",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/uploads/:rid/chunks",
+      "handler": "upload-chunk",
+      "action": "rikune.analysis.create",
+      "permission": "rikune.analysis.create",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-upload",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "rid",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 2
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "upload-chunk",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/uploads/:rid/finalize",
+      "handler": "upload-finalize",
+      "action": "rikune.analysis.create",
+      "permission": "rikune.analysis.create",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-upload",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "rid",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 2
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "upload-finalize",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/uploads/:rid/cancel",
+      "handler": "upload-cancel",
+      "action": "rikune.upload.cancel",
+      "permission": "rikune.upload.cancel",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-upload",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "rid",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "upload-cancel",
+        "severity": "warning"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/analyses/:id",
+      "handler": "analysis-detail",
+      "action": "rikune.analysis.read",
+      "permission": "rikune.analysis.read",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "analysis-detail",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/analyses/:id/summary",
+      "handler": "analysis-summary",
+      "action": "rikune.analysis.read",
+      "permission": "rikune.analysis.read",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "analysis-summary",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/analyses/:id/evidence",
+      "handler": "analysis-evidence",
+      "action": "rikune.analysis.read",
+      "permission": "rikune.analysis.read",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "analysis-evidence",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/analyses/:id/stages",
+      "handler": "analysis-stages",
+      "action": "rikune.analysis.read",
+      "permission": "rikune.analysis.read",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "analysis-stages",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/analyses/:id/conversation",
+      "handler": "conversation-page",
+      "action": "rikune.conversation.use",
+      "permission": "rikune.conversation.use",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "conversation-page",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/analyses/:id/context-preview",
+      "handler": "analysis-context-preview",
+      "action": "rikune.analysis.read",
+      "permission": "rikune.analysis.read",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "analysis-context-preview",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/analyses/:id/events",
+      "handler": "analysis-events",
+      "action": "rikune.analysis.read",
+      "permission": "rikune.analysis.read",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "analysis-events",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/analyses/:id/promote",
+      "handler": "analysis-promote",
+      "action": "rikune.analysis.promote",
+      "permission": "rikune.analysis.promote",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 2
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "analysis-promote",
+        "severity": "warning"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/analyses/:id/delete",
+      "handler": "analysis-delete",
+      "action": "rikune.analysis.delete",
+      "permission": "rikune.analysis.delete",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 2
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "analysis-delete",
+        "severity": "warning"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/analyses/:id/conversations",
+      "handler": "conversation-create",
+      "action": "rikune.conversation.use",
+      "permission": "rikune.conversation.use",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "conversation-create",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/analyses/:id/conversations/:cid/persona",
+      "handler": "conversation-persona",
+      "action": "rikune.conversation.use",
+      "permission": "rikune.conversation.use",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-conversation",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "cid",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "conversation-persona",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/analyses/:id/conversations/:cid/turns",
+      "handler": "turn-create",
+      "action": "rikune.conversation.use",
+      "permission": "rikune.conversation.use",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-conversation",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "cid",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "turn-create",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/analyses/:id/conversations/:cid/turns/:tid",
+      "handler": "turn-status",
+      "action": "rikune.conversation.use",
+      "permission": "rikune.conversation.use",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-turn",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "tid",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "turn-status",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/analyses/:id/conversations/:cid/delete",
+      "handler": "conversation-delete",
+      "action": "rikune.conversation.use",
+      "permission": "rikune.conversation.use",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-conversation",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "cid",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": true,
+        "target": "conversation-delete",
+        "severity": "warning"
+      }
+    }
+  ],
+  "machine_endpoints": [],
+  "machine_data_plane": [],
+  "exemptions": []
+}

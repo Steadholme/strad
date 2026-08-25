@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>{{ title }} · Rikune Workbench</title>
+<link rel="stylesheet" href="/static/rikune.css">
+</head>
+<body data-wb-page="detail">
+<a class="wb-skip" href="#main-content">Skip to main content</a>
+
+<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="Rikune Workbench home">
+    <span class="app-tile" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6M9 13h6M9 17h3"/></svg>
+    </span>
+    <span class="appbar__name"><b>Rikune</b><span>Analysis workbench</span></span>
+  </a>
+  <nav class="appbar__nav" aria-label="Primary">
+    <a class="appnav" href="/">Overview</a>
+    <a class="appnav is-active" href="/analyses" aria-current="page">Analyses</a>
+  </nav>
+  <div class="appbar__right">
+    <span class="chip" title="Signed in">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      <span class="sr-only">Signed in.</span>Account
+    </span>
+  </div>
+</header>
+
+<main id="main-content" tabindex="-1">
+  <div class="page wb-root" data-section="{{ section }}" data-wb-analysis-id="{{ analysis_id }}" data-wb-events-url="/api/analyses/{{ analysis_id }}/events">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="/analyses">Analyses</a>
+      <span class="breadcrumb__sep" aria-hidden="true">/</span>
+      <span aria-current="page" class="mono">{{ title }}</span>
+    </nav>
+
+    <div class="pagehead">
+      <div>
+        <p class="pagehead__eyebrow">Analysis</p>
+        <h1 class="mono">{{ title }}</h1>
+        <p class="wb-analysis-sub">
+          <span class="pill pill-neutral" data-wb-status-pill>
+            <span class="dot" data-wb-status-dot aria-hidden="true"></span>
+            <span data-wb-status-label>Loading…</span>
+          </span>
+          <span class="muted" data-wb-retention></span>
+        </p>
+      </div>
+      <div class="pagehead__actions">
+        <form class="wb-inline-form" method="post" action="/api/analyses/{{ analysis_id }}/promote" data-wb-promote>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="operation_id" value="{{ promote_operation_id }}">
+          <button type="submit" class="btn btn-ghost">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            Promote
+          </button>
+        </form>
+        <details class="wb-confirm" data-wb-delete-confirm>
+          <summary class="btn btn-danger">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+            Delete
+          </summary>
+          <div class="wb-confirm__panel" role="group" aria-label="Confirm delete">
+            <p class="wb-confirm__title">Delete this analysis?</p>
+            <p>This permanently deletes the file, its analysis data and artifacts, and all conversation sessions and messages. Your storage will be freed. This cannot be undone.</p>
+            <form method="post" action="/api/analyses/{{ analysis_id }}/delete" data-wb-delete>
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="operation_id" value="{{ delete_operation_id }}">
+              <div class="actions">
+                <button type="submit" class="btn btn-danger">Delete permanently</button>
+              </div>
+            </form>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div class="alert alert--warn" role="status" data-wb-degraded-banner hidden>
+      <span class="alert__ico" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+      </span>
+      <div class="alert__body">
+        <span class="alert__title">Some analysis stages did not complete</span>
+        <span>The evidence below reflects what was recovered. You can promote to retry the remaining stages, or use the available findings.</span>
+      </div>
+    </div>
+
+    <div class="alert alert--info" role="status" data-wb-recovering-banner hidden>
+      <div class="alert__body">
+        <span class="alert__title">Recovering</span>
+        <span>This analysis is being recovered from a previous run. Progress will update automatically.</span>
+      </div>
+    </div>
+
+    <nav class="tabs" role="tablist" aria-label="Analysis sections">
+      <a class="tab" data-tab="summary" role="tab" href="/analyses/{{ analysis_id }}/summary">Summary</a>
+      <a class="tab" data-tab="evidence" role="tab" href="/analyses/{{ analysis_id }}/evidence">Evidence</a>
+      <a class="tab" role="tab" href="/analyses/{{ analysis_id }}/conversation">Conversation</a>
+      <a class="tab" data-tab="stages" role="tab" href="/analyses/{{ analysis_id }}/stages">Activity</a>
+    </nav>
+
+    <div class="wb-panels">
+      <!-- Overview (default at /analyses/:id) -->
+      <section class="wb-panel" data-panel="detail" role="tabpanel" aria-label="Overview">
+        <div class="card">
+          <div class="card__head"><h2>Overview</h2></div>
+          <div class="card__body">
+            <dl class="desc" data-wb-overview>
+              <dt class="desc__term">Status</dt><dd class="desc__val" data-wb-field="state">—</dd>
+              <dt class="desc__term">Sample</dt><dd class="desc__val mono" data-wb-field="sample_id">—</dd>
+              <dt class="desc__term">Created</dt><dd class="desc__val" data-wb-field="created_at">—</dd>
+              <dt class="desc__term">Retention</dt><dd class="desc__val" data-wb-field="retention_until">—</dd>
+            </dl>
+            <p class="hint">Use the tabs above to review the summary, evidence, activity, and to ask questions.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Summary -->
+      <section class="wb-panel" data-panel="summary" role="tabpanel" aria-label="Summary">
+        <div class="card">
+          <div class="card__head"><h2>Summary</h2></div>
+          <div class="card__body">
+            <div data-wb-summary hidden></div>
+            <div class="empty" data-wb-summary-empty hidden>
+              <h3>No summary yet</h3>
+              <p>A summary becomes available once analysis completes. Check the Activity tab for progress.</p>
+            </div>
+            <p class="hint">Source: Rikune static analysis — grounded evidence, not AI-generated.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Evidence -->
+      <section class="wb-panel" data-panel="evidence" role="tabpanel" aria-label="Evidence">
+        <div class="card">
+          <div class="card__head"><h2>Evidence</h2></div>
+          <div class="card__body">
+            <div data-wb-evidence hidden></div>
+            <div class="empty" data-wb-evidence-empty hidden>
+              <h3>No evidence yet</h3>
+              <p>Evidence appears once the function map completes. Check the Activity tab for progress.</p>
+            </div>
+          </div>
+          <details class="wb-rawdata" open>
+            <summary>Evidence data</summary>
+            <div class="card__body">
+              <pre class="wb-datapre mono" data-wb-data="artifacts" id="wb-data-artifacts">{{ artifacts_json }}</pre>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <!-- Activity / stages -->
+      <section class="wb-panel" data-panel="stages" role="tabpanel" aria-label="Activity">
+        <div class="card">
+          <div class="card__head">
+            <h2>Activity</h2>
+            <a class="btn btn-subtle btn-sm" href="/analyses/{{ analysis_id }}/stages" data-wb-refresh>Refresh</a>
+          </div>
+          <div class="card__body">
+            <div data-wb-stages hidden></div>
+            <p class="hint">Promoting advances to a deeper stage. Dynamic stages are not available in this version.</p>
+            <ul class="eventline" data-wb-events aria-live="polite" aria-label="Recent events"></ul>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <details class="wb-rawdata" data-wb-rawdata open>
+      <summary>Analysis data</summary>
+      <div class="card"><div class="card__body">
+        <pre class="wb-datapre mono" data-wb-data="analysis" id="wb-data-analysis">{{ analysis_json }}</pre>
+      </div></div>
+    </details>
+  </div>
+</main>
+
+<footer class="site-foot">
+  <span>Steadholme · Rikune Workbench</span>
+  <span class="muted">Static binary analysis</span>
+</footer>
+
+<div class="toast-region" data-wb-toasts aria-live="polite" aria-atomic="false"></div>
+
+<script src="/static/rikune.js" defer></script>
+</body>
+</html>

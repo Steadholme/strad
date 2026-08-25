@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Something went wrong · Rikune Workbench</title>
+<link rel="stylesheet" href="/static/rikune.css">
+</head>
+<body data-wb-page="error">
+<a class="wb-skip" href="#main-content">Skip to main content</a>
+
+<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="Rikune Workbench home">
+    <span class="app-tile" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6M9 13h6M9 17h3"/></svg>
+    </span>
+    <span class="appbar__name"><b>Rikune</b><span>Analysis workbench</span></span>
+  </a>
+</header>
+
+<main id="main-content" tabindex="-1">
+  <div class="error-card">
+    <div class="error-card__code" aria-hidden="true">!</div>
+    <h1 class="error-card__title">Something went wrong</h1>
+    <p class="error-card__msg">The request could not be completed. This is usually temporary — please try again in a moment.</p>
+    <div class="actions wb-center">
+      <a class="btn btn-primary" href="/analyses">Back to analyses</a>
+    </div>
+  </div>
+</main>
+
+<footer class="site-foot">
+  <span>Steadholme · Rikune Workbench</span>
+  <span class="muted">Static binary analysis</span>
+</footer>
+</body>
+</html>

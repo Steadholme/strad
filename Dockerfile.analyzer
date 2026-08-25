@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+ARG STRAD_NODE_BUILDER_IMAGE
+ARG RIKUNE_ANALYZER_IMAGE
+
+FROM ${STRAD_NODE_BUILDER_IMAGE} AS bridge-builder
+ARG STRAD_NODE_BUILDER_IMAGE
+ARG RIKUNE_ANALYZER_IMAGE
+ARG STRAD_REVISION
+RUN case "${STRAD_NODE_BUILDER_IMAGE}" in *@sha256:*) ;; *) exit 64 ;; esac \
+ && case "${RIKUNE_ANALYZER_IMAGE}" in ghcr.io/last-emo-boy/rikune-analyzer-static@sha256:*) ;; *) exit 64 ;; esac \
+ && builder_digest="${STRAD_NODE_BUILDER_IMAGE##*@sha256:}" \
+ && analyzer_digest="${RIKUNE_ANALYZER_IMAGE##*@sha256:}" \
+ && test "${#builder_digest}" -eq 64 \
+ && test "${#analyzer_digest}" -eq 64 \
+ && ! printf '%s' "${builder_digest}" | grep -q '[^0-9a-f]' \
+ && ! printf '%s' "${analyzer_digest}" | grep -q '[^0-9a-f]' \
+ && case "${STRAD_REVISION}" in ????????????????????????????????????????) ;; *) exit 64 ;; esac \
+ && ! printf '%s' "${STRAD_REVISION}" | grep -q '[^0-9a-f]'
+
+WORKDIR /bridge
+COPY bridge/package.json bridge/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY bridge/tsconfig.json ./
+COPY bridge/src/ ./src/
+RUN npm run build \
+ && npm prune --omit=dev --no-audit --no-fund \
+ && test -f /bridge/dist/src/index.js \
+ && test -f /bridge/node_modules/better-sqlite3/build/Release/better_sqlite3.node
+
+FROM ${RIKUNE_ANALYZER_IMAGE} AS runtime
+ARG RIKUNE_ANALYZER_IMAGE
+ARG STRAD_REVISION
+LABEL org.opencontainers.image.title="Strad Rikune analyzer" \
+      org.opencontainers.image.description="Static-only Rikune analyzer with the bounded Strad MCP bridge" \
+      org.opencontainers.image.revision="${STRAD_REVISION}" \
+      org.opencontainers.image.base.name="${RIKUNE_ANALYZER_IMAGE}"
+COPY --from=bridge-builder --chown=10001:10001 /bridge/package.json /opt/strad-bridge/package.json
+COPY --from=bridge-builder --chown=10001:10001 /bridge/node_modules/ /opt/strad-bridge/node_modules/
+COPY --from=bridge-builder --chown=10001:10001 /bridge/dist/ /opt/strad-bridge/dist/
+WORKDIR /opt/strad-bridge
+USER 10001:10001
+EXPOSE 18090
+ENTRYPOINT ["/usr/local/bin/node", "/opt/strad-bridge/dist/src/index.js"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=180s --retries=3 \
+  CMD ["/usr/local/bin/node", "/opt/strad-bridge/dist/src/healthcheck.js"]

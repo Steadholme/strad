@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>{{ title }} · Rikune Workbench</title>
+<link rel="stylesheet" href="/static/rikune.css">
+</head>
+<body data-wb-page="workbench">
+<a class="wb-skip" href="#main-content">Skip to main content</a>
+
+<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="Rikune Workbench home">
+    <span class="app-tile" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6M9 13h6M9 17h3"/></svg>
+    </span>
+    <span class="appbar__name"><b>Rikune</b><span>Analysis workbench</span></span>
+  </a>
+  <nav class="appbar__nav" aria-label="Primary">
+    <a class="appnav is-active" href="/" aria-current="page">Overview</a>
+    <a class="appnav" href="/analyses">Analyses</a>
+  </nav>
+  <div class="appbar__right">
+    <span class="chip" title="Signed in">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      <span class="sr-only">Signed in.</span>Account
+    </span>
+  </div>
+</header>
+
+<main id="main-content" tabindex="-1">
+  <div class="page">
+    <div class="pagehead">
+      <div>
+        <p class="pagehead__eyebrow">Workbench</p>
+        <h1>Analyze a binary</h1>
+        <p>Upload a file for static analysis. Rikune profiles the binary, maps its functions, and gathers evidence you can review and ask questions about.</p>
+      </div>
+      <div class="pagehead__actions">
+        <a class="btn btn-ghost" href="/analyses">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+          View analyses
+        </a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <section class="card" aria-labelledby="wb-upload-title">
+        <div class="card__head"><h2 id="wb-upload-title">New analysis</h2></div>
+        <div class="card__body">
+          <div class="alert alert--down" role="alert" data-wb-upload-error hidden>
+            <div class="alert__body"><span class="alert__title">Upload problem</span><span data-wb-upload-error-text></span></div>
+          </div>
+
+          <form class="wb-upload-form" action="/api/analyses" method="post" enctype="multipart/form-data" data-wb-upload>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="field" data-wb-size-field>
+              <label for="wb-total-bytes">File size in bytes</label>
+              <input id="wb-total-bytes" name="total_bytes" type="number" min="1" max="524288000" step="1" inputmode="numeric" autocomplete="off" value="" required data-wb-total-bytes>
+              <p class="hint">This is filled automatically when JavaScript is enabled. Without JavaScript, enter the file's exact size in bytes.</p>
+            </div>
+            <input type="hidden" name="operation_id" value="{{ upload_create_operation_id }}">
+
+            <label class="wb-drop" data-wb-drop>
+              <span class="wb-drop__ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
+              </span>
+              <b>Drop a binary here, or browse</b>
+              <span>Accepted: PE, ELF, Mach-O, APK/DEX, Office, UEFI, WASM, .NET, and more. Maximum 500 MiB.</span>
+              <input class="wb-drop__input" id="wb-file" name="file" type="file" required data-wb-file aria-describedby="wb-file-hint">
+            </label>
+            <p class="hint" id="wb-file-hint">Static analysis starts automatically after upload. Dynamic execution is not available in this version.</p>
+
+            <div class="wb-upload-progress" data-wb-progress hidden aria-live="polite">
+              <div class="wb-upload-file">
+                <span class="pill pill-info" data-wb-progress-state>Uploading</span>
+                <span class="mono" data-wb-progress-name></span>
+              </div>
+              <progress class="wb-progress" max="100" value="0" aria-label="Upload progress" data-wb-progress-el></progress>
+              <div class="wb-upload-meta">
+                <span data-wb-progress-pct>0%</span>
+                <span class="mono" data-wb-progress-bytes></span>
+              </div>
+              <p class="hint">Upload ID <span class="mono" data-wb-progress-id>—</span>. If you close this tab, resume from the Analyses page.</p>
+              <div class="actions">
+                <button type="button" class="btn btn-ghost btn-sm" data-wb-cancel-upload>Cancel upload</button>
+              </div>
+            </div>
+
+            <div class="actions" data-wb-submit-row>
+              <button type="submit" class="btn btn-primary" data-wb-submit>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+                Start analysis
+              </button>
+            </div>
+          </form>
+        </div>
+        <div class="card__foot">
+          <span class="muted">Files stay private to you and are kept for 30 days.</span>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="wb-how-title">
+        <div class="card__head"><h2 id="wb-how-title">How analysis works</h2></div>
+        <div class="card__body">
+          <ol class="wb-steps">
+            <li><b>Upload</b> — the file is stored privately and its type is verified. Unsupported files are rejected without starting analysis.</li>
+            <li><b>Static analysis</b> — Rikune profiles the binary and maps its functions to build reviewable evidence.</li>
+            <li><b>Promote</b> — advance to a deeper stage when you need more detail. Dynamic execution is not available in this version.</li>
+            <li><b>Ask</b> — start a conversation grounded in the collected evidence. Answers cite the evidence they rely on.</li>
+          </ol>
+          <p class="hint">Limits: up to 25 active analyses, 3 analyzing at once, and 10 GiB of storage per person.</p>
+        </div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<footer class="site-foot">
+  <span>Steadholme · Rikune Workbench</span>
+  <span class="muted">Static binary analysis</span>
+</footer>
+
+<div class="toast-region" data-wb-toasts aria-live="polite" aria-atomic="false"></div>
+
+<script src="/static/rikune.js" defer></script>
+<script src="/static/rikune-upload.js" defer></script>
+</body>
+</html>
