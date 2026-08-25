@@ -79,14 +79,20 @@ immutable review unit.
 ## Apply while ingress remains closed
 
 `apply.sh` acquires `/run/lock/holdfast-rikune.lock` before checking any preimage. The same lock is
-used by open and rollback. It takes a PostgreSQL custom dump, snapshots `strad_uploads` and all five
-analyzer volumes, restores each into isolated probes, then applies files through
-`estate_transaction.py`. A failure after any target automatically restores every old/absent
-disposition. The durable backup supports a later mixed old/new/absent estate after a crash and
-rejects any third-party checksum.
+used by open, apply recovery, and rollback. It dumps only the dedicated literal `strad` PostgreSQL
+database; the shared SSO/IAM/routes/audit database is never a backup or restore target. It also
+snapshots `strad_uploads` and all five analyzer volumes and restores every snapshot into an
+isolated probe. `strad`, `rikune-analyzer`, and `rikune-volume-init` are stopped before capture;
+the exact pre-capture running subset is checksum-bound and remains quiesced for apply. The caller
+durably records `apply_armed` before applying files through `estate_transaction.py`. A failure
+after any target automatically restores every old/absent disposition. Service activation is
+followed by the exact runtime verifier; an activation/readiness failure records
+`apply_activation_failed` and an immutable failure receipt without creating `APPLY.receipt`. The
+durable backup supports a later mixed old/new/absent estate after a crash and rejects any
+third-party checksum.
 
 ```sh
-./apply.sh --execute \
+ROUTES_DATABASE_URL='supplied by route authority' ./apply.sh --execute \
   --estate-root /root/w33d_infra \
   --dry-run-dir /secure/release/rikune-dry-run \
   --release-env /secure/release/rikune.release.env \
@@ -96,6 +102,66 @@ rejects any third-party checksum.
 
 Ingress is still closed. Preserve the printed backup directory and `/var/lib/holdfast-rikune`
 state receipts.
+
+### Recover an interrupted, activation-failed, or legacy orphan apply
+
+`apply-recover.sh` is the only supported recovery path when apply did not reach its ordinary final
+state. It accepts an armed/activation-failed apply, a durable prepared or applied estate
+transaction, a new apply whose estate transaction never started, and the legacy orphan shape where
+`CURRENT.json`, `APPLY-ARMED.receipt`, and `APPLY.receipt` are all absent. Legacy adoption
+additionally requires an explicit estate root. Both modes validate the canonical root-owned
+backup, `CONTROL.sha256`, release/dry-run bindings, exact transaction state, and an
+`absent -> dual-stack 404 -> absent` database/public/database bracket before recording a durable
+recovery arm. A crash after that arm reuses the same attempt, service manifest, and immutable
+receipt; a crash after completion but before the active pointer update only finalizes the existing
+completion.
+
+There is one earlier crash boundary: `CURRENT.json` may still be
+`runtime_backup_armed` because `runtime-backup.sh` stopped the Strad writers before apply could
+persist the full CONTROL package. In that state, restore mode consumes only the durable caller
+arm and, when present, the runtime stop arm with its frozen Compose snapshot and prior-running
+manifest. Absence of the runtime stop arm proves that stop never began. Otherwise recovery
+restarts exactly the prior `strad`/`rikune-analyzer` subset, keeps the excluded product and
+`rikune-volume-init` inactive, archives `CURRENT.json`, and requires a fresh apply ceremony. It
+does not restore a database, volume, or estate and remains usable if the original dry-run inputs
+have disappeared.
+
+Restore mode stops and confirms all seven application writers, restores PostgreSQL and six volume
+dispositions, then restores a mixed applied/preimage/absent estate from an attempt-local copy.
+Before mutation it freezes the exact subset whose container state is `running`; `Created` and
+`restarting` services are excluded. After restoring the old Compose estate it starts only that
+frozen subset with Compose `--no-deps --wait`, verifies each is running and each declared
+healthcheck is healthy, then proves every excluded writer remains non-running. The service-set
+hash is bound into the immutable recovery receipt/state. It does not
+leave an active `CURRENT.json`:
+
+```sh
+ROUTES_DATABASE_URL='supplied by route authority' ./apply-recover.sh --execute --mode restore \
+  --backup-dir /secure/backups/holdfast-rikune-TIMESTAMP-PID \
+  --estate-root /root/w33d_infra
+```
+
+The one historical schema-v1 backup may be adopted only with `--legacy-empty-strad`. That path
+first proves the literal `strad` database has zero connections, public tables, and non-system user
+relations, restores only the six absent volume dispositions, and deliberately ignores the old
+shared `postgres.dump`. No command in this package restores that shared dump.
+
+If estate apply already rolled itself back, restore mode first proves every live target is exactly
+at its preimage and performs only the frozen service-lifecycle recovery; it does not restore the
+Strad dump, any volume, or the estate a second time. If apply crashed while promoting
+`APPLY-PENDING.receipt` or before committing the final `CURRENT.json`, resume mode validates the
+exact receipt and applied transaction, repeats runtime and closed-ingress verification, then
+idempotently promotes the receipt and finalizes `applied_ingress_closed`.
+
+Resume mode is narrower: every live target must still equal the applied target manifest. It starts
+the seven exact release services, verifies their configured digests, readiness, and NewAPI model,
+then records an independent recovery receipt and returns `CURRENT.json` to
+`applied_ingress_closed`. It never manufactures the ordinary `APPLY.receipt`:
+
+```sh
+ROUTES_DATABASE_URL='supplied by route authority' ./apply-recover.sh --execute --mode resume \
+  --backup-dir /secure/backups/holdfast-rikune-TIMESTAMP-PID
+```
 
 ## Authority and route-only opening
 
@@ -189,8 +255,10 @@ Do **not** pre-create revocation evidence. Rollback ordering is enforced:
 4. wait for and acknowledge all seven tombstones/epochs;
 5. if the route may have been public, sign v2 rollback evidence proving only the same dual-stack
    route-absent `404` state; no Pages, Cloudflare, or DNS restore exists;
-6. restore PostgreSQL, six volume dispositions, and the mixed-state estate while continuing to
-   verify the public route remains closed.
+6. durably arm the exact seven-service running snapshot, quiesce all seven release services,
+   restore the dedicated Strad database, six volume dispositions, and the mixed-state estate,
+   then reactivate only the frozen shared-service subset plus the runtime pre-apply Strad/analyzer
+   subset while continuing to verify the public route remains closed.
 
 Create the route-close receipt first:
 
@@ -228,7 +296,13 @@ ROUTES_DATABASE_URL='supplied by route authority' ./rollback.sh --execute --phas
   --activate-services
 ```
 
-Runtime restore explicitly stops and removes orphan Strad/analyzer containers before restoring
-volumes. Restored services remain stopped unless `--activate-services` is requested. Physical
-sample deletion performed after release is not logically reversible without separately authorized
-backup recovery; this package never claims otherwise.
+Before the first runtime or estate mutation, execute atomically records
+`rollback_execute_armed`, the exact running-service manifest, and its immutable receipt. A crash
+reuses that attempt and never resamples service state. Runtime restore explicitly removes
+Strad/analyzer/volume-init containers before restoring the literal `strad` database and six
+volumes. The restored Compose estate is started with the rollback Access override and
+`--no-deps --wait`; every included service must be running/healthy and every excluded service must
+remain inactive. `--activate-services` remains accepted for command compatibility but cannot
+expand or shrink this frozen set. Physical sample deletion performed after release is not
+logically reversible without separately authorized backup recovery; this package never claims
+otherwise.

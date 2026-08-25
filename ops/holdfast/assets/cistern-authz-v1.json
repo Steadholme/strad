@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "service": "cistern",
+  "owner": "team-cistern",
+  "owner_sub": "user:u_admin",
+  "manifest_id": "cistern-authz-v1",
+  "generated_at": 1787616000,
+  "digest_scope": "authz-manifest-v1",
+  "permissions": [
+    {
+      "key": "cistern.console.enter",
+      "risk": "high",
+      "principal_class": "human",
+      "owner_sub": "user:u_admin",
+      "approval": {
+        "minimum_approvals": 2
+      },
+      "recertification": {
+        "interval_days": 180
+      }
+    }
+  ],
+  "entries": [],
+  "functions": [],
+  "machine_endpoints": [],
+  "machine_data_plane": [],
+  "exemptions": []
+}

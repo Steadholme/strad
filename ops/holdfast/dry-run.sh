@@ -108,6 +108,7 @@ bash -n \
   "$script_dir/common.sh" \
   "$script_dir/dry-run.sh" \
   "$script_dir/apply.sh" \
+  "$script_dir/apply-recover.sh" \
   "$script_dir/open-ingress.sh" \
   "$script_dir/public-origin-verify.sh" \
   "$script_dir/verify.sh" \

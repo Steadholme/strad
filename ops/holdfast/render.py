@@ -32,6 +32,7 @@ RIKUNE_ACCEPTANCE_SUBJECT = re.compile(r"^user:usr_[A-Za-z0-9_-]{43}$")
 PRIVILEGED_ACCEPTANCE_SUBJECTS = frozenset({"user:u_admin", "user:w33d"})
 
 MUTATED_PATHS = (
+    "access-governance/catalog/cistern-authz-v1.json",
     "access-governance/catalog/rikune-authz-v1.json",
     "access-governance/catalog/permission.sources.v1.json",
     "access-governance/catalog/permissions.snapshot.json",
@@ -365,15 +366,26 @@ def render_registry(stage_root: Path) -> None:
     sources = value.get("sources")
     if value.get("schema_version") != 1 or not isinstance(sources, list) or len(sources) != 6:
         fail("permission source registry precondition failed")
-    if any(isinstance(item, dict) and item.get("source") == "rikune-authz" for item in sources):
-        fail("Rikune source already exists")
-    sources.append(
-        {
-            "path": "access-governance/catalog/rikune-authz-v1.json",
-            "source": "rikune-authz",
-            "schema_version": 1,
-            "digest_scope": "permission-key-risk-v1",
-        }
+    added_sources = {"cistern-authz", "rikune-authz"}
+    if any(
+        isinstance(item, dict) and item.get("source") in added_sources for item in sources
+    ):
+        fail("Holdfast authorization source already exists")
+    sources.extend(
+        (
+            {
+                "path": "access-governance/catalog/cistern-authz-v1.json",
+                "source": "cistern-authz",
+                "schema_version": 1,
+                "digest_scope": "permission-key-risk-v1",
+            },
+            {
+                "path": "access-governance/catalog/rikune-authz-v1.json",
+                "source": "rikune-authz",
+                "schema_version": 1,
+                "digest_scope": "permission-key-risk-v1",
+            },
+        )
     )
     write_json(path, value)
 
@@ -385,36 +397,41 @@ def render_generator(stage_root: Path) -> None:
         (
             'newapi_authz_source="$workspace_dir/relay/upstream/new-api/router/newapi-authz-v1.json"\n',
             'newapi_authz_source="$workspace_dir/relay/upstream/new-api/router/newapi-authz-v1.json"\n'
+            'cistern_authz_source="$service_dir/catalog/cistern-authz-v1.json"\n'
             'rikune_authz_source="$service_dir/catalog/rikune-authz-v1.json"\n',
-            "Rikune generator source",
+            "Holdfast generator sources",
         ),
         (
             '"$multica_authz_source" "$newapi_authz_source" "$source_registry"; do',
-            '"$multica_authz_source" "$newapi_authz_source" "$rikune_authz_source" "$source_registry"; do',
+            '"$multica_authz_source" "$newapi_authz_source" "$cistern_authz_source" "$rikune_authz_source" "$source_registry"; do',
             "generator source loop",
         ),
         (
             'newapi_authz_canonical="$tmp_dir/newapi-authz.canonical.json"\n',
             'newapi_authz_canonical="$tmp_dir/newapi-authz.canonical.json"\n'
+            'cistern_authz_canonical="$tmp_dir/cistern-authz.canonical.json"\n'
             'rikune_authz_canonical="$tmp_dir/rikune-authz.canonical.json"\n',
-            "Rikune canonical file",
+            "Holdfast canonical files",
         ),
         (
             '  --slurpfile newapi_authz "$newapi_authz_source" \'\n',
             '  --slurpfile newapi_authz "$newapi_authz_source" \\\n'
+            '  --slurpfile cistern_authz "$cistern_authz_source" \\\n'
             '  --slurpfile rikune_authz "$rikune_authz_source" \'\n',
-            "Rikune jq slurp",
+            "Holdfast jq slurp",
         ),
         (
             '     or $newapi_authz[0].schema_version != 1\n',
-            '     or $newapi_authz[0].schema_version != 1 or $rikune_authz[0].schema_version != 1\n',
-            "Rikune schema check",
+            '     or $newapi_authz[0].schema_version != 1 or $cistern_authz[0].schema_version != 1\n'
+            '     or $rikune_authz[0].schema_version != 1\n',
+            "Holdfast schema check",
         ),
         (
             '     or (($newapi_authz[0].permissions | type) != "array")\n',
             '     or (($newapi_authz[0].permissions | type) != "array")\n'
+            '     or (($cistern_authz[0].permissions | type) != "array")\n'
             '     or (($rikune_authz[0].permissions | type) != "array")\n',
-            "Rikune permissions type",
+            "Holdfast permissions type",
         ),
         (
             '  | ([ $routes[0].routes[]\n'
@@ -433,14 +450,15 @@ def render_generator(stage_root: Path) -> None:
             '  | ([ $newapi_authz[0].permissions[] | . + {source: "newapi-authz"} ]) as $newapi_authz_items\n'
             '  | ($access_items + $route_items + $newapi_items + $cpa_authz_items + $multica_authz_items + $newapi_authz_items) as $raw\n',
             '  | ([ $newapi_authz[0].permissions[] | . + {source: "newapi-authz"} ]) as $newapi_authz_items\n'
+            '  | ([ $cistern_authz[0].permissions[] | . + {source: "cistern-authz"} ]) as $cistern_authz_items\n'
             '  | ([ $rikune_authz[0].permissions[] | . + {source: "rikune-authz"} ]) as $rikune_authz_items\n'
-            '  | ($access_items + $route_items + $newapi_items + $cpa_authz_items + $multica_authz_items + $newapi_authz_items + $rikune_authz_items) as $raw\n',
-            "Rikune raw entries",
+            '  | ($access_items + $route_items + $newapi_items + $cpa_authz_items + $multica_authz_items + $newapi_authz_items + $cistern_authz_items + $rikune_authz_items) as $raw\n',
+            "Holdfast raw entries",
         ),
         (
             '[$access_items, $route_items, $newapi_items, $cpa_authz_items, $multica_authz_items, $newapi_authz_items][];',
-            '[$access_items, $route_items, $newapi_items, $cpa_authz_items, $multica_authz_items, $newapi_authz_items, $rikune_authz_items][];',
-            "Rikune duplicate source list",
+            '[$access_items, $route_items, $newapi_items, $cpa_authz_items, $multica_authz_items, $newapi_authz_items, $cistern_authz_items, $rikune_authz_items][];',
+            "Holdfast duplicate source list",
         ),
         (
             '      | {key: .require_permission, risk}] | sort_by(.key))\n',
@@ -453,28 +471,39 @@ def render_generator(stage_root: Path) -> None:
             '\' "$newapi_authz_source" >"$newapi_authz_canonical"\n'
             'jq -cS \'\n'
             '  {\n'
+            '    source: "cistern-authz",\n'
+            '    schema_version: .schema_version,\n'
+            '    permissions: ([.permissions[] | {key, risk}] | sort_by(.key))\n'
+            '  }\n'
+            '\' "$cistern_authz_source" >"$cistern_authz_canonical"\n'
+            'jq -cS \'\n'
+            '  {\n'
             '    source: "rikune-authz",\n'
             '    schema_version: .schema_version,\n'
             '    permissions: ([.permissions[] | {key, risk}] | sort_by(.key))\n'
             '  }\n'
             '\' "$rikune_authz_source" >"$rikune_authz_canonical"\n',
-            "Rikune canonical digest block",
+            "Holdfast canonical digest blocks",
         ),
         (
             '  --arg newapi_authz_digest "$(sha256sum "$newapi_authz_canonical" | cut -d\' \' -f1)" \'\n',
             '  --arg newapi_authz_digest "$(sha256sum "$newapi_authz_canonical" | cut -d\' \' -f1)" \\\n'
+            '  --arg cistern_authz_path "access-governance/catalog/cistern-authz-v1.json" \\\n'
+            '  --arg cistern_authz_digest "$(sha256sum "$cistern_authz_canonical" | cut -d\' \' -f1)" \\\n'
             '  --arg rikune_authz_path "access-governance/catalog/rikune-authz-v1.json" \\\n'
             '  --arg rikune_authz_digest "$(sha256sum "$rikune_authz_canonical" | cut -d\' \' -f1)" \'\n',
-            "Rikune metadata args",
+            "Holdfast metadata args",
         ),
         (
             '      {path: $newapi_authz_path, source: "newapi-authz", schema_version: 1,\n'
             '       digest_scope: "permission-key-risk-v1", sha256: $newapi_authz_digest}\n',
             '      {path: $newapi_authz_path, source: "newapi-authz", schema_version: 1,\n'
             '       digest_scope: "permission-key-risk-v1", sha256: $newapi_authz_digest},\n'
+            '      {path: $cistern_authz_path, source: "cistern-authz", schema_version: 1,\n'
+            '       digest_scope: "permission-key-risk-v1", sha256: $cistern_authz_digest},\n'
             '      {path: $rikune_authz_path, source: "rikune-authz", schema_version: 1,\n'
             '       digest_scope: "permission-key-risk-v1", sha256: $rikune_authz_digest}\n',
-            "Rikune generated_from",
+            "Holdfast generated_from",
         ),
     )
     for old, new, label in replacements:
@@ -486,7 +515,11 @@ def render_validator(stage_root: Path) -> None:
     path = stage_root / "access-governance/scripts/validate_authz_manifests.py"
     text = path.read_text(encoding="utf-8")
     old = '    SERVICE_DIR / "catalog" / "cpa-authz-v1.json",\n'
-    new = old + '    SERVICE_DIR / "catalog" / "rikune-authz-v1.json",\n'
+    new = (
+        old
+        + '    SERVICE_DIR / "catalog" / "cistern-authz-v1.json",\n'
+        + '    SERVICE_DIR / "catalog" / "rikune-authz-v1.json",\n'
+    )
     path.write_text(replace_once(text, old, new, "validator manifest"), encoding="utf-8")
 
 
@@ -497,17 +530,34 @@ def render_catalog_rs(stage_root: Path) -> None:
         (
             'const MULTICA_AUTHZ_MANIFEST: &str = include_str!("../catalog/multica-authz-v1.json");\n',
             'const MULTICA_AUTHZ_MANIFEST: &str = include_str!("../catalog/multica-authz-v1.json");\n'
+            'const CISTERN_AUTHZ_MANIFEST: &str = include_str!("../catalog/cistern-authz-v1.json");\n'
             'const RIKUNE_AUTHZ_MANIFEST: &str = include_str!("../catalog/rikune-authz-v1.json");\n',
-            "Rikune include",
+            "Holdfast includes",
         ),
         (
             '    validate_service_manifest(&snapshot.entries, MULTICA_AUTHZ_MANIFEST, "multica-authz")?;\n',
             '    validate_service_manifest(&snapshot.entries, MULTICA_AUTHZ_MANIFEST, "multica-authz")?;\n'
+            '    validate_service_manifest(&snapshot.entries, CISTERN_AUTHZ_MANIFEST, "cistern-authz")?;\n'
             '    validate_service_manifest(&snapshot.entries, RIKUNE_AUTHZ_MANIFEST, "rikune-authz")?;\n',
-            "Rikune service validation",
+            "Holdfast service validation",
         ),
         (
             '    Ok(())\n}\n\nfn canonical_source_digest(',
+            '    let cistern_source = sources\n'
+            '        .iter()\n'
+            '        .find(|source| source.source == "cistern-authz")\n'
+            '        .ok_or_else(|| "Cistern authorization manifest source is missing".to_string())?;\n'
+            '    let cistern_manifest: PermissionManifest = serde_json::from_str(CISTERN_AUTHZ_MANIFEST)\n'
+            '        .map_err(|_| "Cistern authorization manifest is malformed".to_string())?;\n'
+            '    if cistern_source.sha256\n'
+            '        != canonical_source_digest(\n'
+            '            "cistern-authz",\n'
+            '            cistern_manifest.schema_version,\n'
+            '            &cistern_manifest.permissions,\n'
+            '        )?\n'
+            '    {\n'
+            '        return Err("Cistern authorization manifest source digest changed".to_string());\n'
+            '    }\n'
             '    let rikune_source = sources\n'
             '        .iter()\n'
             '        .find(|source| source.source == "rikune-authz")\n'
@@ -524,16 +574,16 @@ def render_catalog_rs(stage_root: Path) -> None:
             '        return Err("Rikune authorization manifest source digest changed".to_string());\n'
             '    }\n'
             '    Ok(())\n}\n\nfn canonical_source_digest(',
-            "Rikune source digest validation",
+            "Holdfast source digest validation",
         ),
         (
             '                "access-manifest" | "newapi-enterprise" | "cpa-authz" | "multica-authz"\n'
             '                | "newapi-authz" => serde_json::from_value(value["permissions"].clone()).unwrap(),\n',
             '                "access-manifest" | "newapi-enterprise" | "cpa-authz" | "multica-authz"\n'
-            '                | "newapi-authz" | "rikune-authz" => {\n'
+            '                | "newapi-authz" | "cistern-authz" | "rikune-authz" => {\n'
             '                    serde_json::from_value(value["permissions"].clone()).unwrap()\n'
             '                }\n',
-            "Rikune workspace source test",
+            "Holdfast workspace source test",
         ),
         (
             '                        Some(PermissionSourceEntry {\n'
@@ -1166,7 +1216,8 @@ def main() -> int:
     secrets = {} if args.catalog_only else parse_env(args.secret_env.absolute(), require_mode_0600=True)
 
     copy_stage(estate_root, stage_root, args.catalog_only)
-    shutil.copy2(ASSETS / "rikune-authz-v1.json", stage_root / "access-governance/catalog/rikune-authz-v1.json")
+    for manifest in ("cistern-authz-v1.json", "rikune-authz-v1.json"):
+        shutil.copy2(ASSETS / manifest, stage_root / f"access-governance/catalog/{manifest}")
     render_registry(stage_root)
     render_generator(stage_root)
     render_validator(stage_root)

@@ -11,7 +11,7 @@ import {
   validateStaticBackendEnvironment,
   validateStaticLock,
 } from '../src/static-lock.js'
-import { withoutSdkInheritedEnvironment } from '../src/mcp-child.js'
+import { RikuneChild, withoutSdkInheritedEnvironment } from '../src/mcp-child.js'
 
 function requestWithRawHeaders(rawHeaders: string[]): IncomingMessage {
   return { rawHeaders } as IncomingMessage
@@ -49,6 +49,65 @@ test('SDK default parent environment is scrubbed only for the child spawn window
     if (originalTerm === undefined) delete process.env.TERM
     else process.env.TERM = originalTerm
   }
+})
+
+test('SDK inherited-environment scrub windows are serialized', async () => {
+  const originalTerm = process.env.TERM
+  process.env.TERM = 'parent-terminal-must-not-leak'
+  let enterFirst!: () => void
+  let releaseFirst!: () => void
+  const firstEntered = new Promise<void>((resolve) => {
+    enterFirst = resolve
+  })
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve
+  })
+  let secondEntered = false
+  try {
+    const first = withoutSdkInheritedEnvironment(async () => {
+      assert.equal(process.env.TERM, undefined)
+      enterFirst()
+      await firstGate
+      assert.equal(process.env.TERM, undefined)
+    })
+    await firstEntered
+    const second = withoutSdkInheritedEnvironment(async () => {
+      secondEntered = true
+      assert.equal(process.env.TERM, undefined)
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(secondEntered, false)
+    releaseFirst()
+    await Promise.all([first, second])
+    assert.equal(process.env.TERM, 'parent-terminal-must-not-leak')
+  } finally {
+    if (originalTerm === undefined) delete process.env.TERM
+    else process.env.TERM = originalTerm
+  }
+})
+
+test('child is not alive until the complete boot contract is verified', () => {
+  const child = new RikuneChild(
+    loadConfig({
+      STRAD_BRIDGE_TOKEN: 'b'.repeat(32),
+      RIKUNE_FILE_SERVER_API_KEY: 'f'.repeat(32),
+    }),
+    () => undefined
+  )
+  const state = child as unknown as {
+    initialized: boolean
+    closing: boolean
+    bootVerified: boolean
+    transport: { pid: number | null } | null
+  }
+  state.initialized = true
+  state.closing = false
+  state.transport = { pid: 123 }
+  assert.equal(child.alive, false)
+  state.bootVerified = true
+  assert.equal(child.alive, true)
+  state.closing = true
+  assert.equal(child.alive, false)
 })
 
 test('config rejects short or equal bridge and file-server secrets', () => {
@@ -243,5 +302,83 @@ test('static lock accepts the Rikune v1.4.1 environment union and enforces it fa
         }))
       )
     )
+  )
+})
+
+test('spawned child environment satisfies the complete Rikune v1.4.1 backend lock', () => {
+  const backend = (
+    name: string,
+    path: string,
+    environment: readonly Record<string, unknown>[]
+  ) => ({
+    name,
+    path,
+    environment: [...environment],
+    version_args: [],
+    allowed_exit_codes: [0],
+    version_pattern: 'locked',
+  })
+  const base = staticLockFixture()
+  const lock = validateStaticLock({
+    ...base,
+    required_backends: [
+      backend('java', '/opt/java/openjdk/bin/java', [
+        { name: 'JAVA_HOME', value: '/opt/java/openjdk', required: true },
+        {
+          name: 'PATH',
+          value:
+            '/opt/java/openjdk/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin',
+          required: true,
+        },
+        { name: 'PYTHON_PATH', value: '/usr/local/bin/python3.12', required: true },
+        { name: 'PYTHONPATH', value: '/app/workers', required: true },
+        { name: 'HOME', value: '/tmp/rikune-home', required: true },
+        { name: 'XDG_CONFIG_HOME', value: '/tmp/rikune-home/.config', required: true },
+        { name: 'XDG_CACHE_HOME', value: '/tmp/rikune-home/.cache', required: true },
+        { name: 'CONFIG_PATH', must_be_unset: true },
+        { name: 'NODE_OPTIONS', must_be_unset: true },
+        { name: 'NODE_PATH', must_be_unset: true },
+        { name: 'LD_PRELOAD', must_be_unset: true },
+        { name: 'PYTHONHOME', must_be_unset: true },
+      ]),
+      backend('ghidra-analyze-headless', '/opt/ghidra/support/analyzeHeadless', [
+        { name: 'GHIDRA_INSTALL_DIR', value: '/opt/ghidra', required: true },
+        { name: 'GHIDRA_PATH', value: '/opt/ghidra', required: true },
+      ]),
+      backend('rizin', '/opt/rizin/bin/rizin', [
+        { name: 'RIZIN_PATH', value: '/opt/rizin/bin/rizin', required: true },
+      ]),
+      backend('capa', '/usr/local/bin/capa', [
+        { name: 'CAPA_PATH', value: '/usr/local/bin/capa', required: true },
+        { name: 'CAPA_RULES_PATH', value: '/opt/capa-rules', required: true },
+      ]),
+      backend('detect-it-easy', '/usr/bin/diec', [
+        { name: 'DIE_PATH', value: '/usr/bin/diec', required: true },
+      ]),
+      backend('upx', '/opt/upx/upx', [
+        { name: 'UPX_PATH', value: '/opt/upx/upx', required: true },
+      ]),
+      backend('flare-floss', '/usr/local/bin/floss', [
+        { name: 'FLOSS_PATH', value: '/usr/local/bin/floss', required: true },
+      ]),
+      backend('yara-x-python', '/usr/local/bin/python3.12', [
+        { name: 'YARAX_PYTHON', value: '/usr/local/bin/python3.12', required: true },
+        { name: 'YARA_X_RULES_PATH', must_be_unset: true },
+      ]),
+    ],
+  })
+  const config = loadConfig({
+    STRAD_BRIDGE_TOKEN: 'b'.repeat(32),
+    RIKUNE_FILE_SERVER_API_KEY: 'f'.repeat(32),
+  })
+
+  assert.doesNotThrow(() => validateStaticBackendEnvironment(lock, config.childEnv))
+  assert.throws(
+    () =>
+      validateStaticBackendEnvironment(lock, {
+        ...config.childEnv,
+        PATH: `${config.childEnv.PATH}:/unexpected`,
+      }),
+    /PATH/
   )
 })

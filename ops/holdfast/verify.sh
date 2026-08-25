@@ -64,7 +64,23 @@ jq -e '
 jq -e '
   ([.entries[].key | select(startswith("rikune."))] | length) == 7
   and ([.generated_from[].source | select(. == "rikune-authz")] | length) == 1
+  and ([.entries[] | select(.key == "cistern.console.enter" and .risk == "high")] | length) == 1
+  and ([.generated_from[].source | select(. == "cistern-authz")] | length) == 1
 ' "$target_root/access-governance/catalog/permissions.snapshot.json" >/dev/null
+jq -e '
+  ([.routes[] | select(.name == "cistern-dash")] | length) == 1
+  and ([.routes[] | select(
+    .name == "cistern-dash"
+    and .protected == false
+    and .auth == "sso"
+    and .internal_only == false
+    and .require_group == ""
+    and .require_permission == ""
+    and .permission_resource == ""
+    and .risk == ""
+    and .require_scope == ""
+  )] | length) == 1
+' "$target_root/deploy/routes.seed.json" >/dev/null
 
 if [[ "$phase" == "live" ]]; then
   [[ -n "$release_env" && -n "$authority_evidence" && -n "$authority_signature" && -n "$authority_public_key" && -n "${ROUTES_DATABASE_URL:-}" ]] || {

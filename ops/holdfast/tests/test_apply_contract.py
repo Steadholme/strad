@@ -102,13 +102,42 @@ class ApplyContractTests(unittest.TestCase):
         self.assertEqual(set(targets), set(apply_preimages) | apply_absent)
         self.assertFalse(set(apply_preimages) & apply_absent)
         self.assertEqual(len(apply_preimages), 12)
-        self.assertEqual(len(apply_absent), 1)
+        self.assertEqual(len(apply_absent), 2)
         self.assertGreater(len(global_preimages), len(apply_preimages))
         self.assertEqual(
             apply_preimages,
             {path: global_preimages[path] for path in targets if path in global_preimages},
         )
         self.assertEqual(apply_absent, set(targets) & global_absent)
+
+    def test_cistern_permission_is_retained_as_an_independent_catalog_source(self) -> None:
+        asset_path = OPS_ROOT / "assets/cistern-authz-v1.json"
+        manifest = json.loads(asset_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["manifest_id"], "cistern-authz-v1")
+        self.assertEqual(manifest["service"], "cistern")
+        self.assertEqual(manifest["entries"], [])
+        self.assertEqual(manifest["functions"], [])
+        self.assertEqual(
+            manifest["permissions"],
+            [
+                {
+                    "key": "cistern.console.enter",
+                    "risk": "high",
+                    "principal_class": "human",
+                    "owner_sub": "user:u_admin",
+                    "approval": {"minimum_approvals": 2},
+                    "recertification": {"interval_days": 180},
+                }
+            ],
+        )
+        relative = "access-governance/catalog/cistern-authz-v1.json"
+        self.assertIn(relative, render.MUTATED_PATHS)
+        self.assertIn(relative, render_input_binding.FROZEN_STATIC_PATHS)
+        self.assertIn(relative, render.parse_path_manifest(OPS_ROOT / "absent.paths"))
+        self.assertEqual(
+            render.parse_checksum_manifest(OPS_ROOT / "static-targets.sha256")[relative],
+            render.sha256_file(asset_path),
+        )
 
     def test_render_binding_uses_real_authority_inputs_and_rejects_tampering(self) -> None:
         binding = self.root / "RENDER-INPUTS.sha256"
@@ -163,20 +192,445 @@ class ApplyContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "route_up_sha256"):
             render_input_binding.verify_apply_binding(ops, binding, stage, evidence)
 
-    def test_apply_preflights_before_backup_and_rebinds_after_backup(self) -> None:
+    def test_apply_preflights_before_backup_and_fully_rebinds_after_backup(self) -> None:
         script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
-        preflight = script.index('"$script_dir/estate_transaction.py" preflight')
+        first_rebind = script.index("\nverify_release_bindings\n")
+        first_preflight = script.index('"$script_dir/estate_transaction.py" preflight')
         runtime_backup = script.index('"$script_dir/runtime-backup.sh"')
+        second_rebind = script.index("\nverify_release_bindings\n", first_rebind + 1)
+        persisted_targets = script.index(
+            'atomic_copy_authority "$targets" "$backup/TARGETS.sha256"',
+            second_rebind,
+        )
+        second_preflight = script.index(
+            '"$script_dir/estate_transaction.py" preflight', first_preflight + 1
+        )
         apply = script.index('"$script_dir/estate_transaction.py" apply')
-        first_rebind = script.index("\nverify_render_bindings\n")
-        second_rebind = script.index("\nverify_render_bindings\n", first_rebind + 1)
-        self.assertLess(first_rebind, preflight)
-        self.assertLess(preflight, runtime_backup)
+        self.assertLess(first_rebind, first_preflight)
+        self.assertLess(first_preflight, runtime_backup)
         self.assertLess(runtime_backup, second_rebind)
-        self.assertLess(second_rebind, apply)
-        self.assertIn("render_inputs_sha256", script)
-        self.assertIn('--stage-root "$stage"', script)
-        self.assertIn('--release-evidence "$stage/RELEASE-EVIDENCE.json"', script)
+        self.assertLess(second_rebind, persisted_targets)
+        self.assertLess(persisted_targets, second_preflight)
+        self.assertLess(second_preflight, apply)
+
+        full_rebind = script[
+            script.index("verify_release_bindings() {") : script.index(
+                "commit_atomic_file() {"
+            )
+        ]
+        for binding in (
+            "bound_dry_receipt_sha",
+            "targets_sha256",
+            "release_evidence_sha256",
+            "release_env_sha256",
+            "supply_chain_${key}_sha256",
+            "verify_render_bindings",
+            'sha256sum --check TARGETS.sha256',
+        ):
+            self.assertIn(binding, full_rebind)
+        render_rebind = script[
+            script.index("verify_render_bindings() {") : script.index(
+                "bound_dry_receipt_sha="
+            )
+        ]
+        self.assertIn('--stage-root "$stage"', render_rebind)
+        self.assertIn(
+            '--release-evidence "$stage/RELEASE-EVIDENCE.json"', render_rebind
+        )
+        persisted_receipt = script.index(
+            'atomic_copy_authority "$receipt" "$backup/DRY-RUN.receipt"'
+        )
+        pinned_receipt = script.index(
+            '[[ "$(holdfast_sha256 "$backup/DRY-RUN.receipt")" == "$bound_dry_receipt_sha" ]]',
+            persisted_receipt,
+        )
+        self.assertLess(persisted_receipt, pinned_receipt)
+
+    def test_apply_uses_safe_control_directories_and_frozen_digests(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        directory_helper = script[
+            script.index("require_canonical_root_directory() {") : script.index(
+                "release_control_files=("
+            )
+        ]
+        for guard in (
+            '! -L "$directory"',
+            'readlink -f -- "$directory"',
+            "control directory must be root-owned",
+            'readlink -m -- "$directory"',
+            'mkdir -m 0700 -- "$directory"',
+            'sync -f "$parent"',
+        ):
+            self.assertIn(guard, directory_helper)
+        first_current_check = script.index(
+            'if [[ -e "$state_file" || -L "$state_file" ]]'
+        )
+        first_rebind = script.index("\nverify_release_bindings\n", first_current_check)
+        self.assertLess(first_current_check, first_rebind)
+        self.assertLess(
+            first_current_check,
+            script.index('ROUTES_DATABASE_URL is required to prove closed ingress'),
+        )
+        self.assertLess(
+            script.index('require_canonical_root_directory "$state_dir"'),
+            first_current_check,
+        )
+        self.assertLess(
+            first_rebind,
+            script.index('ensure_private_control_directory "$state_dir"'),
+        )
+
+        control_pin = script.index(
+            '[[ "$(holdfast_sha256 "$control_file")" == "$control_sha" ]]'
+        )
+        final_bracket = script.index("\nverify_closed_bracket\n", control_pin)
+        self.assertLess(control_pin, final_bracket)
+        finalization = script[final_bracket:]
+        self.assertNotIn(
+            'control_sha "$(holdfast_sha256 "$backup/CONTROL.sha256")"',
+            finalization,
+        )
+        self.assertGreaterEqual(finalization.count('--arg control_sha "$control_sha"'), 2)
+        self.assertIn("printf 'control_sha256=%s\\n' \"$control_sha\"", finalization)
+
+    def test_apply_persists_control_authority_before_any_estate_mutation(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        copied_targets = script.index(
+            'atomic_copy_authority "$targets" "$backup/TARGETS.sha256"'
+        )
+        armed_commit = script.index(
+            'commit_atomic_file "$armed_tmp" "$armed_receipt"', copied_targets
+        )
+        control_start = script.index('control_file="$backup/CONTROL.sha256"')
+        control_commit = script.index(
+            'commit_atomic_file "$control_tmp" "$control_file"', control_start
+        )
+        armed_state = script.index('state:"apply_armed"', control_commit)
+        estate_apply = script.index('"$script_dir/estate_transaction.py" apply')
+        self.assertLess(copied_targets, armed_commit)
+        self.assertLess(armed_commit, control_start)
+        self.assertLess(control_start, control_commit)
+        self.assertLess(control_commit, armed_state)
+        self.assertLess(armed_state, estate_apply)
+
+        armed = script[script.index('armed_receipt="$backup/APPLY-ARMED.receipt"') : control_start]
+        self.assertIn(
+            'targets_sha256=%s\\n\' "$(holdfast_sha256 "$backup/TARGETS.sha256")"',
+            armed,
+        )
+        control = script[control_start:armed_state]
+        for authority in (
+            "RELEASE-EVIDENCE.json",
+            "release.env",
+            "DRY-RUN.receipt",
+            "SUPPLY-CHAIN.json",
+            "SUPPLY-CHAIN.sig",
+            "SUPPLY-CHAIN.pub",
+            "TARGETS.sha256",
+            "APPLY-PREIMAGES.sha256",
+            "APPLY-ABSENT.paths",
+            "RENDER-INPUTS.sha256",
+            "rollback.override.yml",
+            "APPLY-ARMED.receipt",
+            "runtime/SHA256SUMS",
+            "runtime/BACKUP.receipt",
+        ):
+            self.assertIn(authority, control)
+        self.assertNotIn("estate/APPLIED-TARGETS.sha256", control)
+        transaction = script[estate_apply : script.index("estate_status=$?", estate_apply)]
+        self.assertIn('--targets "$backup/TARGETS.sha256"', transaction)
+        self.assertIn('--preimages "$backup/APPLY-PREIMAGES.sha256"', transaction)
+        self.assertIn('--absent "$backup/APPLY-ABSENT.paths"', transaction)
+
+    def test_apply_receipts_use_atomic_rename_and_sync(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        atomic = script[
+            script.index("commit_atomic_file() {") : script.index(
+                "atomic_copy_authority() {"
+            )
+        ]
+        chmod = atomic.index('chmod 0600 -- "$temporary"')
+        sync_temporary = atomic.index('sync -f "$temporary"')
+        rename = atomic.index('mv -fT -- "$temporary" "$target"')
+        sync_target = atomic.index('sync -f "$target"')
+        sync_parent = atomic.index('sync -f "$parent"')
+        self.assertLess(chmod, sync_temporary)
+        self.assertLess(sync_temporary, rename)
+        self.assertLess(rename, sync_target)
+        self.assertLess(sync_target, sync_parent)
+
+        for call in (
+            'commit_atomic_file "$armed_tmp" "$armed_receipt"',
+            'commit_atomic_file "$control_tmp" "$control_file"',
+            'commit_atomic_file "$failure_tmp" "$failure_receipt"',
+            'commit_atomic_file "$apply_receipt_tmp" "$pending_apply_receipt"',
+            'commit_atomic_file "$pending_apply_receipt" "$apply_receipt"',
+            'commit_atomic_file "$state_tmp" "$state_dir/CURRENT.json"',
+        ):
+            self.assertIn(call, script)
+        self.assertNotIn('} >"$apply_receipt"', script)
+
+    def test_apply_proves_closed_ingress_before_success_receipt_and_state(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        closed_function = script[
+            script.index("verify_closed_bracket() {") : script.index(
+                "prior_running_services=()"
+            )
+        ]
+        first_db = closed_function.index("verify_database_absent")
+        public = closed_function.index(
+            'public-origin-verify.sh" --mode closed --url https://analyze.w33d.xyz/'
+        )
+        second_db = closed_function.index("verify_database_absent", first_db + 1)
+        self.assertLess(first_db, public)
+        self.assertLess(public, second_db)
+
+        final_bracket = script.index("\nverify_closed_bracket\n", script.index("activation_step="))
+        apply_receipt = script.index('apply_receipt="$backup/APPLY.receipt"')
+        final_state = script.index('state:"applied_ingress_closed"')
+        self.assertLess(final_bracket, apply_receipt)
+        self.assertLess(apply_receipt, final_state)
+        self.assertIn("ROUTES_DATABASE_URL must be a PostgreSQL URI", script)
+        self.assertIn("assets/verify_rikune_root_absent.sql", script)
+        self.assertNotIn("20260823_rikune_root_up.sql", script)
+        for evidence in (
+            "closed_bracket=passed",
+            "route_database_state=absent",
+            "public_ipv4_ipv6_closed_status=404",
+            "ingress_opened=false",
+        ):
+            self.assertIn(evidence, script[final_bracket:final_state])
+
+    def test_apply_finalization_has_recoverable_fault_boundaries(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        final_bracket = script.index(
+            "\nverify_closed_bracket\n", script.index("activation_step=")
+        )
+        receipt_temp = script.index('apply_receipt_tmp="$backup/.APPLY.receipt.$$"')
+        receipt_complete = script.index('} >"$apply_receipt_tmp"', receipt_temp)
+        pending_commit = script.index(
+            'commit_atomic_file "$apply_receipt_tmp" "$pending_apply_receipt"',
+            receipt_complete,
+        )
+        pending_hash = script.index(
+            'pending_apply_sha=$(holdfast_sha256 "$pending_apply_receipt")',
+            pending_commit,
+        )
+        finalizing_state = script.index(
+            'state:"apply_finalizing_ingress_closed"', pending_hash
+        )
+        finalizing_commit = script.index(
+            'commit_atomic_file "$state_tmp" "$state_file"', finalizing_state
+        )
+        receipt_commit = script.index(
+            'commit_atomic_file "$pending_apply_receipt" "$apply_receipt"',
+            finalizing_commit,
+        )
+        final_state = script.index('state:"applied_ingress_closed"', receipt_commit)
+        final_commit = script.index(
+            'commit_atomic_file "$state_tmp" "$state_dir/CURRENT.json"', final_state
+        )
+        self.assertLess(final_bracket, receipt_temp)
+        self.assertLess(receipt_complete, pending_commit)
+        self.assertLess(pending_commit, pending_hash)
+        self.assertLess(pending_hash, finalizing_state)
+        self.assertLess(finalizing_state, finalizing_commit)
+        self.assertLess(finalizing_commit, receipt_commit)
+        self.assertLess(receipt_commit, final_state)
+        self.assertLess(final_state, final_commit)
+
+        receipt_body = script[receipt_temp:receipt_complete]
+        self.assertIn("schema_version=2", receipt_body)
+        self.assertIn("completion_state=applied_ingress_closed", receipt_body)
+
+        finalizing = script[finalizing_state:finalizing_commit]
+        self.assertIn('pending_apply_receipt:"APPLY-PENDING.receipt"', finalizing)
+        self.assertIn("pending_apply_receipt_sha256:$pending_apply_sha", finalizing)
+        for binding in (
+            "apply_armed_receipt_sha256",
+            "control_sha256",
+            "release_evidence_sha256",
+            "transaction_sha256",
+            "applied_targets_sha256",
+            'route_database_state:"absent"',
+            "public_ipv4_ipv6_closed_status:404",
+            "ingress_opened:false",
+        ):
+            self.assertIn(binding, finalizing)
+        promotion = script[finalizing_commit:final_state]
+        self.assertIn('[[ ! -e "$apply_receipt" && ! -L "$apply_receipt" ]]', promotion)
+        self.assertIn('[[ ! -e "$pending_apply_receipt" && ! -L "$pending_apply_receipt" ]]', promotion)
+        self.assertIn(
+            '[[ "$(holdfast_sha256 "$apply_receipt")" == "$pending_apply_sha" ]]',
+            promotion,
+        )
+
+    def test_apply_restores_only_prior_running_products_after_auto_rollback(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        loader = script[
+            script.index("load_prior_running_services() {") : script.index(
+                "validate_runtime_backup_authority() {"
+            )
+        ]
+        validator = script[
+            script.index("validate_runtime_backup_authority() {") : script.index(
+                "verify_products_quiesced() {"
+            )
+        ]
+        self.assertIn("RUNNING-SERVICES.before", script)
+        self.assertIn("runtime/SHA256SUMS", script)
+        self.assertIn("runtime_writers_stopped", validator)
+        self.assertIn("strad) index=0", loader)
+        self.assertIn("rikune-analyzer) index=1", loader)
+        self.assertIn("unknown service", loader)
+        self.assertIn("duplicated or out of order", loader)
+        self.assertIn("prior_running_services_sha256", loader)
+
+        resume_function = script[
+            script.index("resume_prior_running_products() {") : script.index(
+                'prearm_cleanup_active="false"'
+            )
+        ]
+        self.assertIn('start "${prior_running_services[@]}"', resume_function)
+        self.assertIn('for service in "${prior_running_services[@]}"', resume_function)
+        self.assertIn('ps -aq "$service"', resume_function)
+        self.assertIn("docker inspect -f '{{.State.Status}}'", resume_function)
+        self.assertIn(".State.Health", resume_function)
+        self.assertIn('"$health" != "none" && "$health" != "healthy"', resume_function)
+        self.assertIn("excluded runtime service remains active", resume_function)
+        self.assertIn("rikune-volume-init", resume_function)
+
+        failure = script[
+            script.index("if [[ $estate_status -ne 0 ]]") : script.index(
+                "for file in \"$backup/estate/APPLIED-TARGETS.sha256\""
+            )
+        ]
+        rolled_back = failure.index('transaction_state" == "rolled_back_after_failure"')
+        resume = failure.index("resume_prior_running_products", rolled_back)
+        failure_receipt = failure.index('failure_receipt="$state_dir/APPLY-ESTATE-FAILED-', resume)
+        self.assertLess(rolled_back, resume)
+        self.assertLess(resume, failure_receipt)
+        self.assertIn('prior_running_restore="failed"', failure)
+        for binding in (
+            "transaction_sha256",
+            "control_sha256",
+            "targets_sha256",
+            "runtime_backup_receipt_sha256",
+            "runtime_backup_manifest_sha256",
+            "prior_running_manifest_sha256",
+            "prior_running_restore",
+            "estate_transaction_state",
+            "estate_transaction_sha256",
+        ):
+            self.assertIn(binding, failure)
+
+    def test_apply_restores_prior_running_products_on_every_prearm_exit(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        cleanup = script[
+            script.index("prearm_exit_cleanup() {") : script.index(
+                "verify_release_bindings\n"
+            )
+        ]
+        self.assertIn("recover_runtime_backup_caller_arm prearm_failure", cleanup)
+        self.assertIn("trap - EXIT HUP INT TERM", cleanup)
+        self.assertIn('if [[ "$prearm_cleanup_active" == "true" ]]', cleanup)
+        self.assertIn("restore_status=$?", cleanup)
+
+        caller_active = script.index('prearm_cleanup_active="true"')
+        caller_receipt = script.index(
+            'commit_atomic_file "$caller_armed_tmp" "$caller_armed_receipt"',
+            caller_active,
+        )
+        caller_state = script.index('state:"runtime_backup_armed"', caller_receipt)
+        caller_state_commit = script.index(
+            'commit_atomic_file "$state_tmp" "$state_file"', caller_state
+        )
+        runtime_backup = script.index(
+            '"$script_dir/runtime-backup.sh" --compose-root "$stage"'
+        )
+        exit_trap = script.index("trap prearm_exit_cleanup EXIT", caller_active)
+        second_rebind = script.index("\nverify_release_bindings\n", exit_trap)
+        state_commit = script.index(
+            'commit_atomic_file "$state_tmp" "$state_file"', caller_state_commit + 1
+        )
+        cleanup_inactive = script.index(
+            'prearm_cleanup_active="false"', state_commit
+        )
+        clear_traps = script.index("trap - EXIT HUP INT TERM", cleanup_inactive)
+        estate_apply = script.index('"$script_dir/estate_transaction.py" apply')
+        self.assertLess(caller_active, exit_trap)
+        self.assertLess(exit_trap, caller_receipt)
+        self.assertLess(caller_receipt, caller_state)
+        self.assertLess(caller_state, caller_state_commit)
+        self.assertLess(caller_state_commit, runtime_backup)
+        self.assertLess(runtime_backup, second_rebind)
+        self.assertLess(second_rebind, state_commit)
+        self.assertLess(state_commit, cleanup_inactive)
+        self.assertLess(cleanup_inactive, clear_traps)
+        self.assertLess(clear_traps, estate_apply)
+        for signal_trap in (
+            "trap 'exit 129' HUP",
+            "trap 'exit 130' INT",
+            "trap 'exit 143' TERM",
+        ):
+            self.assertIn(signal_trap, script[caller_active:second_rebind])
+
+    def test_apply_runtime_backup_caller_arm_is_durable_and_recoverable(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        caller = script[
+            script.index('caller_armed_receipt="$backup/RUNTIME-BACKUP-CALLER-ARMED.receipt"') :
+            script.index('# Runtime backup plus isolated restore probes')
+        ]
+        for binding in (
+            "schema_version=2",
+            "estate_root=%s",
+            "dry_run_dir=%s",
+            "backup_dir=%s",
+            "runtime_backup_dir=%s",
+            "release_env_sha256=%s",
+            "dry_run_receipt_sha256=%s",
+            "targets_sha256=%s",
+            "apply_preimages_sha256=%s",
+            "apply_absent_sha256=%s",
+            "render_inputs_sha256=%s",
+            "runtime_backup_armed_receipt=runtime/RUNTIME-BACKUP-ARMED.receipt",
+            "stop_authority_contract=absence-means-stop-not-started",
+            "ingress_opened=false",
+        ):
+            self.assertIn(binding, caller)
+        receipt_commit = caller.index(
+            'commit_atomic_file "$caller_armed_tmp" "$caller_armed_receipt"'
+        )
+        state = caller.index('state:"runtime_backup_armed"', receipt_commit)
+        state_commit = caller.index(
+            'commit_atomic_file "$state_tmp" "$state_file"', state
+        )
+        self.assertLess(receipt_commit, state)
+        self.assertLess(state, state_commit)
+
+        recovery = script[
+            script.index("recover_runtime_backup_caller_arm() {") :
+            script.index('prearm_cleanup_active="false"')
+        ]
+        self.assertIn("validate_runtime_backup_caller_authority false", recovery)
+        self.assertIn('RUNTIME-BACKUP-ARMED.receipt', recovery)
+        self.assertIn("validate_runtime_stop_authority", recovery)
+        self.assertIn("load_prior_running_services", recovery)
+        self.assertIn("resume_prior_running_products", recovery)
+        self.assertIn("record_runtime_backup_cleanup", recovery)
+        self.assertIn("archive_runtime_backup_state", recovery)
+        self.assertIn("runtime backup succeeded without its durable stop authority", recovery)
+
+        control = script[
+            script.index('control_file="$backup/CONTROL.sha256"') :
+            script.index('control_sha=$(holdfast_sha256 "$control_file")')
+        ]
+        for authority in (
+            "RUNTIME-BACKUP-CALLER-ARMED.receipt",
+            "runtime/RUNTIME-BACKUP-ARMED.receipt",
+            "runtime/RUNNING-SERVICES.before",
+        ):
+            self.assertIn(authority, control)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,10 @@ import {
 } from './constants.js'
 import type { BridgeConfig } from './config.js'
 import { BridgeError } from './errors.js'
-import { loadAndVerifyStaticLock } from './static-lock.js'
+import {
+  loadAndVerifyStaticLock,
+  validateStaticBackendEnvironment,
+} from './static-lock.js'
 import { validateAndProjectBusinessResult } from './schemas.js'
 
 type JsonRecord = Record<string, unknown>
@@ -29,9 +32,17 @@ function isRecord(value: unknown): value is JsonRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+let inheritedEnvironmentWindow: Promise<void> = Promise.resolve()
+
 export async function withoutSdkInheritedEnvironment<T>(
   action: () => Promise<T>
 ): Promise<T> {
+  const previousWindow = inheritedEnvironmentWindow
+  let releaseWindow!: () => void
+  inheritedEnvironmentWindow = new Promise<void>((resolve) => {
+    releaseWindow = resolve
+  })
+  await previousWindow
   const saved = new Map<string, string | undefined>()
   for (const name of DEFAULT_INHERITED_ENV_VARS) {
     saved.set(name, process.env[name])
@@ -44,6 +55,7 @@ export async function withoutSdkInheritedEnvironment<T>(
       if (value === undefined) delete process.env[name]
       else process.env[name] = value
     }
+    releaseWindow()
   }
 }
 
@@ -154,6 +166,7 @@ export class RikuneChild implements AnalyzerClient {
   private closing = false
   private initialized = false
   private bootVerified = false
+  private startPromise: Promise<void> | null = null
 
   constructor(
     private readonly config: BridgeConfig,
@@ -161,11 +174,19 @@ export class RikuneChild implements AnalyzerClient {
   ) {}
 
   get alive(): boolean {
-    return this.initialized && !this.closing && this.transport?.pid !== null
+    return (
+      this.bootVerified && this.initialized && !this.closing && this.transport?.pid !== null
+    )
   }
 
   async start(): Promise<void> {
-    await loadAndVerifyStaticLock(this.config.staticLockPath)
+    this.startPromise ??= this.startOnce()
+    return this.startPromise
+  }
+
+  private async startOnce(): Promise<void> {
+    const lock = await loadAndVerifyStaticLock(this.config.staticLockPath)
+    validateStaticBackendEnvironment(lock, this.config.childEnv)
     const transport = new StdioClientTransport({
       command: this.config.childCommand,
       args: [...this.config.childArgs],
@@ -176,6 +197,8 @@ export class RikuneChild implements AnalyzerClient {
     this.transport = transport
     this.client.onclose = () => {
       this.initialized = false
+      this.bootVerified = false
+      this.transport = null
       if (!this.closing) this.onFatal('close')
     }
     this.client.onerror = () => {
@@ -184,35 +207,48 @@ export class RikuneChild implements AnalyzerClient {
     // The SDK merges a small parent-env allowlist even when `env` is supplied.
     // Startup is single-threaded, so scrub that list until spawn captures the
     // explicitly frozen child environment, then restore PID 1 immediately.
-    await withoutSdkInheritedEnvironment(() => this.client.connect(transport))
-    this.initialized = true
-    await this.waitForHttpReady(120_000)
-    for (const canonicalName of ACTIVATION_TARGETS) {
-      const data = unwrapResult(
-        await this.client.callTool(
-          {
-            name: 'workflow_search',
-            arguments: { action: 'activate', tool_name: canonicalName },
-          },
-          undefined,
-          { timeout: 30_000, maxTotalTimeout: 30_000 }
+    try {
+      await withoutSdkInheritedEnvironment(() => this.client.connect(transport))
+      this.initialized = true
+      await this.waitForHttpReady(120_000)
+      for (const canonicalName of ACTIVATION_TARGETS) {
+        const data = unwrapResult(
+          await this.client.callTool(
+            {
+              name: 'workflow_search',
+              arguments: { action: 'activate', tool_name: canonicalName },
+            },
+            undefined,
+            { timeout: 30_000, maxTotalTimeout: 30_000 }
+          )
         )
-      )
-      if (!isRecord(data)) throw new Error('activation result is not an object')
-      const activated = data.activated_tools
-      if (
-        !Array.isArray(activated) ||
-        !activated.every((item) => typeof item === 'string') ||
-        !activated.some(
-          (item) => item === canonicalName || item === canonicalName.replaceAll('.', '_')
-        )
-      ) {
-        throw new Error(`activation was not proven for ${canonicalName}`)
+        if (!isRecord(data)) throw new Error('activation result is not an object')
+        const activated = data.activated_tools
+        if (
+          !Array.isArray(activated) ||
+          !activated.every((item) => typeof item === 'string') ||
+          !activated.some(
+            (item) => item === canonicalName || item === canonicalName.replaceAll('.', '_')
+          )
+        ) {
+          throw new Error(`activation was not proven for ${canonicalName}`)
+        }
       }
+      await this.verifyExactToolSet()
+      await this.passiveStatusProbe()
+      this.bootVerified = true
+    } catch (error) {
+      this.bootVerified = false
+      this.initialized = false
+      this.closing = true
+      this.transport = null
+      try {
+        await this.client.close()
+      } catch {
+        // Preserve the original startup failure while still attempting cleanup.
+      }
+      throw error
     }
-    await this.verifyExactToolSet()
-    await this.passiveStatusProbe()
-    this.bootVerified = true
   }
 
   async call(tool: string, args: JsonRecord, hardTimeoutMs: number): Promise<unknown> {
@@ -296,7 +332,8 @@ export class RikuneChild implements AnalyzerClient {
 
   async probeReady(): Promise<void> {
     if (!this.bootVerified || !this.alive) throw new Error('child is not initialized')
-    await loadAndVerifyStaticLock(this.config.staticLockPath)
+    const lock = await loadAndVerifyStaticLock(this.config.staticLockPath)
+    validateStaticBackendEnvironment(lock, this.config.childEnv)
     await Promise.all([
       boundedLoopbackProbe('/api/v1/ready', 10_000),
       this.verifyExactToolSet(),
@@ -308,6 +345,8 @@ export class RikuneChild implements AnalyzerClient {
     if (this.closing) return
     this.closing = true
     this.initialized = false
+    this.bootVerified = false
+    this.transport = null
     await this.client.close()
   }
 }

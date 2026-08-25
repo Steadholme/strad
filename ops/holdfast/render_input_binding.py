@@ -23,6 +23,7 @@ BOUND_INPUTS = (
     "absent.paths",
 )
 FROZEN_STATIC_PATHS = (
+    "access-governance/catalog/cistern-authz-v1.json",
     "access-governance/catalog/rikune-authz-v1.json",
     "access-governance/catalog/permission.sources.v1.json",
     "access-governance/catalog/permissions.snapshot.json",

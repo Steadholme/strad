@@ -192,7 +192,9 @@ jobs:
               if (contract.STATIC_PROFILE_LOCK_SHA256 !== process.env.RIKUNE_STATIC_LOCK_SHA256) {
                 throw new Error("Rikune static lock differs from the release input");
               }
-              await contract.loadAndVerifyStaticLock("/app/static-profile.lock.json");
+              const lock = await contract.loadAndVerifyStaticLock("/app/static-profile.lock.json");
+              const constants = await import("./dist/src/constants.js");
+              contract.validateStaticBackendEnvironment(lock, constants.CHILD_ENV_BASE);
               if (process.getuid?.() !== 1000) {
                 throw new Error("analyzer runtime user differs from the container contract");
               }
