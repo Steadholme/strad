@@ -41,6 +41,7 @@ MUTATED_PATHS = (
     "access-governance/scripts/validate_authz_manifests.py",
     "access-governance/src/catalog.rs",
     "access-governance/src/package_catalog.rs",
+    "access-governance/src/repository/postgres.rs",
     "access-governance/src/handlers/ui.rs",
     "deploy/routes.seed.json",
 )
@@ -642,6 +643,20 @@ def render_catalog_rs(stage_root: Path) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def render_repository_package_shape(stage_root: Path) -> None:
+    repository_path = stage_root / "access-governance/src/repository/postgres.rs"
+    repository_text = repository_path.read_text(encoding="utf-8")
+    repository_text = replace_once(
+        repository_text,
+        "        if snapshot.packages.len() != 8\n"
+        "            || snapshot.requestable_package_count != 7\n",
+        "        if snapshot.packages.len() != 9\n"
+        "            || snapshot.requestable_package_count != 8\n",
+        "repository package snapshot shape",
+    )
+    repository_path.write_text(repository_text, encoding="utf-8")
+
+
 def render_packages(stage_root: Path) -> None:
     snapshot_path = stage_root / "access-governance/catalog/packages.snapshot.json"
     permission_path = stage_root / "access-governance/catalog/permissions.snapshot.json"
@@ -758,6 +773,8 @@ def render_packages(stage_root: Path) -> None:
     for old, new, label in changes:
         text = replace_once(text, old, new, label)
     code_path.write_text(text, encoding="utf-8")
+
+    render_repository_package_shape(stage_root)
 
     ui_path = stage_root / "access-governance/src/handlers/ui.rs"
     ui_text = ui_path.read_text(encoding="utf-8")

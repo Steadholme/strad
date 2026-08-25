@@ -101,7 +101,7 @@ class ApplyContractTests(unittest.TestCase):
         global_absent = render.parse_path_manifest(OPS_ROOT / "absent.paths")
         self.assertEqual(set(targets), set(apply_preimages) | apply_absent)
         self.assertFalse(set(apply_preimages) & apply_absent)
-        self.assertEqual(len(apply_preimages), 12)
+        self.assertEqual(len(apply_preimages), 13)
         self.assertEqual(len(apply_absent), 2)
         self.assertGreater(len(global_preimages), len(apply_preimages))
         self.assertEqual(
@@ -109,6 +109,36 @@ class ApplyContractTests(unittest.TestCase):
             {path: global_preimages[path] for path in targets if path in global_preimages},
         )
         self.assertEqual(apply_absent, set(targets) & global_absent)
+
+    def test_repository_package_shape_is_part_of_the_frozen_render_contract(self) -> None:
+        relative = "access-governance/src/repository/postgres.rs"
+        self.assertIn(relative, render.MUTATED_PATHS)
+        self.assertIn(relative, render_input_binding.FROZEN_STATIC_PATHS)
+        self.assertEqual(
+            render.parse_checksum_manifest(OPS_ROOT / "preimages.sha256")[relative],
+            "b8f81a049777b38f2ba5911559d9123dec213e6a311e1000c8d4d40e962cb907",
+        )
+        self.assertEqual(
+            render.parse_checksum_manifest(OPS_ROOT / "static-targets.sha256")[relative],
+            "25a776e2b1ac871891861e1b4745b700199254b8d6e1b49f7e80f47737969c77",
+        )
+
+        stage = self.root / "repository-render-stage"
+        target = stage / relative
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            "before\n"
+            "        if snapshot.packages.len() != 8\n"
+            "            || snapshot.requestable_package_count != 7\n",
+            encoding="utf-8",
+        )
+        render.render_repository_package_shape(stage)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            "before\n"
+            "        if snapshot.packages.len() != 9\n"
+            "            || snapshot.requestable_package_count != 8\n",
+        )
 
     def test_cistern_permission_is_retained_as_an_independent_catalog_source(self) -> None:
         asset_path = OPS_ROOT / "assets/cistern-authz-v1.json"

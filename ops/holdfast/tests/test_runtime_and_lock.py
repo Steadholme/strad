@@ -1048,6 +1048,13 @@ class RuntimeAndLockTests(unittest.TestCase):
         for base in (estate, stage):
             (base / "access-governance/catalog/packages.snapshot.json").write_text(json.dumps(packages))
             (base / "access-governance/catalog/permissions.snapshot.json").write_text(json.dumps(permissions))
+            repository = base / "access-governance/src/repository/postgres.rs"
+            repository.parent.mkdir(parents=True, exist_ok=True)
+            repository.write_text(
+                "        if snapshot.packages.len() != 9\n"
+                "            || snapshot.requestable_package_count != 8\n",
+                encoding="utf-8",
+            )
             (base / "deploy/routes.seed.json").write_text(json.dumps(routes))
             generator = base / "access-governance/scripts/generate_permission_catalog.sh"
             generator.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")

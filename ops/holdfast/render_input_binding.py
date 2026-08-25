@@ -32,6 +32,7 @@ FROZEN_STATIC_PATHS = (
     "access-governance/scripts/validate_authz_manifests.py",
     "access-governance/src/catalog.rs",
     "access-governance/src/package_catalog.rs",
+    "access-governance/src/repository/postgres.rs",
     "access-governance/src/handlers/ui.rs",
     "deploy/routes.seed.json",
     "deploy/docker-compose.yml",

@@ -61,6 +61,22 @@ jq -e '
   and .packages[8].membership_digest == "16b3b01187d066ce7a2e3b4b8c13185cae93bc9b64ee680ccf7c62b501df4b6c"
   and .packages[8].policy_digest == "6cb61051c0fdfea360a3fedc9b938a63581e4358d992bb418408eaeb024cdffa"
 ' "$target_root/access-governance/catalog/packages.snapshot.json" >/dev/null
+python3 - "$target_root/access-governance/src/repository/postgres.rs" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+expected = (
+    "        if snapshot.packages.len() != 9\n"
+    "            || snapshot.requestable_package_count != 8\n"
+)
+legacy = (
+    "        if snapshot.packages.len() != 8\n"
+    "            || snapshot.requestable_package_count != 7\n"
+)
+if text.count(expected) != 1 or legacy in text:
+    raise SystemExit("Access repository package snapshot guard is not frozen at 9/8")
+PY
 jq -e '
   ([.entries[].key | select(startswith("rikune."))] | length) == 7
   and ([.generated_from[].source | select(. == "rikune-authz")] | length) == 1

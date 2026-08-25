@@ -841,9 +841,10 @@ service_container_ids() {
     --filter "label=com.docker.compose.service=$service"
 }
 
-validate_restore_writer_set() {
+validate_writer_sequence() {
+  local -n writers=$1
   local previous_index=-1 service candidate index found
-  for service in "${restore_running_writers[@]}"; do
+  for service in "${writers[@]}"; do
     found=-1
     for index in "${!application_writers[@]}"; do
       candidate=${application_writers[$index]}
@@ -855,6 +856,133 @@ validate_restore_writer_set() {
     ((found >= 0)) || holdfast_die "restore writer manifest contains an unknown service: $service"
     ((found > previous_index)) || holdfast_die "restore writer manifest is duplicated or out of order"
     previous_index=$found
+  done
+}
+
+validate_restore_writer_set() {
+  validate_writer_sequence restore_running_writers
+}
+
+declare -A preimage_compose_services=()
+preimage_compose_sha="none"
+load_preimage_compose_authority() {
+  local compose_path expected_sha="" digest relative extra output service
+  local matches=0
+  if [[ "$transaction_state" == "not_started" ]]; then
+    compose_path="$estate_root/deploy/docker-compose.yml"
+  else
+    compose_path="$backup/estate/tree/deploy/docker-compose.yml"
+  fi
+  require_root_file "$compose_path"
+  while read -r digest relative extra; do
+    if [[ "$relative" == "deploy/docker-compose.yml" ]]; then
+      [[ -z "${extra:-}" && "$digest" =~ ^[0-9a-f]{64}$ ]] || \
+        holdfast_die "estate preimage Compose authority is malformed"
+      expected_sha=$digest
+      ((matches += 1))
+    fi
+  done <"$backup/APPLY-PREIMAGES.sha256"
+  [[ "$matches" == "1" ]] || \
+    holdfast_die "estate preimage Compose authority is absent or ambiguous"
+  preimage_compose_sha=$(holdfast_sha256 "$compose_path")
+  [[ "$preimage_compose_sha" == "$expected_sha" ]] || \
+    holdfast_die "estate preimage Compose differs from its frozen preimage"
+
+  output=$("$docker_bin" compose -f "$compose_path" config --no-interpolate --services) || \
+    holdfast_die "could not resolve estate preimage Compose services"
+  preimage_compose_services=()
+  while IFS= read -r service; do
+    [[ -n "$service" && "$service" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || \
+      holdfast_die "estate preimage Compose contains an unsafe service identity"
+    [[ -z "${preimage_compose_services[$service]:-}" ]] || \
+      holdfast_die "estate preimage Compose service inventory is duplicated"
+    preimage_compose_services["$service"]=1
+  done <<<"$output"
+  ((${#preimage_compose_services[@]} > 0)) || \
+    holdfast_die "estate preimage Compose service inventory is empty"
+}
+
+validate_writer_reconciliation_source() {
+  local source_state source_failure_name source_failure source_arm_name source_arm
+  local source_manifest_name source_manifest source_arm_sha service
+  local -a source_writers=() expected_writers=()
+
+  source_state="$state_dir/APPLY-RECOVERY-FAILED-${writer_set_source_attempt}.json"
+  require_root_file "$source_state"
+  [[ "$(holdfast_sha256 "$source_state")" == "$writer_set_source_state_sha" ]] || \
+    holdfast_die "writer reconciliation source state was replaced"
+  jq -e \
+    --arg attempt "$writer_set_source_attempt" --arg backup "$backup" \
+    --arg estate "$estate_root" --arg control "$control_sha" \
+    --arg transaction "$transaction_sha" --arg writers "$writer_set_source_manifest_sha" \
+    --arg failure "$writer_set_source_failure_sha" \
+    '.schema_version == 2 and .state == "restore_failed" and
+     .recovery_attempt_id == $attempt and .recovery_mode == "restore" and
+     .recovery_failure_stage == "restore_prior_running_writers" and
+     .backup_dir == $backup and .estate_root == $estate and
+     .control_sha256 == $control and .transaction_sha256 == $transaction and
+     .restore_running_writers_sha256 == $writers and
+     .apply_failure_receipt_sha256 == $failure and
+     .recovery_route_database_state == "absent" and .ingress_opened == false' \
+    "$source_state" >/dev/null || \
+    holdfast_die "writer reconciliation source state authority differs"
+
+  source_failure_name=$(jq -er '.apply_failure_receipt' "$source_state")
+  [[ "$source_failure_name" =~ ^APPLY-RECOVERY-FAILED-${writer_set_source_attempt}(-retry-[0-9]+)?\.receipt$ ]] || \
+    holdfast_die "writer reconciliation source failure identity is unsafe"
+  source_failure="$state_dir/$source_failure_name"
+  require_root_file "$source_failure"
+  [[ "$(holdfast_sha256 "$source_failure")" == "$writer_set_source_failure_sha" ]] || \
+    holdfast_die "writer reconciliation source failure was replaced"
+
+  source_arm_name=$(jq -er '.recovery_armed_receipt' "$source_state")
+  [[ "$source_arm_name" == "APPLY-RECOVERY-ARMED-${writer_set_source_attempt}.receipt" ]] || \
+    holdfast_die "writer reconciliation source arm identity is unsafe"
+  source_arm="$state_dir/$source_arm_name"
+  require_root_file "$source_arm"
+  source_arm_sha=$(holdfast_sha256 "$source_arm")
+  [[ "$(jq -er '.recovery_armed_receipt_sha256' "$source_state")" == "$source_arm_sha" && \
+    "$(holdfast_receipt_value "$source_failure" recovery_armed_receipt_sha256)" == "$source_arm_sha" ]] || \
+    holdfast_die "writer reconciliation source arm was replaced"
+  [[ "$(holdfast_receipt_value "$source_failure" attempt_id)" == "$writer_set_source_attempt" && \
+    "$(holdfast_receipt_value "$source_failure" mode)" == "restore" && \
+    "$(holdfast_receipt_value "$source_failure" stage)" == "restore_prior_running_writers" && \
+    "$(holdfast_receipt_value "$source_failure" estate_root)" == "$estate_root" && \
+    "$(holdfast_receipt_value "$source_failure" backup_dir)" == "$backup" && \
+    "$(holdfast_receipt_value "$source_failure" control_sha256)" == "$control_sha" && \
+    "$(holdfast_receipt_value "$source_failure" transaction_sha256)" == "$transaction_sha" && \
+    "$(holdfast_receipt_value "$source_failure" restore_running_writers_sha256)" == \
+      "$writer_set_source_manifest_sha" && \
+    "$(holdfast_receipt_value "$source_failure" route_database_state)" == "absent" && \
+    "$(holdfast_receipt_value "$source_failure" ingress_opened)" == "false" ]] || \
+    holdfast_die "writer reconciliation source failure authority differs"
+  [[ "$(holdfast_receipt_value "$source_arm" attempt_id)" == "$writer_set_source_attempt" && \
+    "$(holdfast_receipt_value "$source_arm" mode)" == "restore" && \
+    "$(holdfast_receipt_value "$source_arm" control_sha256)" == "$control_sha" && \
+    "$(holdfast_receipt_value "$source_arm" transaction_sha256)" == "$transaction_sha" && \
+    "$(holdfast_receipt_value "$source_arm" restore_running_writers_sha256)" == \
+      "$writer_set_source_manifest_sha" ]] || \
+    holdfast_die "writer reconciliation source arm authority differs"
+
+  source_manifest_name=$(jq -er '.restore_running_writers_manifest' "$source_state")
+  [[ "$source_manifest_name" == "RESTORE-RUNNING-WRITERS-${writer_set_source_attempt}.txt" ]] || \
+    holdfast_die "writer reconciliation source manifest identity is unsafe"
+  source_manifest="$state_dir/$source_manifest_name"
+  require_root_file "$source_manifest"
+  [[ "$(holdfast_sha256 "$source_manifest")" == "$writer_set_source_manifest_sha" ]] || \
+    holdfast_die "writer reconciliation source manifest was replaced"
+  mapfile -t source_writers <"$source_manifest"
+  validate_writer_sequence source_writers
+  for service in "${source_writers[@]}"; do
+    if [[ -n "${preimage_compose_services[$service]:-}" ]]; then
+      expected_writers+=("$service")
+    fi
+  done
+  ((${#expected_writers[@]} == ${#restore_running_writers[@]})) || \
+    holdfast_die "writer reconciliation result differs from estate preimage"
+  for index in "${!expected_writers[@]}"; do
+    [[ "${expected_writers[$index]}" == "${restore_running_writers[$index]}" ]] || \
+      holdfast_die "writer reconciliation result differs from estate preimage"
   done
 }
 
@@ -1468,6 +1596,98 @@ if [[ -n "$completed_state_match" ]]; then
     "$transaction_sha" && \
     "$(holdfast_receipt_value "$completed_armed" applied_targets_sha256)" == \
     "$applied_targets_sha" ]] || holdfast_die "completed recovery arm rollback authority differs"
+  completed_writer_reconciled=$(holdfast_receipt_value "$completed_receipt" writer_set_reconciled 2>/dev/null || printf legacy-absent)
+  completed_writer_source_attempt=$(holdfast_receipt_value "$completed_receipt" writer_set_source_attempt 2>/dev/null || printf legacy-absent)
+  completed_writer_source_failure=$(holdfast_receipt_value "$completed_receipt" writer_set_source_failure_receipt_sha256 2>/dev/null || printf legacy-absent)
+  completed_writer_source_state=$(holdfast_receipt_value "$completed_receipt" writer_set_source_state_sha256 2>/dev/null || printf legacy-absent)
+  completed_writer_source_manifest=$(holdfast_receipt_value "$completed_receipt" writer_set_source_manifest_sha256 2>/dev/null || printf legacy-absent)
+  completed_writer_preimage=$(holdfast_receipt_value "$completed_receipt" writer_set_preimage_compose_sha256 2>/dev/null || printf legacy-absent)
+  if [[ "$completed_writer_reconciled" == "legacy-absent" && \
+    "$completed_writer_source_attempt" == "legacy-absent" && \
+    "$completed_writer_source_failure" == "legacy-absent" && \
+    "$completed_writer_source_state" == "legacy-absent" && \
+    "$completed_writer_source_manifest" == "legacy-absent" && \
+    "$completed_writer_preimage" == "legacy-absent" ]]; then
+    for key in writer_set_reconciled writer_set_source_attempt \
+      writer_set_source_failure_receipt_sha256 writer_set_source_state_sha256 \
+      writer_set_source_manifest_sha256 writer_set_preimage_compose_sha256; do
+      [[ "$(holdfast_receipt_value "$completed_armed" "$key" 2>/dev/null || printf legacy-absent)" == \
+        "legacy-absent" ]] || holdfast_die "legacy completed arm carries writer reconciliation"
+    done
+    jq -e \
+      '(.writer_set_reconciled // false) == false and
+       (.writer_set_source_attempt // "none") == "none" and
+       (.writer_set_source_failure_receipt_sha256 // "none") == "none" and
+       (.writer_set_source_state_sha256 // "none") == "none" and
+       (.writer_set_source_manifest_sha256 // "none") == "none" and
+       (.writer_set_preimage_compose_sha256 // "none") == "none"' \
+      "$completed_state_match" >/dev/null || \
+      holdfast_die "legacy completed state carries writer reconciliation"
+  else
+    [[ "$completed_writer_reconciled" == "true" || \
+      "$completed_writer_reconciled" == "false" ]] || \
+      holdfast_die "completed writer reconciliation flag differs"
+    writer_set_reconciled=$completed_writer_reconciled
+    writer_set_source_attempt=$completed_writer_source_attempt
+    writer_set_source_failure_sha=$completed_writer_source_failure
+    writer_set_source_state_sha=$completed_writer_source_state
+    writer_set_source_manifest_sha=$completed_writer_source_manifest
+    writer_set_preimage_compose_sha=$completed_writer_preimage
+    for key in writer_set_reconciled writer_set_source_attempt \
+      writer_set_source_failure_receipt_sha256 writer_set_source_state_sha256 \
+      writer_set_source_manifest_sha256 writer_set_preimage_compose_sha256; do
+      [[ "$(holdfast_receipt_value "$completed_receipt" "$key")" == \
+          "$(holdfast_receipt_value "$completed_armed" "$key")" && \
+        "$(holdfast_receipt_value "$completed_armed" "$key")" == \
+          "$(jq -er ".${key} | tostring" "$completed_state_match")" ]] || \
+        holdfast_die "completed writer reconciliation authority differs: $key"
+    done
+    if [[ "$mode" == "restore" ]]; then
+      load_preimage_compose_authority
+      [[ "$writer_set_preimage_compose_sha" == "$preimage_compose_sha" ]] || \
+        holdfast_die "completed writer reconciliation preimage Compose differs"
+      completed_attempt=$(holdfast_receipt_value "$completed_receipt" attempt_id)
+      completed_writers_name=$(holdfast_receipt_value "$completed_receipt" restore_running_writers_manifest)
+      completed_writers_sha=$(holdfast_receipt_value "$completed_receipt" restore_running_writers_sha256)
+      [[ "$completed_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+        "$completed_writers_name" == "RESTORE-RUNNING-WRITERS-${completed_attempt}.txt" && \
+        "$completed_writers_sha" =~ ^[0-9a-f]{64}$ && \
+        "$(jq -er '.restore_running_writers_manifest' "$completed_state_match")" == \
+          "$completed_writers_name" && \
+        "$(jq -er '.restore_running_writers_sha256' "$completed_state_match")" == \
+          "$completed_writers_sha" && \
+        "$(holdfast_receipt_value "$completed_armed" restore_running_writers_manifest)" == \
+          "$completed_writers_name" && \
+        "$(holdfast_receipt_value "$completed_armed" restore_running_writers_sha256)" == \
+          "$completed_writers_sha" ]] || \
+        holdfast_die "completed recovery writer manifest authority differs"
+      restore_writers_manifest="$state_dir/$completed_writers_name"
+      require_root_file "$restore_writers_manifest"
+      [[ "$(holdfast_sha256 "$restore_writers_manifest")" == "$completed_writers_sha" ]] || \
+        holdfast_die "completed recovery writer manifest was replaced"
+      mapfile -t restore_running_writers <"$restore_writers_manifest"
+      validate_restore_writer_set
+    else
+      [[ "$writer_set_preimage_compose_sha" == "none" ]] || \
+        holdfast_die "completed resume carries writer preimage authority"
+      restore_running_writers=()
+    fi
+    if [[ "$writer_set_reconciled" == "true" ]]; then
+      [[ "$mode" == "restore" && \
+        "$writer_set_source_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+        "$writer_set_source_failure_sha" =~ ^[0-9a-f]{64}$ && \
+        "$writer_set_source_state_sha" =~ ^[0-9a-f]{64}$ && \
+        "$writer_set_source_manifest_sha" =~ ^[0-9a-f]{64}$ ]] || \
+        holdfast_die "completed writer reconciliation evidence is invalid"
+      validate_writer_reconciliation_source
+    else
+      [[ "$writer_set_source_attempt" == "none" && \
+        "$writer_set_source_failure_sha" == "none" && \
+        "$writer_set_source_state_sha" == "none" && \
+        "$writer_set_source_manifest_sha" == "none" ]] || \
+        holdfast_die "completed inactive writer reconciliation carries source evidence"
+    fi
+  fi
   if [[ "$mode" == "restore" ]]; then
     verify_live_disposition preimage
     if [[ -f "$state_file" && ! -L "$state_file" ]]; then
@@ -1511,6 +1731,16 @@ fi
 restore_running_writers=()
 restore_writers_manifest="none"
 restore_writers_sha="none"
+writer_set_reconciled="false"
+writer_set_source_attempt="none"
+writer_set_source_failure_sha="none"
+writer_set_source_state_sha="none"
+writer_set_source_manifest_sha="none"
+writer_set_preimage_compose_sha="none"
+if [[ "$mode" == "restore" ]]; then
+  load_preimage_compose_authority
+  writer_set_preimage_compose_sha=$preimage_compose_sha
+fi
 if [[ "$prior_state" == "apply_recovery_armed" ]]; then
   attempt_id=$(jq -er '.recovery_attempt_id' "$state_file")
   [[ "$attempt_id" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || holdfast_die "armed recovery attempt identity is unsafe"
@@ -1609,6 +1839,73 @@ if [[ "$prior_state" == "apply_recovery_armed" ]]; then
       "$(jq -er '.pre_restored_runtime_disposition' "$state_file")" == \
         "$pre_restored_runtime_disposition" ]] || holdfast_die "armed pre-restored retry state differs"
   fi
+  armed_writer_set_reconciled=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_reconciled 2>/dev/null || printf legacy-absent)
+  armed_writer_set_source_attempt=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_source_attempt 2>/dev/null || printf legacy-absent)
+  armed_writer_set_source_failure=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_source_failure_receipt_sha256 2>/dev/null || printf legacy-absent)
+  armed_writer_set_source_state=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_source_state_sha256 2>/dev/null || printf legacy-absent)
+  armed_writer_set_source_manifest=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_source_manifest_sha256 2>/dev/null || printf legacy-absent)
+  armed_writer_set_preimage_compose=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_preimage_compose_sha256 2>/dev/null || printf legacy-absent)
+  if [[ "$armed_writer_set_reconciled" == "legacy-absent" && \
+    "$armed_writer_set_source_attempt" == "legacy-absent" && \
+    "$armed_writer_set_source_failure" == "legacy-absent" && \
+    "$armed_writer_set_source_state" == "legacy-absent" && \
+    "$armed_writer_set_source_manifest" == "legacy-absent" && \
+    "$armed_writer_set_preimage_compose" == "legacy-absent" ]]; then
+    jq -e \
+      '(.writer_set_reconciled // false) == false and
+       (.writer_set_source_attempt // "none") == "none" and
+       (.writer_set_source_failure_receipt_sha256 // "none") == "none" and
+       (.writer_set_source_state_sha256 // "none") == "none" and
+       (.writer_set_source_manifest_sha256 // "none") == "none" and
+       (.writer_set_preimage_compose_sha256 // "none") == "none"' \
+      "$state_file" >/dev/null || \
+      holdfast_die "legacy armed recovery cannot claim writer reconciliation"
+    writer_set_preimage_compose_sha="none"
+  else
+    [[ "$armed_writer_set_reconciled" == "true" || \
+      "$armed_writer_set_reconciled" == "false" ]] || \
+      holdfast_die "armed writer reconciliation flag differs"
+    writer_set_reconciled=$armed_writer_set_reconciled
+    writer_set_source_attempt=$armed_writer_set_source_attempt
+    writer_set_source_failure_sha=$armed_writer_set_source_failure
+    writer_set_source_state_sha=$armed_writer_set_source_state
+    writer_set_source_manifest_sha=$armed_writer_set_source_manifest
+    writer_set_preimage_compose_sha=$armed_writer_set_preimage_compose
+    if [[ "$mode" == "restore" ]]; then
+      [[ "$writer_set_preimage_compose_sha" == "$preimage_compose_sha" ]] || \
+        holdfast_die "armed writer reconciliation preimage Compose differs"
+    else
+      [[ "$writer_set_preimage_compose_sha" == "none" ]] || \
+        holdfast_die "resume arm carries writer preimage authority"
+    fi
+    if [[ "$writer_set_reconciled" == "true" ]]; then
+      [[ "$mode" == "restore" && \
+        "$writer_set_source_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+        "$writer_set_source_failure_sha" =~ ^[0-9a-f]{64}$ && \
+        "$writer_set_source_state_sha" =~ ^[0-9a-f]{64}$ && \
+        "$writer_set_source_manifest_sha" =~ ^[0-9a-f]{64}$ ]] || \
+        holdfast_die "armed writer reconciliation evidence is invalid"
+    else
+      [[ "$writer_set_source_attempt" == "none" && \
+        "$writer_set_source_failure_sha" == "none" && \
+        "$writer_set_source_state_sha" == "none" && \
+        "$writer_set_source_manifest_sha" == "none" ]] || \
+        holdfast_die "inactive writer reconciliation carries source evidence"
+    fi
+    [[ "$(jq -er '.writer_set_reconciled | tostring' "$state_file")" == \
+        "$writer_set_reconciled" && \
+      "$(jq -er '.writer_set_source_attempt' "$state_file")" == \
+        "$writer_set_source_attempt" && \
+      "$(jq -er '.writer_set_source_failure_receipt_sha256' "$state_file")" == \
+        "$writer_set_source_failure_sha" && \
+      "$(jq -er '.writer_set_source_state_sha256' "$state_file")" == \
+        "$writer_set_source_state_sha" && \
+      "$(jq -er '.writer_set_source_manifest_sha256' "$state_file")" == \
+        "$writer_set_source_manifest_sha" && \
+      "$(jq -er '.writer_set_preimage_compose_sha256' "$state_file")" == \
+        "$writer_set_preimage_compose_sha" ]] || \
+      holdfast_die "armed writer reconciliation state differs"
+  fi
   if [[ "$mode" == "restore" ]]; then
     restore_writers_name=$(jq -er '.restore_running_writers_manifest' "$state_file")
     [[ "$restore_writers_name" == "RESTORE-RUNNING-WRITERS-${attempt_id}.txt" ]] || \
@@ -1620,6 +1917,9 @@ if [[ "$prior_state" == "apply_recovery_armed" ]]; then
       holdfast_die "armed recovery writer manifest was replaced"
     mapfile -t restore_running_writers <"$restore_writers_manifest"
     validate_restore_writer_set
+    if [[ "$writer_set_reconciled" == "true" ]]; then
+      validate_writer_reconciliation_source
+    fi
   fi
 else
   attempt_stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -1634,6 +1934,82 @@ else
       [[ "$(jq -er '.restore_running_writers_sha256' "$state_file")" == "$(holdfast_sha256 "$prior_writers_manifest")" ]] || \
         holdfast_die "restore-failed writer manifest was replaced"
       mapfile -t restore_running_writers <"$prior_writers_manifest"
+      validate_restore_writer_set
+      source_writer_count=${#restore_running_writers[@]}
+      reconciled_writers=()
+      for service in "${restore_running_writers[@]}"; do
+        if [[ -n "${preimage_compose_services[$service]:-}" ]]; then
+          reconciled_writers+=("$service")
+        fi
+      done
+      prior_writer_set_reconciled=$(jq -er '(.writer_set_reconciled // false) | tostring' "$state_file")
+      if [[ "$prior_writer_set_reconciled" == "true" ]]; then
+        ((${#reconciled_writers[@]} == source_writer_count)) || \
+          holdfast_die "previously reconciled writer set differs from estate preimage"
+        writer_set_reconciled="true"
+        writer_set_source_attempt=$(jq -er '.writer_set_source_attempt' "$state_file")
+        writer_set_source_failure_sha=$(jq -er '.writer_set_source_failure_receipt_sha256' "$state_file")
+        writer_set_source_state_sha=$(jq -er '.writer_set_source_state_sha256' "$state_file")
+        writer_set_source_manifest_sha=$(jq -er '.writer_set_source_manifest_sha256' "$state_file")
+        writer_set_preimage_compose_sha=$(jq -er '.writer_set_preimage_compose_sha256' "$state_file")
+        [[ "$writer_set_source_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+          "$writer_set_source_failure_sha" =~ ^[0-9a-f]{64}$ && \
+          "$writer_set_source_state_sha" =~ ^[0-9a-f]{64}$ && \
+          "$writer_set_source_manifest_sha" =~ ^[0-9a-f]{64}$ && \
+          "$writer_set_preimage_compose_sha" == "$preimage_compose_sha" ]] || \
+          holdfast_die "inherited writer reconciliation evidence is invalid"
+        current_attempt=$(jq -er '.recovery_attempt_id' "$state_file")
+        [[ "$current_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || \
+          holdfast_die "inherited writer reconciliation attempt is unsafe"
+        current_failed_state="$state_dir/APPLY-RECOVERY-FAILED-${current_attempt}.json"
+        require_root_file "$current_failed_state"
+        [[ "$(holdfast_sha256 "$current_failed_state")" == "$(holdfast_sha256 "$state_file")" ]] || \
+          holdfast_die "inherited writer reconciliation CURRENT differs from immutable state"
+        current_failure_name=$(jq -er '.apply_failure_receipt' "$state_file")
+        current_arm_name=$(jq -er '.recovery_armed_receipt' "$state_file")
+        [[ "$current_failure_name" =~ ^APPLY-RECOVERY-FAILED-${current_attempt}(-retry-[0-9]+)?\.receipt$ && \
+          "$current_arm_name" == "APPLY-RECOVERY-ARMED-${current_attempt}.receipt" ]] || \
+          holdfast_die "inherited writer reconciliation evidence identity is unsafe"
+        current_failure="$state_dir/$current_failure_name"
+        current_arm="$state_dir/$current_arm_name"
+        require_root_file "$current_failure"
+        require_root_file "$current_arm"
+        [[ "$(holdfast_sha256 "$current_arm")" == \
+            "$(jq -er '.recovery_armed_receipt_sha256' "$state_file")" && \
+          "$(holdfast_sha256 "$current_arm")" == \
+            "$(holdfast_receipt_value "$current_failure" recovery_armed_receipt_sha256)" ]] || \
+          holdfast_die "inherited writer reconciliation arm was replaced"
+        for key in writer_set_reconciled writer_set_source_attempt \
+          writer_set_source_failure_receipt_sha256 writer_set_source_state_sha256 \
+          writer_set_source_manifest_sha256 writer_set_preimage_compose_sha256; do
+          [[ "$(holdfast_receipt_value "$current_failure" "$key")" == \
+              "$(holdfast_receipt_value "$current_arm" "$key")" && \
+            "$(holdfast_receipt_value "$current_arm" "$key")" == \
+              "$(jq -er ".${key} | tostring" "$state_file")" ]] || \
+            holdfast_die "inherited writer reconciliation authority differs: $key"
+        done
+        validate_writer_reconciliation_source
+      elif ((${#reconciled_writers[@]} != source_writer_count)); then
+        [[ "$runtime_schema" == "2" && \
+          "$(jq -er '.recovery_failure_stage' "$state_file")" == \
+            "restore_prior_running_writers" && \
+          "$(jq -er '.recovery_route_database_state' "$state_file")" == "absent" && \
+          "$(jq -er '.ingress_opened | tostring' "$state_file")" == "false" ]] || \
+          holdfast_die "restore-failed writer reconciliation lacks closed schema-v2 authority"
+        writer_set_source_attempt=$(jq -er '.recovery_attempt_id' "$state_file")
+        [[ "$writer_set_source_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || \
+          holdfast_die "writer reconciliation source attempt is unsafe"
+        writer_set_source_failure_sha=$(jq -er '.apply_failure_receipt_sha256' "$state_file")
+        writer_set_source_manifest_sha=$(holdfast_sha256 "$prior_writers_manifest")
+        writer_set_source_state_sha=$(holdfast_sha256 "$state_file")
+        source_failed_state="$state_dir/APPLY-RECOVERY-FAILED-${writer_set_source_attempt}.json"
+        require_root_file "$source_failed_state"
+        [[ "$(holdfast_sha256 "$source_failed_state")" == "$writer_set_source_state_sha" ]] || \
+          holdfast_die "restore-failed CURRENT differs from its immutable failure state"
+        writer_set_reconciled="true"
+        restore_running_writers=("${reconciled_writers[@]}")
+        validate_writer_reconciliation_source
+      fi
     else
       declare -A restore_needed=()
       for service in "${application_writers[@]}"; do
@@ -1649,7 +2025,10 @@ else
       done
       for service in "${runtime_prior_services[@]}"; do restore_needed["$service"]=1; done
       for service in "${application_writers[@]}"; do
-        if [[ "${restore_needed[$service]:-0}" == "1" ]]; then restore_running_writers+=("$service"); fi
+        if [[ "${restore_needed[$service]:-0}" == "1" && \
+          -n "${preimage_compose_services[$service]:-}" ]]; then
+          restore_running_writers+=("$service")
+        fi
       done
     fi
     validate_restore_writer_set
@@ -1693,6 +2072,12 @@ else
     fi
     printf 'restore_running_writers_manifest=%s\n' "$([[ "$mode" == "restore" ]] && basename -- "$restore_writers_manifest" || printf not-applicable)"
     printf 'restore_running_writers_sha256=%s\n' "$restore_writers_sha"
+    printf 'writer_set_reconciled=%s\n' "$writer_set_reconciled"
+    printf 'writer_set_source_attempt=%s\n' "$writer_set_source_attempt"
+    printf 'writer_set_source_failure_receipt_sha256=%s\n' "$writer_set_source_failure_sha"
+    printf 'writer_set_source_state_sha256=%s\n' "$writer_set_source_state_sha"
+    printf 'writer_set_source_manifest_sha256=%s\n' "$writer_set_source_manifest_sha"
+    printf 'writer_set_preimage_compose_sha256=%s\n' "$writer_set_preimage_compose_sha"
     printf 'pre_restored_retry=%s\n' "$pre_restored_retry"
     printf 'pre_restored_source_attempt=%s\n' "$pre_restored_source_attempt"
     printf 'pre_restored_runtime_snapshot_sha256=%s\n' "$pre_restored_runtime_snapshot"
@@ -1724,8 +2109,14 @@ else
       --arg pre_restored_superseded_failure "$pre_restored_superseded_failure_sha" \
       --arg pre_restored_superseded_state "$pre_restored_superseded_state_sha" \
       --arg pre_restored_disposition "$pre_restored_runtime_disposition" \
+      --arg writer_reconciled "$writer_set_reconciled" \
+      --arg writer_source_attempt "$writer_set_source_attempt" \
+      --arg writer_source_failure "$writer_set_source_failure_sha" \
+      --arg writer_source_state "$writer_set_source_state_sha" \
+      --arg writer_source_manifest "$writer_set_source_manifest_sha" \
+      --arg writer_preimage_compose "$writer_set_preimage_compose_sha" \
       --arg transaction "$transaction_sha" --arg applied_targets "$applied_targets_sha" \
-      '.state="apply_recovery_armed" | .recovery_prior_state=$prior | .recovery_mode=$mode | .recovery_attempt_id=$attempt | .recovery_armed_receipt=$armed | .recovery_armed_receipt_sha256=$armed_sha | .restore_running_writers_manifest=$writers | .restore_running_writers_sha256=$writers_sha | .legacy_empty_strad=($legacy_empty == "true") | .pre_restored_retry=($pre_restored == "true") | .pre_restored_source_attempt=$pre_restored_attempt | .pre_restored_runtime_snapshot_sha256=$pre_restored_runtime | .pre_restored_estate_snapshot_sha256=$pre_restored_estate | .pre_restored_superseded_attempt=$pre_restored_superseded_attempt | .pre_restored_superseded_failure_receipt_sha256=$pre_restored_superseded_failure | .pre_restored_superseded_state_sha256=$pre_restored_superseded_state | .pre_restored_runtime_disposition=$pre_restored_disposition | .transaction_sha256=$transaction | .applied_targets_sha256=$applied_targets' \
+      '.state="apply_recovery_armed" | .recovery_prior_state=$prior | .recovery_mode=$mode | .recovery_attempt_id=$attempt | .recovery_armed_receipt=$armed | .recovery_armed_receipt_sha256=$armed_sha | .restore_running_writers_manifest=$writers | .restore_running_writers_sha256=$writers_sha | .legacy_empty_strad=($legacy_empty == "true") | .pre_restored_retry=($pre_restored == "true") | .pre_restored_source_attempt=$pre_restored_attempt | .pre_restored_runtime_snapshot_sha256=$pre_restored_runtime | .pre_restored_estate_snapshot_sha256=$pre_restored_estate | .pre_restored_superseded_attempt=$pre_restored_superseded_attempt | .pre_restored_superseded_failure_receipt_sha256=$pre_restored_superseded_failure | .pre_restored_superseded_state_sha256=$pre_restored_superseded_state | .pre_restored_runtime_disposition=$pre_restored_disposition | .writer_set_reconciled=($writer_reconciled == "true") | .writer_set_source_attempt=$writer_source_attempt | .writer_set_source_failure_receipt_sha256=$writer_source_failure | .writer_set_source_state_sha256=$writer_source_state | .writer_set_source_manifest_sha256=$writer_source_manifest | .writer_set_preimage_compose_sha256=$writer_preimage_compose | .transaction_sha256=$transaction | .applied_targets_sha256=$applied_targets' \
       "$state_file" >"$state_tmp"
   else
     jq -n \
@@ -1743,8 +2134,14 @@ else
       --arg pre_restored_superseded_failure "$pre_restored_superseded_failure_sha" \
       --arg pre_restored_superseded_state "$pre_restored_superseded_state_sha" \
       --arg pre_restored_disposition "$pre_restored_runtime_disposition" \
+      --arg writer_reconciled "$writer_set_reconciled" \
+      --arg writer_source_attempt "$writer_set_source_attempt" \
+      --arg writer_source_failure "$writer_set_source_failure_sha" \
+      --arg writer_source_state "$writer_set_source_state_sha" \
+      --arg writer_source_manifest "$writer_set_source_manifest_sha" \
+      --arg writer_preimage_compose "$writer_set_preimage_compose_sha" \
       --arg transaction "$transaction_sha" --arg applied_targets "$applied_targets_sha" \
-      '{schema_version:2,state:"apply_recovery_armed",estate_root:$estate,backup_dir:$backup,apply_armed_receipt_sha256:$apply_armed_sha,release_evidence_sha256:$release,dry_run_receipt_sha256:$dry,control_sha256:$control,transaction_sha256:$transaction,applied_targets_sha256:$applied_targets,recovery_prior_state:$prior,recovery_mode:$mode,recovery_attempt_id:$attempt,recovery_armed_receipt:$armed,recovery_armed_receipt_sha256:$armed_sha,restore_running_writers_manifest:$writers,restore_running_writers_sha256:$writers_sha,legacy_orphan_adopted:($legacy_adopted == "true"),apply_armed_pointer_was_missing:($armed_pointer_missing == "true"),legacy_empty_strad:($legacy_empty == "true"),pre_restored_retry:($pre_restored == "true"),pre_restored_source_attempt:$pre_restored_attempt,pre_restored_runtime_snapshot_sha256:$pre_restored_runtime,pre_restored_estate_snapshot_sha256:$pre_restored_estate,pre_restored_superseded_attempt:$pre_restored_superseded_attempt,pre_restored_superseded_failure_receipt_sha256:$pre_restored_superseded_failure,pre_restored_superseded_state_sha256:$pre_restored_superseded_state,pre_restored_runtime_disposition:$pre_restored_disposition,ingress_opened:false}' \
+      '{schema_version:2,state:"apply_recovery_armed",estate_root:$estate,backup_dir:$backup,apply_armed_receipt_sha256:$apply_armed_sha,release_evidence_sha256:$release,dry_run_receipt_sha256:$dry,control_sha256:$control,transaction_sha256:$transaction,applied_targets_sha256:$applied_targets,recovery_prior_state:$prior,recovery_mode:$mode,recovery_attempt_id:$attempt,recovery_armed_receipt:$armed,recovery_armed_receipt_sha256:$armed_sha,restore_running_writers_manifest:$writers,restore_running_writers_sha256:$writers_sha,legacy_orphan_adopted:($legacy_adopted == "true"),apply_armed_pointer_was_missing:($armed_pointer_missing == "true"),legacy_empty_strad:($legacy_empty == "true"),pre_restored_retry:($pre_restored == "true"),pre_restored_source_attempt:$pre_restored_attempt,pre_restored_runtime_snapshot_sha256:$pre_restored_runtime,pre_restored_estate_snapshot_sha256:$pre_restored_estate,pre_restored_superseded_attempt:$pre_restored_superseded_attempt,pre_restored_superseded_failure_receipt_sha256:$pre_restored_superseded_failure,pre_restored_superseded_state_sha256:$pre_restored_superseded_state,pre_restored_runtime_disposition:$pre_restored_disposition,writer_set_reconciled:($writer_reconciled == "true"),writer_set_source_attempt:$writer_source_attempt,writer_set_source_failure_receipt_sha256:$writer_source_failure,writer_set_source_state_sha256:$writer_source_state,writer_set_source_manifest_sha256:$writer_source_manifest,writer_set_preimage_compose_sha256:$writer_preimage_compose,ingress_opened:false}' \
       >"$state_tmp"
   fi
   chmod 0600 "$state_tmp"
@@ -1779,6 +2176,12 @@ record_recovery_failure() {
     printf 'transaction_sha256=%s\n' "$transaction_sha"
     printf 'recovery_armed_receipt_sha256=%s\n' "$recovery_armed_sha"
     printf 'restore_running_writers_sha256=%s\n' "$restore_writers_sha"
+    printf 'writer_set_reconciled=%s\n' "$writer_set_reconciled"
+    printf 'writer_set_source_attempt=%s\n' "$writer_set_source_attempt"
+    printf 'writer_set_source_failure_receipt_sha256=%s\n' "$writer_set_source_failure_sha"
+    printf 'writer_set_source_state_sha256=%s\n' "$writer_set_source_state_sha"
+    printf 'writer_set_source_manifest_sha256=%s\n' "$writer_set_source_manifest_sha"
+    printf 'writer_set_preimage_compose_sha256=%s\n' "$writer_set_preimage_compose_sha"
     printf 'pre_restored_retry=%s\n' "$pre_restored_retry"
     printf 'pre_restored_source_attempt=%s\n' "$pre_restored_source_attempt"
     printf 'pre_restored_runtime_snapshot_sha256=%s\n' "$pre_restored_runtime_snapshot"
@@ -1983,6 +2386,34 @@ if [[ -f "$recovery_receipt" && ! -L "$recovery_receipt" ]]; then
       "$pre_restored_superseded_state_sha" && \
     "$(holdfast_receipt_value "$recovery_receipt" pre_restored_runtime_disposition)" == \
       "$pre_restored_runtime_disposition" ]] || holdfast_die "existing completion receipt pre-restored authority differs"
+  completion_writer_reconciled=$(holdfast_receipt_value "$recovery_receipt" writer_set_reconciled 2>/dev/null || printf legacy-absent)
+  completion_writer_source_attempt=$(holdfast_receipt_value "$recovery_receipt" writer_set_source_attempt 2>/dev/null || printf legacy-absent)
+  completion_writer_source_failure=$(holdfast_receipt_value "$recovery_receipt" writer_set_source_failure_receipt_sha256 2>/dev/null || printf legacy-absent)
+  completion_writer_source_state=$(holdfast_receipt_value "$recovery_receipt" writer_set_source_state_sha256 2>/dev/null || printf legacy-absent)
+  completion_writer_source_manifest=$(holdfast_receipt_value "$recovery_receipt" writer_set_source_manifest_sha256 2>/dev/null || printf legacy-absent)
+  completion_writer_preimage=$(holdfast_receipt_value "$recovery_receipt" writer_set_preimage_compose_sha256 2>/dev/null || printf legacy-absent)
+  if [[ "$completion_writer_reconciled" == "legacy-absent" && \
+    "$completion_writer_source_attempt" == "legacy-absent" && \
+    "$completion_writer_source_failure" == "legacy-absent" && \
+    "$completion_writer_source_state" == "legacy-absent" && \
+    "$completion_writer_source_manifest" == "legacy-absent" && \
+    "$completion_writer_preimage" == "legacy-absent" ]]; then
+    [[ "$writer_set_reconciled" == "false" && \
+      "$writer_set_source_attempt" == "none" && \
+      "$writer_set_source_failure_sha" == "none" && \
+      "$writer_set_source_state_sha" == "none" && \
+      "$writer_set_source_manifest_sha" == "none" && \
+      "$writer_set_preimage_compose_sha" == "none" ]] || \
+      holdfast_die "legacy completion receipt cannot claim writer reconciliation"
+  else
+    [[ "$completion_writer_reconciled" == "$writer_set_reconciled" && \
+      "$completion_writer_source_attempt" == "$writer_set_source_attempt" && \
+      "$completion_writer_source_failure" == "$writer_set_source_failure_sha" && \
+      "$completion_writer_source_state" == "$writer_set_source_state_sha" && \
+      "$completion_writer_source_manifest" == "$writer_set_source_manifest_sha" && \
+      "$completion_writer_preimage" == "$writer_set_preimage_compose_sha" ]] || \
+      holdfast_die "existing completion receipt writer reconciliation authority differs"
+  fi
 else
   [[ ! -e "$recovery_receipt" && ! -L "$recovery_receipt" && ! -e "$recovery_receipt_tmp" && ! -L "$recovery_receipt_tmp" ]] || \
     holdfast_die "unsafe recovery completion receipt path"
@@ -2011,6 +2442,12 @@ else
     printf 'pre_restored_runtime_disposition=%s\n' "$pre_restored_runtime_disposition"
     printf 'restore_running_writers_manifest=%s\n' "$([[ "$mode" == "restore" ]] && basename -- "$restore_writers_manifest" || printf not-applicable)"
     printf 'restore_running_writers_sha256=%s\n' "$restore_writers_sha"
+    printf 'writer_set_reconciled=%s\n' "$writer_set_reconciled"
+    printf 'writer_set_source_attempt=%s\n' "$writer_set_source_attempt"
+    printf 'writer_set_source_failure_receipt_sha256=%s\n' "$writer_set_source_failure_sha"
+    printf 'writer_set_source_state_sha256=%s\n' "$writer_set_source_state_sha"
+    printf 'writer_set_source_manifest_sha256=%s\n' "$writer_set_source_manifest_sha"
+    printf 'writer_set_preimage_compose_sha256=%s\n' "$writer_set_preimage_compose_sha"
     printf 'writers_reactivated=%s\n' "$writers_reactivated"
     printf 'uncaptured_writers_inactive=%s\n' "$uncaptured_writers_inactive"
     printf 'runtime_verified=%s\n' "$([[ "$mode" == "resume" ]] && printf passed || printf not-applicable)"

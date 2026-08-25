@@ -562,9 +562,16 @@ class ApplyRecoveryTests(unittest.TestCase):
             '  if [[ "$query" == *"FROM pg_database"* ]]; then printf "1\\n"; else printf "0\\n"; fi\n'
             '  exit 0\n'
             'fi\n'
+            'if [[ " $* " == *" compose "* && " $* " == *" config --no-interpolate --services "* ]]; then\n'
+            '  [[ "${HOLDFAST_TEST_PREIMAGE_COMPOSE_FAIL:-0}" != "1" ]] || exit 46\n'
+            '  services=${HOLDFAST_TEST_PREIMAGE_COMPOSE_SERVICES:-"access-governance verdict newapi rikune-analyzer strad sluice sluice-internal"}\n'
+            '  for service in $services; do printf "%s\\n" "$service"; done\n'
+            '  exit 0\n'
+            'fi\n'
             'if [[ " $* " == *" compose "* && " $* " == *" ps -aq "* ]]; then\n'
             '  service=${!#}\n'
             '  [[ "${HOLDFAST_TEST_DOCKER_PS_FAIL_SERVICE:-}" != "$service" ]] || exit 44\n'
+            '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES:-} " == *" $service "* ]]; then exit 0; fi\n'
             '  after_up=""\n'
             '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then after_up=${HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES:-}; fi\n'
             '  all=" ${HOLDFAST_TEST_RUNNING_SERVICES:-} ${HOLDFAST_TEST_RESTARTING_SERVICES:-} ${HOLDFAST_TEST_CREATED_SERVICES:-} $after_up "\n'
@@ -572,12 +579,14 @@ class ApplyRecoveryTests(unittest.TestCase):
             '  exit 0\n'
             'fi\n'
             'if [[ " $* " == *" compose "* && " $* " == *" up -d "* ]]; then\n'
+            '  rm -f "$HOLDFAST_TEST_LOG.requiesced"\n'
             '  touch "$HOLDFAST_TEST_LOG.writers-stopped"\n'
             '  exit 0\n'
             'fi\n'
             'if [[ "${1:-}" == "ps" && " $* " == *" -aq "* ]]; then\n'
             '  service=${!#}; service=${service#label=com.docker.compose.service=}\n'
             '  [[ "${HOLDFAST_TEST_DOCKER_PS_FAIL_SERVICE:-}" != "$service" ]] || exit 44\n'
+            '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES:-} " == *" $service "* ]]; then exit 0; fi\n'
             '  after_up=""\n'
             '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then after_up=${HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES:-}; fi\n'
             '  all=" ${HOLDFAST_TEST_RUNNING_SERVICES:-} ${HOLDFAST_TEST_RESTARTING_SERVICES:-} ${HOLDFAST_TEST_CREATED_SERVICES:-} $after_up "\n'
@@ -591,7 +600,8 @@ class ApplyRecoveryTests(unittest.TestCase):
             '    if [[ " ${HOLDFAST_TEST_UNHEALTHY_SERVICES:-} " == *" $service "* ]]; then printf "unhealthy\\n"; else printf "healthy\\n"; fi\n'
             '    exit 0\n'
             '  fi\n'
-            '  if [[ -e "$HOLDFAST_TEST_LOG.quiesced" && ! -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then printf "exited\\n"\n'
+            '  if [[ -e "$HOLDFAST_TEST_LOG.requiesced" ]]; then printf "exited\\n"\n'
+            '  elif [[ -e "$HOLDFAST_TEST_LOG.quiesced" && ! -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then printf "exited\\n"\n'
             '  elif [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_STOP_LEAK_SERVICES:-} " == *" $service "* ]]; then printf "running\\n"\n'
             '  elif [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES:-} " == *" $service "* ]]; then printf "running\\n"\n'
             '  elif [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_RUNNING_SERVICES:-} " != *" $service "* ]]; then printf "exited\\n"\n'
@@ -601,6 +611,7 @@ class ApplyRecoveryTests(unittest.TestCase):
             '  else printf "exited\\n"; fi\n'
             'fi\n'
             'if [[ "${1:-}" == "stop" ]]; then\n'
+            '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then touch "$HOLDFAST_TEST_LOG.requiesced"; fi\n'
             '  touch "$HOLDFAST_TEST_LOG.quiesced"\n'
             '  if [[ "${HOLDFAST_TEST_SIGKILL_ON_STOP:-0}" == "1" ]]; then kill -KILL "$PPID"; exit 137; fi\n'
             'fi\n'
@@ -673,6 +684,23 @@ class ApplyRecoveryTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             env=env or self.environment(),
         )
+
+    def install_restore_failed_with_release_only_writer(self) -> dict[str, object]:
+        running = "verdict rikune-analyzer sluice sluice-internal"
+        result = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES="rikune-analyzer",
+            ),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = json.loads((self.state / "CURRENT.json").read_text(encoding="utf-8"))
+        self.assertEqual(current["state"], "restore_failed")
+        self.assertEqual(current["recovery_failure_stage"], "restore_prior_running_writers")
+        manifest = self.state / str(current["restore_running_writers_manifest"])
+        self.assertEqual(manifest.read_text(encoding="utf-8").splitlines(), running.split())
+        return current
 
     def test_runtime_caller_arm_without_stop_archives_state_without_runtime_restore(self) -> None:
         self.install_runtime_caller_state(stop_started=False)
@@ -1243,6 +1271,229 @@ class ApplyRecoveryTests(unittest.TestCase):
         self.assertIn(f"restore_running_writers_sha256={sha256(manifests[0])}", receipt)
         self.assertIn("writers_reactivated=passed", receipt)
         self.assertIn("uncaptured_writers_inactive=passed", receipt)
+
+    def test_restore_excludes_release_only_writer_absent_from_preimage_compose(self) -> None:
+        preimage_services = "access-governance verdict newapi strad sluice sluice-internal"
+        running = "verdict rikune-analyzer sluice sluice-internal"
+        result = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_PREIMAGE_COMPOSE_SERVICES=preimage_services,
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES="rikune-analyzer",
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        manifest = next(self.state.glob("RESTORE-RUNNING-WRITERS-*.txt"))
+        self.assertEqual(
+            manifest.read_text(encoding="utf-8").splitlines(),
+            ["verdict", "sluice", "sluice-internal"],
+        )
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        up = next(line for line in calls if " up -d --no-build --wait --wait-timeout 300 " in line)
+        self.assertNotIn(" rikune-analyzer", up)
+        armed = next(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("writer_set_reconciled=false", armed)
+        self.assertIn(
+            f"writer_set_preimage_compose_sha256={sha256(self.backup / 'estate/tree/deploy/docker-compose.yml')}",
+            armed,
+        )
+
+    def test_restore_failed_reentry_supersedes_bad_writer_set_without_overwriting_evidence(
+        self,
+    ) -> None:
+        source = self.install_restore_failed_with_release_only_writer()
+        source_attempt = str(source["recovery_attempt_id"])
+        source_manifest = self.state / str(source["restore_running_writers_manifest"])
+        source_failure = self.state / str(source["apply_failure_receipt"])
+        source_state = self.state / f"APPLY-RECOVERY-FAILED-{source_attempt}.json"
+        source_arm = self.state / str(source["recovery_armed_receipt"])
+        frozen = {
+            path: path.read_bytes()
+            for path in (source_manifest, source_failure, source_state, source_arm)
+        }
+
+        preimage_services = "access-governance verdict newapi strad sluice sluice-internal"
+        result = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_PREIMAGE_COMPOSE_SERVICES=preimage_services,
+                HOLDFAST_TEST_RUNNING_SERVICES="verdict rikune-analyzer sluice sluice-internal",
+                HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES="rikune-analyzer",
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for path, content in frozen.items():
+            self.assertEqual(path.read_bytes(), content)
+
+        manifests = list(self.state.glob("RESTORE-RUNNING-WRITERS-*.txt"))
+        self.assertEqual(len(manifests), 2)
+        reconciled = next(path for path in manifests if path != source_manifest)
+        self.assertEqual(
+            reconciled.read_text(encoding="utf-8").splitlines(),
+            ["verdict", "sluice", "sluice-internal"],
+        )
+        receipt_path = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        receipt = dict(
+            line.split("=", 1)
+            for line in receipt_path.read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(receipt["writer_set_reconciled"], "true")
+        self.assertEqual(receipt["writer_set_source_attempt"], source_attempt)
+        self.assertEqual(
+            receipt["writer_set_source_failure_receipt_sha256"], sha256(source_failure)
+        )
+        self.assertEqual(receipt["writer_set_source_state_sha256"], sha256(source_state))
+        self.assertEqual(
+            receipt["writer_set_source_manifest_sha256"], sha256(source_manifest)
+        )
+        self.assertEqual(receipt["pre_restored_retry"], "false")
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum(line.startswith("runtime-restore ") for line in calls), 2)
+
+    def test_reconciled_writer_set_arm_is_reentrant_after_sigkill(self) -> None:
+        source = self.install_restore_failed_with_release_only_writer()
+        source_attempt = str(source["recovery_attempt_id"])
+        preimage_services = "access-governance verdict newapi strad sluice sluice-internal"
+        common = {
+            "HOLDFAST_TEST_PREIMAGE_COMPOSE_SERVICES": preimage_services,
+            "HOLDFAST_TEST_RUNNING_SERVICES": "verdict rikune-analyzer sluice sluice-internal",
+            "HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES": "rikune-analyzer",
+        }
+        killed = self.recover(
+            "restore",
+            env=self.environment(**common, HOLDFAST_TEST_SIGKILL_RECOVERY="1"),
+        )
+        self.assertNotEqual(killed.returncode, 0, killed.stdout + killed.stderr)
+        armed_current = json.loads(
+            (self.state / "CURRENT.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(armed_current["state"], "apply_recovery_armed")
+        self.assertTrue(armed_current["writer_set_reconciled"])
+        self.assertEqual(armed_current["writer_set_source_attempt"], source_attempt)
+        reconciled_attempt = armed_current["recovery_attempt_id"]
+        reconciled_manifest = self.state / str(
+            armed_current["restore_running_writers_manifest"]
+        )
+
+        resumed = self.recover("restore", env=self.environment(**common))
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(
+            reconciled_manifest.read_text(encoding="utf-8").splitlines(),
+            ["verdict", "sluice", "sluice-internal"],
+        )
+        completion = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        values = dict(
+            line.split("=", 1) for line in completion.read_text().splitlines()
+        )
+        self.assertEqual(values["attempt_id"], reconciled_attempt)
+        self.assertEqual(values["writer_set_source_attempt"], source_attempt)
+        self.assertEqual(len(list(self.state.glob("RESTORE-RUNNING-WRITERS-*.txt"))), 2)
+
+    def test_reconciled_writer_set_survives_another_failed_attempt(self) -> None:
+        source = self.install_restore_failed_with_release_only_writer()
+        source_attempt = str(source["recovery_attempt_id"])
+        common = {
+            "HOLDFAST_TEST_PREIMAGE_COMPOSE_SERVICES": "access-governance verdict newapi strad sluice sluice-internal",
+            "HOLDFAST_TEST_RUNNING_SERVICES": "verdict rikune-analyzer sluice sluice-internal",
+            "HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES": "rikune-analyzer",
+        }
+        failed = self.recover(
+            "restore",
+            env=self.environment(**common, HOLDFAST_TEST_UNHEALTHY_SERVICES="verdict"),
+        )
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        failed_current = json.loads(
+            (self.state / "CURRENT.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(failed_current["state"], "restore_failed")
+        self.assertTrue(failed_current["writer_set_reconciled"])
+        self.assertEqual(failed_current["writer_set_source_attempt"], source_attempt)
+
+        completed = self.recover("restore", env=self.environment(**common))
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        receipt_path = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        receipt = dict(
+            line.split("=", 1)
+            for line in receipt_path.read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(receipt["writer_set_reconciled"], "true")
+        self.assertEqual(receipt["writer_set_source_attempt"], source_attempt)
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum(line.startswith("runtime-restore ") for line in calls), 3)
+
+    def test_completed_reconciled_restore_revalidates_source_before_crash_finalization(
+        self,
+    ) -> None:
+        source = self.install_restore_failed_with_release_only_writer()
+        source_attempt = str(source["recovery_attempt_id"])
+        source_state = self.state / f"APPLY-RECOVERY-FAILED-{source_attempt}.json"
+        common = {
+            "HOLDFAST_TEST_PREIMAGE_COMPOSE_SERVICES": "access-governance verdict newapi strad sluice sluice-internal",
+            "HOLDFAST_TEST_RUNNING_SERVICES": "verdict rikune-analyzer sluice sluice-internal",
+            "HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES": "rikune-analyzer",
+        }
+        completed = self.recover("restore", env=self.environment(**common))
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        completion = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        values = dict(
+            line.split("=", 1) for line in completion.read_text().splitlines()
+        )
+        attempt = values["attempt_id"]
+        armed_archive = self.state / f"APPLY-RECOVERY-ARMED-STATE-{attempt}.json"
+        current_path = self.state / "CURRENT.json"
+        armed_archive.rename(current_path)
+        frozen_current = current_path.read_bytes()
+        source_state.write_bytes(source_state.read_bytes() + b"tampered\n")
+
+        rejected = self.recover("restore", env=self.environment(**common))
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn("writer reconciliation source state was replaced", rejected.stderr)
+        self.assertEqual(current_path.read_bytes(), frozen_current)
+        self.assertFalse(
+            (self.state / f"APPLY-RECOVERY-FINALIZED-STATE-{attempt}.json").exists()
+        )
+
+    def test_writer_reconciliation_source_tampering_fails_before_new_arm(self) -> None:
+        source = self.install_restore_failed_with_release_only_writer()
+        source_attempt = str(source["recovery_attempt_id"])
+        source_state = self.state / f"APPLY-RECOVERY-FAILED-{source_attempt}.json"
+        source_state.write_bytes(source_state.read_bytes() + b"tampered\n")
+        arms_before = list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt"))
+        runtime_calls_before = sum(
+            line.startswith("runtime-restore ")
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+        )
+
+        rejected = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_PREIMAGE_COMPOSE_SERVICES="access-governance verdict newapi strad sluice sluice-internal",
+                HOLDFAST_TEST_RUNNING_SERVICES="verdict rikune-analyzer sluice sluice-internal",
+                HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES="rikune-analyzer",
+            ),
+        )
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn("CURRENT differs from its immutable failure state", rejected.stderr)
+        self.assertEqual(list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")), arms_before)
+        runtime_calls_after = sum(
+            line.startswith("runtime-restore ")
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(runtime_calls_after, runtime_calls_before)
+
+    def test_preimage_compose_inventory_failure_precedes_recovery_arm(self) -> None:
+        rejected = self.recover(
+            "restore",
+            env=self.environment(HOLDFAST_TEST_PREIMAGE_COMPOSE_FAIL="1"),
+        )
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn("could not resolve estate preimage Compose services", rejected.stderr)
+        self.assertFalse(list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")))
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertFalse(any(line.startswith("runtime-restore ") for line in calls))
 
     def test_restore_reactivation_health_failure_keeps_restore_failed_state(self) -> None:
         result = self.recover(
