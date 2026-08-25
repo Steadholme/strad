@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -21,6 +22,22 @@ PERMISSIONS = sorted(
         "rikune.upload.cancel",
     }
 )
+SUPPLY_IMAGE_KEYS = (
+    "ACCESS_GOVERNANCE_IMAGE",
+    "ACCESS_GOVERNANCE_ROLLBACK_IMAGE",
+    "RIKUNE_ANALYZER_IMAGE",
+    "STRAD_ANALYZER_IMAGE",
+    "STRAD_IMAGE",
+    "STRAD_VOLUME_INIT_IMAGE",
+    "STRAD_RUST_BUILDER_IMAGE",
+    "STRAD_RUNTIME_IMAGE",
+    "STRAD_NODE_BUILDER_IMAGE",
+    "VERDICT_IMAGE",
+    "NEWAPI_IMAGE",
+    "SLUICE_IMAGE",
+)
+ACCEPTANCE_SUBJECT = "user:usr_" + "A" * 43
+OTHER_ACCEPTANCE_SUBJECT = "user:usr_" + "B" * 43
 
 
 def sha256(path: Path) -> str:
@@ -57,31 +74,20 @@ class SignedEvidenceTests(unittest.TestCase):
         )
         return signature
 
-    def test_supply_chain_requires_signature_registry_materials_and_access_build_input(self) -> None:
-        image_keys = (
-            "ACCESS_GOVERNANCE_IMAGE",
-            "ACCESS_GOVERNANCE_ROLLBACK_IMAGE",
-            "RIKUNE_ANALYZER_IMAGE",
-            "STRAD_ANALYZER_IMAGE",
-            "STRAD_IMAGE",
-            "STRAD_VOLUME_INIT_IMAGE",
-            "STRAD_RUST_BUILDER_IMAGE",
-            "STRAD_RUNTIME_IMAGE",
-            "STRAD_NODE_BUILDER_IMAGE",
-            "VERDICT_IMAGE",
-            "NEWAPI_IMAGE",
-            "SLUICE_IMAGE",
-        )
+    def make_supply_fixture(self) -> tuple[dict[str, str], dict[str, object]]:
         release: dict[str, str] = {
             key: f"registry.example/w33d/{key.lower()}@sha256:{index:064x}"
-            for index, key in enumerate(image_keys, 1)
+            for index, key in enumerate(SUPPLY_IMAGE_KEYS, 1)
         }
-        release["RIKUNE_ANALYZER_IMAGE"] = "ghcr.io/last-emo-boy/rikune-analyzer-static@sha256:" + "c" * 64
+        release["RIKUNE_ANALYZER_IMAGE"] = (
+            "ghcr.io/last-emo-boy/rikune-analyzer-static@sha256:" + "c" * 64
+        )
         release.update(
             {
                 "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256": "1" * 64,
                 "PERMISSION_CATALOG_SHA256": "2" * 64,
                 "PACKAGE_CATALOG_SHA256": "3" * 64,
+                "RIKUNE_ACCEPTANCE_SUBJECT": ACCEPTANCE_SUBJECT,
                 "STRAD_REVISION": "4" * 40,
                 "STRAD_NEWAPI_MODEL": "exact-alias",
                 "AUTHORITY_PUBLIC_KEY_SHA256": sha256(self.public_key),
@@ -96,7 +102,7 @@ class SignedEvidenceTests(unittest.TestCase):
             if key not in {"SUPPLY_CHAIN_EVIDENCE_SHA256", "SUPPLY_CHAIN_SIGNATURE_SHA256"}
         )
         registry_images = {}
-        for key in image_keys:
+        for key in SUPPLY_IMAGE_KEYS:
             image = release[key]
             subject = image.rsplit("@", 1)[1]
             registry_images[key] = {
@@ -105,16 +111,28 @@ class SignedEvidenceTests(unittest.TestCase):
                 "registry": image.split("/", 1)[0],
                 "subject_digest": subject,
                 "sbom": {"uri": "oci://evidence/sbom", "sha256": "5" * 64},
-                "provenance": {"uri": "oci://evidence/provenance", "sha256": "6" * 64, "builder_id": "builder:trusted"},
+                "provenance": {
+                    "uri": "oci://evidence/provenance",
+                    "sha256": "6" * 64,
+                    "builder_id": "builder:trusted",
+                },
                 "attestation": {"uri": "oci://evidence/attestation", "sha256": "7" * 64},
-                "signature": {"identity": "release@example.invalid", "issuer": "https://issuer.example", "rekor_log_index": 1},
+                "signature": {
+                    "identity": "release@example.invalid",
+                    "issuer": "https://issuer.example",
+                    "rekor_log_index": 1,
+                },
             }
-        evidence_value = {
+        evidence_value: dict[str, object] = {
             "schema_version": 1,
             "issued_at": "2026-08-22T00:00:00Z",
             "platform": "linux/amd64",
             "release_pins_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
-            "registry_verification": {"verified_at": "2026-08-22T00:00:00Z", "verifier": "cosign-policy-v1", "images": registry_images},
+            "registry_verification": {
+                "verified_at": "2026-08-22T00:00:00Z",
+                "verifier": "cosign-policy-v1",
+                "images": registry_images,
+            },
             "analyzer_overlay": {
                 "base_image": release["RIKUNE_ANALYZER_IMAGE"],
                 "overlay_image": release["STRAD_ANALYZER_IMAGE"],
@@ -131,13 +149,22 @@ class SignedEvidenceTests(unittest.TestCase):
                 "source_revision": release["STRAD_REVISION"],
             },
         }
-        evidence = self.root / "supply.json"
+        return release, evidence_value
+
+    def run_supply_fixture(
+        self, release: dict[str, str], evidence_value: dict[str, object], label: str
+    ) -> subprocess.CompletedProcess[str]:
+        evidence = self.root / f"supply-{label}.json"
         evidence.write_text(json.dumps(evidence_value, sort_keys=True), encoding="utf-8")
         signature = self.sign(evidence)
-        release["SUPPLY_CHAIN_EVIDENCE_SHA256"] = sha256(evidence)
-        release["SUPPLY_CHAIN_SIGNATURE_SHA256"] = sha256(signature)
-        release_env = self.root / "release.env"
-        release_env.write_text("".join(f"{key}={value}\n" for key, value in release.items()), encoding="utf-8")
+        bound_release = dict(release)
+        bound_release["SUPPLY_CHAIN_EVIDENCE_SHA256"] = sha256(evidence)
+        bound_release["SUPPLY_CHAIN_SIGNATURE_SHA256"] = sha256(signature)
+        release_env = self.root / f"release-{label}.env"
+        release_env.write_text(
+            "".join(f"{key}={value}\n" for key, value in bound_release.items()),
+            encoding="utf-8",
+        )
         command = [
             "python3",
             str(OPS_ROOT / "supply_chain_evidence.py"),
@@ -154,12 +181,202 @@ class SignedEvidenceTests(unittest.TestCase):
             "--bridge-lock",
             str(OPS_ROOT.parents[1] / "bridge/package-lock.json"),
         ]
-        valid = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def make_supply_waiver(
+        self,
+        release: dict[str, str],
+        image_key: str,
+        missing_field: str,
+        reason_code: str,
+        *,
+        issued_at: datetime | None = None,
+        expires_at: datetime | None = None,
+    ) -> dict[str, object]:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        issued_at = issued_at or now - timedelta(minutes=1)
+        expires_at = expires_at or now + timedelta(days=7)
+        return {
+            "image_key": image_key,
+            "image": release[image_key],
+            "missing_field": missing_field,
+            "reason_code": reason_code,
+            "ticket_uri": f"https://tickets.example.invalid/{image_key}",
+            "ticket_sha256": "8" * 64,
+            "approver_identity": "user:release-authority",
+            "issued_at": issued_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expires_at": expires_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "compensating_attestation": {
+                "uri": f"oci://evidence/{image_key}/verification-attestation",
+                "sha256": "9" * 64,
+                "identity": "release@example.invalid",
+                "issuer": "https://issuer.example",
+                "rekor_log_index": 2,
+            },
+        }
+
+    def make_supply_v2_fixture(self) -> tuple[dict[str, str], dict[str, object]]:
+        release, evidence = self.make_supply_fixture()
+        registry = evidence["registry_verification"]
+        assert isinstance(registry, dict)
+        images = registry["images"]
+        assert isinstance(images, dict)
+        waiver_policy = (
+            (
+                "STRAD_RUNTIME_IMAGE",
+                "provenance",
+                "upstream-provenance-unavailable",
+            ),
+            (
+                "ACCESS_GOVERNANCE_ROLLBACK_IMAGE",
+                "provenance.builder_id",
+                "legacy-builder-id-unavailable",
+            ),
+            (
+                "VERDICT_IMAGE",
+                "provenance.builder_id",
+                "legacy-builder-id-unavailable",
+            ),
+            (
+                "NEWAPI_IMAGE",
+                "provenance.builder_id",
+                "legacy-builder-id-unavailable",
+            ),
+            (
+                "SLUICE_IMAGE",
+                "provenance.builder_id",
+                "legacy-builder-id-unavailable",
+            ),
+        )
+        waivers = []
+        for image_key, missing_field, reason_code in waiver_policy:
+            waivers.append(
+                self.make_supply_waiver(
+                    release, image_key, missing_field, reason_code
+                )
+            )
+            image = images[image_key]
+            assert isinstance(image, dict)
+            if missing_field == "provenance":
+                image["provenance"] = None
+            else:
+                provenance = image["provenance"]
+                assert isinstance(provenance, dict)
+                provenance["builder_id"] = None
+        evidence["schema_version"] = 2
+        evidence["waivers"] = waivers
+        return release, evidence
+
+    def test_supply_chain_requires_signature_registry_materials_and_access_build_input(self) -> None:
+        release, evidence_value = self.make_supply_fixture()
+        valid = self.run_supply_fixture(release, evidence_value, "v1-valid")
         self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
-        evidence_value["access_candidate"]["build_input_sha256"] = "f" * 64
-        evidence.write_text(json.dumps(evidence_value, sort_keys=True), encoding="utf-8")
-        invalid = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        v1_with_waivers = json.loads(json.dumps(evidence_value))
+        v1_with_waivers["waivers"] = []
+        invalid = self.run_supply_fixture(
+            release, v1_with_waivers, "v1-extra-waivers"
+        )
         self.assertNotEqual(invalid.returncode, 0)
+
+        evidence_value = json.loads(json.dumps(evidence_value))
+        evidence_value["access_candidate"]["build_input_sha256"] = "f" * 64
+        invalid = self.run_supply_fixture(
+            release, evidence_value, "v1-access-binding-tamper"
+        )
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("Access candidate build input differs", invalid.stderr)
+
+    def test_supply_chain_v2_accepts_only_exact_short_lived_waivers(self) -> None:
+        release, evidence = self.make_supply_v2_fixture()
+        valid = self.run_supply_fixture(release, evidence, "v2-valid")
+        self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        cases: list[tuple[str, dict[str, object]]] = []
+
+        expired = json.loads(json.dumps(evidence))
+        expired["waivers"][0]["issued_at"] = (now - timedelta(days=2)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        expired["waivers"][0]["expires_at"] = (now - timedelta(days=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        cases.append(("expired", expired))
+
+        too_long = json.loads(json.dumps(evidence))
+        too_long["waivers"][0]["issued_at"] = (now - timedelta(minutes=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        too_long["waivers"][0]["expires_at"] = (now + timedelta(days=31)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        cases.append(("too-long", too_long))
+
+        wrong_ref = json.loads(json.dumps(evidence))
+        wrong_ref["waivers"][0]["image"] = (
+            "registry.example/w33d/wrong@sha256:" + "a" * 64
+        )
+        cases.append(("wrong-ref", wrong_ref))
+
+        duplicate = json.loads(json.dumps(evidence))
+        duplicate["waivers"].append(json.loads(json.dumps(duplicate["waivers"][0])))
+        cases.append(("duplicate", duplicate))
+
+        wrong_reason = json.loads(json.dumps(evidence))
+        wrong_reason["waivers"][0]["reason_code"] = "operator-convenience"
+        cases.append(("wrong-reason", wrong_reason))
+
+        wrong_field = json.loads(json.dumps(evidence))
+        wrong_field["waivers"][0]["missing_field"] = "sbom"
+        cases.append(("wrong-field", wrong_field))
+
+        overbroad = json.loads(json.dumps(evidence))
+        overbroad["waivers"][0]["missing_fields"] = ["provenance", "sbom"]
+        cases.append(("overbroad", overbroad))
+
+        unconsumed = json.loads(json.dumps(evidence))
+        unconsumed_registry = unconsumed["registry_verification"]
+        unconsumed_registry["images"]["VERDICT_IMAGE"]["provenance"][
+            "builder_id"
+        ] = "builder:unexpected"
+        cases.append(("unconsumed", unconsumed))
+
+        for label, candidate in cases:
+            with self.subTest(label=label):
+                invalid = self.run_supply_fixture(release, candidate, f"v2-{label}")
+                self.assertNotEqual(
+                    invalid.returncode, 0, invalid.stdout + invalid.stderr
+                )
+
+        for forbidden_key in (
+            "ACCESS_GOVERNANCE_IMAGE",
+            "STRAD_IMAGE",
+            "STRAD_ANALYZER_IMAGE",
+            "RIKUNE_ANALYZER_IMAGE",
+        ):
+            with self.subTest(forbidden_key=forbidden_key):
+                forbidden = json.loads(json.dumps(evidence))
+                forbidden["waivers"].append(
+                    self.make_supply_waiver(
+                        release,
+                        forbidden_key,
+                        "provenance",
+                        "upstream-provenance-unavailable",
+                    )
+                )
+                invalid = self.run_supply_fixture(
+                    release, forbidden, f"v2-forbidden-{forbidden_key.lower()}"
+                )
+                self.assertNotEqual(
+                    invalid.returncode, 0, invalid.stdout + invalid.stderr
+                )
 
     def test_authority_rollback_proves_route_close_then_same_grant_then_tombstones(self) -> None:
         release_env = self.root / "authority.release.env"
@@ -169,6 +386,7 @@ class SignedEvidenceTests(unittest.TestCase):
             "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256": "2" * 64,
             "PERMISSION_CATALOG_SHA256": "3" * 64,
             "PACKAGE_CATALOG_SHA256": "4" * 64,
+            "RIKUNE_ACCEPTANCE_SUBJECT": ACCEPTANCE_SUBJECT,
         }
         release_env.write_text("".join(f"{key}={value}\n" for key, value in release.items()), encoding="utf-8")
         release_evidence = self.root / "release-evidence.json"
@@ -191,7 +409,7 @@ class SignedEvidenceTests(unittest.TestCase):
             "bootstrap_version": 6,
             "package_id": "pkg_rikune_analyst",
             "requestable_version": 2,
-            "beneficiary": "user:rikune-acceptance",
+            "beneficiary": ACCEPTANCE_SUBJECT,
             "promotion_ceremony_id": "promotion-ceremony-0001",
             "package_request_id": "package-request-0001",
             "source_grant_id": "source-grant-0001",
@@ -211,6 +429,62 @@ class SignedEvidenceTests(unittest.TestCase):
         ]
         opened = subprocess.run(open_command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
+        invalid_pin_cases: tuple[tuple[str, str | None], ...] = (
+            ("missing", None),
+            ("placeholder", "user:usr_<43-char-base64url-sub>"),
+            ("malformed", "user:usr_too-short"),
+            ("privileged-u-admin", "user:u_admin"),
+            ("privileged-w33d", "user:w33d"),
+        )
+        for label, invalid_subject in invalid_pin_cases:
+            invalid_release = dict(release)
+            if invalid_subject is None:
+                invalid_release.pop("RIKUNE_ACCEPTANCE_SUBJECT")
+            else:
+                invalid_release["RIKUNE_ACCEPTANCE_SUBJECT"] = invalid_subject
+            invalid_pin_env = self.root / f"authority-{label}.release.env"
+            invalid_pin_env.write_text(
+                "".join(f"{key}={value}\n" for key, value in invalid_release.items()),
+                encoding="utf-8",
+            )
+            invalid_pin_command = list(open_command)
+            invalid_pin_command[
+                invalid_pin_command.index("--release-env") + 1
+            ] = str(invalid_pin_env)
+            invalid_pin = subprocess.run(
+                invalid_pin_command,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            with self.subTest(label=label):
+                self.assertNotEqual(invalid_pin.returncode, 0)
+                self.assertIn("RIKUNE_ACCEPTANCE_SUBJECT", invalid_pin.stderr)
+
+        mismatched_open_value = dict(open_value)
+        mismatched_open_value["beneficiary"] = OTHER_ACCEPTANCE_SUBJECT
+        mismatched_open = self.root / "open-beneficiary-mismatch.json"
+        mismatched_open.write_text(
+            json.dumps(mismatched_open_value, sort_keys=True), encoding="utf-8"
+        )
+        mismatched_open_signature = self.sign(mismatched_open)
+        mismatch_command = list(open_command)
+        mismatch_command[mismatch_command.index("--evidence") + 1] = str(
+            mismatched_open
+        )
+        mismatch_command[mismatch_command.index("--signature") + 1] = str(
+            mismatched_open_signature
+        )
+        mismatch = subprocess.run(
+            mismatch_command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("release-pinned acceptance subject", mismatch.stderr)
         route_receipt = self.root / "ROUTE-CLOSE.receipt"
         route_receipt.write_text(
             f"route_closed_at=2026-08-22T01:00:00Z\nopen_evidence_sha256={sha256(open_evidence)}\nsource_grant_id=source-grant-0001\n",
@@ -224,7 +498,7 @@ class SignedEvidenceTests(unittest.TestCase):
             "release_evidence_sha256": sha256(release_evidence),
             "signature_key_sha256": sha256(self.public_key),
             "package_id": "pkg_rikune_analyst",
-            "beneficiary": "user:rikune-acceptance",
+            "beneficiary": ACCEPTANCE_SUBJECT,
             "source_grant_id": "source-grant-0001",
             "open_evidence_sha256": sha256(open_evidence),
             "route_close_receipt_sha256": sha256(route_receipt),
@@ -248,6 +522,29 @@ class SignedEvidenceTests(unittest.TestCase):
         ]
         valid = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+        mismatched_rollback_value = dict(rollback_value)
+        mismatched_rollback_value["beneficiary"] = OTHER_ACCEPTANCE_SUBJECT
+        mismatched_rollback = self.root / "rollback-beneficiary-mismatch.json"
+        mismatched_rollback.write_text(
+            json.dumps(mismatched_rollback_value, sort_keys=True), encoding="utf-8"
+        )
+        mismatched_rollback_signature = self.sign(mismatched_rollback)
+        mismatch_command = list(command)
+        mismatch_command[mismatch_command.index("--evidence") + 1] = str(
+            mismatched_rollback
+        )
+        mismatch_command[mismatch_command.index("--signature") + 1] = str(
+            mismatched_rollback_signature
+        )
+        mismatch = subprocess.run(
+            mismatch_command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("release-pinned acceptance subject", mismatch.stderr)
         rollback_value["projection_tombstones"][0]["acknowledged_at"] = "2026-08-22T01:05:00Z"
         rollback_evidence.write_text(json.dumps(rollback_value, sort_keys=True), encoding="utf-8")
         rollback_signature = self.sign(rollback_evidence)

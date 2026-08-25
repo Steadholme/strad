@@ -17,6 +17,8 @@ Rikune base/Strad overlay images fail closed.
 The release env also pins:
 
 - the exact Access build-input, permission catalog, and package catalog hashes;
+- the independent acceptance account's exact canonical `user:usr_*` subject in
+  `RIKUNE_ACCEPTANCE_SUBJECT`;
 - the 40-character Strad source revision and real NewAPI alias;
 - the authority and supply-chain public-key hashes;
 - detached supply-chain evidence/signature hashes.
@@ -27,6 +29,14 @@ base-to-overlay relationship, the frozen static lock, Dockerfile and bridge lock
 Access candidate build inputs. `supply_chain_evidence.py` cross-checks those claims against the
 local Dockerfile/lock, release env, and rendered `RELEASE-EVIDENCE.json`; operator-authored claims
 without a valid pinned signature are rejected.
+
+Schema v2 permits only five narrowly scoped, short-lived provenance waivers when historical build
+metadata cannot be recreated honestly: full provenance for the pinned Distroless runtime, and only
+an absent `builder_id` for the pinned Access rollback, Verdict, NewAPI, and Sluice images. Every
+waiver is bound to the exact image ref, a fixed reason code, an HTTPS ticket and digest, an approver,
+a maximum 30-day UTC interval, and a signed compensating attestation with Rekor identity. SBOM,
+signature, subject/digest, platform, and transparency-log evidence are never waivable. The Access
+candidate and both final Strad images are never waivable. Schema v1 remains accepted unchanged.
 
 Keep `STRAD_DATABASE_URL`, bridge/file-server/NewAPI tokens, and all existing gateway/Verdict
 secrets in a separate mode-`0600` secret env. Evidence files contain only identities and hashes.
@@ -89,10 +99,14 @@ state receipts.
 
 ## Authority and route-only opening
 
-Provision the finite 30-day `pkg_rikune_analyst` request for exactly
-`user:rikune-acceptance`, through normal step-up and 2-of-2 approval. Record the exact source grant
-and all seven positive epochs/ack timestamps using `authority-open.example.json`, then
-detached-sign the JSON with the release-pinned authority key.
+The acceptance user must first self-register at `https://sso.w33d.xyz/register`, verify the email,
+sign in to `https://sso.w33d.xyz/account`, enroll a passkey or TOTP factor, and copy the exact
+Account `Subject`. Replace the `RIKUNE_ACCEPTANCE_SUBJECT` placeholder in the protected release env
+with that canonical `user:usr_*` value before generating and signing release evidence. Provision
+the finite 30-day `pkg_rikune_analyst` request for exactly that release-pinned subject, through the
+acceptance user's own step-up and normal 2-of-2 approval. Record the same pinned beneficiary, exact
+source grant, and all seven positive epochs/ack timestamps using `authority-open.example.json`,
+then detached-sign the JSON with the release-pinned authority key.
 
 `analyze.w33d.xyz` already reaches the existing W33D Sluice ingress through the managed wildcard
 Cloudflare/DNS estate. With no `rikune-root` row, both public IPv4 and IPv6 must return exact

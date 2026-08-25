@@ -14,7 +14,7 @@
   "bootstrap_version": 6,
   "package_id": "pkg_rikune_analyst",
   "requestable_version": 2,
-  "beneficiary": "user:rikune-acceptance",
+  "beneficiary": "REQUIRED_RIKUNE_ACCEPTANCE_SUBJECT_FROM_RELEASE_ENV",
   "promotion_ceremony_id": "REQUIRED",
   "package_request_id": "REQUIRED",
   "source_grant_id": "REQUIRED",

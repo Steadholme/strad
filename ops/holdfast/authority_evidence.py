@@ -26,6 +26,8 @@ PERMISSIONS = {
 }
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+RIKUNE_ACCEPTANCE_SUBJECT = re.compile(r"^user:usr_[A-Za-z0-9_-]{43}$")
+PRIVILEGED_ACCEPTANCE_SUBJECTS = frozenset({"user:u_admin", "user:w33d"})
 
 
 def fail(message: str) -> NoReturn:
@@ -88,6 +90,21 @@ def receipt(path: Path) -> dict[str, str]:
 def require_id(value: object, field: str) -> str:
     if not isinstance(value, str) or not SAFE_ID.fullmatch(value) or value.startswith("REQUIRED"):
         fail(f"{field} is not immutable ceremony evidence")
+    return value
+
+
+def pinned_acceptance_subject(release: dict[str, str]) -> str:
+    value = release.get("RIKUNE_ACCEPTANCE_SUBJECT")
+    if (
+        not isinstance(value, str)
+        or value.startswith("REQUIRED")
+        or value in PRIVILEGED_ACCEPTANCE_SUBJECTS
+        or not RIKUNE_ACCEPTANCE_SUBJECT.fullmatch(value)
+    ):
+        fail(
+            "RIKUNE_ACCEPTANCE_SUBJECT must be a non-placeholder, non-privileged "
+            "user:usr_ subject with exactly 43 base64url characters"
+        )
     return value
 
 
@@ -155,8 +172,8 @@ def verify_signature(evidence: Path, signature: Path, public_key: Path, release:
 def validate_common(value: dict[str, Any], release: dict[str, str], args: argparse.Namespace) -> None:
     if value.get("schema_version") != 2:
         fail("schema_version must equal 2")
-    if value.get("beneficiary") != "user:rikune-acceptance":
-        fail("beneficiary must be the independent acceptance subject")
+    if value.get("beneficiary") != pinned_acceptance_subject(release):
+        fail("beneficiary differs from the release-pinned acceptance subject")
     if value.get("package_id") != "pkg_rikune_analyst":
         fail("package_id differs from the frozen package")
     require_id(value.get("source_grant_id"), "source_grant_id")

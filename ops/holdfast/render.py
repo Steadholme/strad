@@ -28,6 +28,8 @@ GENERATOR_VERSION = "holdfast-rikune-estate/1.0.0"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST = re.compile(r"^[^\s:@]+(?:/[^\s:@]+)+@sha256:[0-9a-f]{64}$")
+RIKUNE_ACCEPTANCE_SUBJECT = re.compile(r"^user:usr_[A-Za-z0-9_-]{43}$")
+PRIVILEGED_ACCEPTANCE_SUBJECTS = frozenset({"user:u_admin", "user:w33d"})
 
 MUTATED_PATHS = (
     "access-governance/catalog/rikune-authz-v1.json",
@@ -61,6 +63,7 @@ RELEASE_KEYS = (
     "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256",
     "PERMISSION_CATALOG_SHA256",
     "PACKAGE_CATALOG_SHA256",
+    "RIKUNE_ACCEPTANCE_SUBJECT",
     "RIKUNE_ANALYZER_IMAGE",
     "STRAD_ANALYZER_IMAGE",
     "STRAD_IMAGE",
@@ -241,6 +244,16 @@ def validate_release(values: dict[str, str], catalog_only: bool) -> None:
     ):
         if not HEX64.fullmatch(values[key]):
             fail(f"{key} must be 64 lowercase hex characters")
+    acceptance_subject = values["RIKUNE_ACCEPTANCE_SUBJECT"]
+    if (
+        acceptance_subject.startswith("REQUIRED")
+        or acceptance_subject in PRIVILEGED_ACCEPTANCE_SUBJECTS
+        or not RIKUNE_ACCEPTANCE_SUBJECT.fullmatch(acceptance_subject)
+    ):
+        fail(
+            "RIKUNE_ACCEPTANCE_SUBJECT must be a non-placeholder, non-privileged "
+            "user:usr_ subject with exactly 43 base64url characters"
+        )
     if not HEX40.fullmatch(values["STRAD_REVISION"]):
         fail("STRAD_REVISION must be a 40-character lowercase commit id")
     model = values["STRAD_NEWAPI_MODEL"]

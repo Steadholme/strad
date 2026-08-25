@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -32,6 +33,18 @@ IMAGE_KEYS = (
     "SLUICE_IMAGE",
 )
 STATIC_LOCK_SHA256 = "32e3ea5103ff73c413062b17ad3bb4e7270fbcd6fd1325f6a7f3dc831bee83ef"
+MAX_WAIVER_LIFETIME = timedelta(days=30)
+MAX_WAIVER_CLOCK_SKEW = timedelta(minutes=5)
+WAIVER_POLICY = {
+    ("STRAD_RUNTIME_IMAGE", "provenance"): "upstream-provenance-unavailable",
+    (
+        "ACCESS_GOVERNANCE_ROLLBACK_IMAGE",
+        "provenance.builder_id",
+    ): "legacy-builder-id-unavailable",
+    ("VERDICT_IMAGE", "provenance.builder_id"): "legacy-builder-id-unavailable",
+    ("NEWAPI_IMAGE", "provenance.builder_id"): "legacy-builder-id-unavailable",
+    ("SLUICE_IMAGE", "provenance.builder_id"): "legacy-builder-id-unavailable",
+}
 
 
 def fail(message: str) -> NoReturn:
@@ -99,7 +112,117 @@ def require_hex(value: object, label: str) -> str:
     return value
 
 
+def require_uri(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.startswith(("https://", "oci://")):
+        fail(f"{label} URI is invalid")
+    return value
+
+
+def require_utc_timestamp(value: object, label: str) -> datetime:
+    if not isinstance(value, str):
+        fail(f"{label} must be an RFC3339 UTC timestamp")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        fail(f"{label} must be an RFC3339 UTC timestamp")
+    return parsed
+
+
+def validate_waivers(
+    value: object, release: dict[str, str], now: datetime
+) -> dict[tuple[str, str], dict[str, Any]]:
+    if not isinstance(value, list):
+        fail("waivers must be an array")
+    waiver_fields = {
+        "image_key",
+        "image",
+        "missing_field",
+        "reason_code",
+        "ticket_uri",
+        "ticket_sha256",
+        "approver_identity",
+        "issued_at",
+        "expires_at",
+        "compensating_attestation",
+    }
+    compensating_fields = {
+        "uri",
+        "sha256",
+        "identity",
+        "issuer",
+        "rekor_log_index",
+    }
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for index, raw in enumerate(value):
+        waiver = exact_keys(raw, waiver_fields, f"waiver {index}")
+        image_key = waiver["image_key"]
+        missing_field = waiver["missing_field"]
+        if not isinstance(image_key, str) or not isinstance(missing_field, str):
+            fail(f"waiver {index} policy key is invalid")
+        policy_key = (image_key, missing_field)
+        expected_reason = WAIVER_POLICY.get(policy_key)
+        if expected_reason is None:
+            fail(f"waiver is not permitted for {image_key}.{missing_field}")
+        if policy_key in result:
+            fail(f"duplicate waiver for {image_key}.{missing_field}")
+        expected_image = release.get(image_key)
+        if waiver["image"] != expected_image or not isinstance(
+            expected_image, str
+        ) or not IMAGE.fullmatch(expected_image):
+            fail(f"waiver image binding differs for {image_key}")
+        if waiver["reason_code"] != expected_reason:
+            fail(f"waiver reason differs for {image_key}.{missing_field}")
+        ticket_uri = waiver["ticket_uri"]
+        if not isinstance(ticket_uri, str) or not ticket_uri.startswith("https://"):
+            fail(f"waiver ticket URI is invalid for {image_key}.{missing_field}")
+        require_hex(waiver["ticket_sha256"], f"waiver ticket for {image_key}")
+        approver = waiver["approver_identity"]
+        if not isinstance(approver, str) or len(approver) < 8:
+            fail(f"waiver approver identity is absent for {image_key}")
+        issued_at = require_utc_timestamp(
+            waiver["issued_at"], f"waiver issued_at for {image_key}"
+        )
+        expires_at = require_utc_timestamp(
+            waiver["expires_at"], f"waiver expires_at for {image_key}"
+        )
+        if expires_at <= issued_at:
+            fail(f"waiver expiry is not after issuance for {image_key}")
+        if expires_at - issued_at > MAX_WAIVER_LIFETIME:
+            fail(f"waiver lifetime exceeds 30 days for {image_key}")
+        if issued_at > now + MAX_WAIVER_CLOCK_SKEW:
+            fail(f"waiver issuance is in the future for {image_key}")
+        if expires_at <= now:
+            fail(f"waiver is expired for {image_key}")
+        compensating = exact_keys(
+            waiver["compensating_attestation"],
+            compensating_fields,
+            f"waiver compensating attestation for {image_key}",
+        )
+        require_uri(
+            compensating["uri"], f"waiver compensating attestation for {image_key}"
+        )
+        require_hex(
+            compensating["sha256"],
+            f"waiver compensating attestation for {image_key}",
+        )
+        if not all(
+            isinstance(compensating[name], str) and compensating[name]
+            for name in ("identity", "issuer")
+        ):
+            fail(f"waiver compensating signature is incomplete for {image_key}")
+        if (
+            not isinstance(compensating["rekor_log_index"], int)
+            or compensating["rekor_log_index"] < 0
+        ):
+            fail(f"waiver compensating transparency-log binding is invalid for {image_key}")
+        result[policy_key] = waiver
+    return result
+
+
 def validate_document(value: dict[str, Any], release: dict[str, str], release_sha: str) -> None:
+    schema_version = value.get("schema_version")
     expected_root = {
         "schema_version",
         "issued_at",
@@ -109,13 +232,21 @@ def validate_document(value: dict[str, Any], release: dict[str, str], release_sh
         "analyzer_overlay",
         "access_candidate",
     }
+    if schema_version == 2:
+        expected_root.add("waivers")
     exact_keys(value, expected_root, "evidence")
-    if value["schema_version"] != 1 or value["platform"] != "linux/amd64":
+    if schema_version not in (1, 2) or value["platform"] != "linux/amd64":
         fail("unsupported supply-chain schema or platform")
     if value["release_pins_sha256"] != release_pins_sha256(release):
         fail("supply-chain evidence is not bound to the canonical release pins")
     if not isinstance(value["issued_at"], str) or not value["issued_at"].endswith("Z"):
         fail("issued_at must be an immutable UTC timestamp")
+    waivers = (
+        validate_waivers(value["waivers"], release, datetime.now(timezone.utc))
+        if schema_version == 2
+        else {}
+    )
+    consumed_waivers: set[tuple[str, str]] = set()
 
     registry = exact_keys(
         value["registry_verification"], {"verified_at", "verifier", "images"}, "registry"
@@ -152,21 +283,30 @@ def validate_document(value: dict[str, Any], release: dict[str, str], release_sh
             fail(f"registry identity differs for {key}")
         for material_name in ("sbom", "attestation"):
             material = exact_keys(item[material_name], material_fields, f"{key} {material_name}")
-            if not isinstance(material["uri"], str) or not material["uri"].startswith(
-                ("https://", "oci://")
-            ):
-                fail(f"{key} {material_name} URI is invalid")
+            require_uri(material["uri"], f"{key} {material_name}")
             require_hex(material["sha256"], f"{key} {material_name}")
-        provenance = exact_keys(
-            item["provenance"], {"uri", "sha256", "builder_id"}, f"{key} provenance"
-        )
-        if not isinstance(provenance["uri"], str) or not provenance["uri"].startswith(
-            ("https://", "oci://")
-        ):
-            fail(f"{key} provenance URI is invalid")
-        require_hex(provenance["sha256"], f"{key} provenance")
-        if not isinstance(provenance["builder_id"], str) or len(provenance["builder_id"]) < 8:
-            fail(f"{key} builder identity is absent")
+        provenance_waiver = (key, "provenance")
+        builder_waiver = (key, "provenance.builder_id")
+        if provenance_waiver in waivers:
+            if item["provenance"] is not None:
+                fail(f"{key} provenance waiver does not match an absent provenance")
+            consumed_waivers.add(provenance_waiver)
+        else:
+            provenance = exact_keys(
+                item["provenance"],
+                {"uri", "sha256", "builder_id"},
+                f"{key} provenance",
+            )
+            require_uri(provenance["uri"], f"{key} provenance")
+            require_hex(provenance["sha256"], f"{key} provenance")
+            if builder_waiver in waivers:
+                if provenance["builder_id"] not in (None, ""):
+                    fail(f"{key} builder waiver does not match an absent builder identity")
+                consumed_waivers.add(builder_waiver)
+            elif not isinstance(provenance["builder_id"], str) or len(
+                provenance["builder_id"]
+            ) < 8:
+                fail(f"{key} builder identity is absent")
         signature = exact_keys(
             item["signature"], {"identity", "issuer", "rekor_log_index"}, f"{key} signature"
         )
@@ -174,6 +314,9 @@ def validate_document(value: dict[str, Any], release: dict[str, str], release_sh
             fail(f"{key} signature identity is incomplete")
         if not isinstance(signature["rekor_log_index"], int) or signature["rekor_log_index"] < 0:
             fail(f"{key} transparency-log binding is invalid")
+
+    if set(waivers) != consumed_waivers:
+        fail("supply-chain evidence contains an unconsumed waiver")
 
     overlay = exact_keys(
         value["analyzer_overlay"],

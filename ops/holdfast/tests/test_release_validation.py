@@ -73,6 +73,32 @@ class AnalyzerImageBindingTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(SystemExit):
                 render.validate_release(invalid, False)
 
+    def test_release_rejects_missing_acceptance_subject(self) -> None:
+        invalid = copy.deepcopy(self.release)
+        invalid.pop("RIKUNE_ACCEPTANCE_SUBJECT")
+        with self.assertRaisesRegex(SystemExit, "RIKUNE_ACCEPTANCE_SUBJECT"):
+            render.validate_release(invalid, False)
+
+    def test_release_rejects_malformed_placeholder_or_privileged_acceptance_subject(
+        self,
+    ) -> None:
+        for subject in (
+            "user:usr_<43-char-base64url-sub>",
+            "REQUIRED_RIKUNE_ACCEPTANCE_SUBJECT",
+            "user:usr_too-short",
+            "user:usr_" + "A" * 42,
+            "user:usr_" + "A" * 44,
+            "user:usr_" + "A" * 42 + "+",
+            "user:u_admin",
+            "user:w33d",
+        ):
+            invalid = copy.deepcopy(self.release)
+            invalid["RIKUNE_ACCEPTANCE_SUBJECT"] = subject
+            with self.subTest(subject=subject), self.assertRaisesRegex(
+                SystemExit, "RIKUNE_ACCEPTANCE_SUBJECT"
+            ):
+                render.validate_release(invalid, False)
+
     def test_evidence_rejects_unbound_overlay_claim(self) -> None:
         evidence = self.evidence()
         evidence["analyzer_image_binding"]["overlay_image"] = (
