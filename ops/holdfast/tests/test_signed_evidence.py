@@ -406,7 +406,7 @@ class SignedEvidenceTests(unittest.TestCase):
             "build_input_sha256": release["ACCESS_GOVERNANCE_BUILD_INPUT_SHA256"],
             "permission_catalog_sha256": release["PERMISSION_CATALOG_SHA256"],
             "package_catalog_sha256": release["PACKAGE_CATALOG_SHA256"],
-            "bootstrap_version": 6,
+            "bootstrap_version": 7,
             "package_id": "pkg_rikune_analyst",
             "requestable_version": 2,
             "beneficiary": ACCEPTANCE_SUBJECT,
@@ -429,6 +429,34 @@ class SignedEvidenceTests(unittest.TestCase):
         ]
         opened = subprocess.run(open_command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
+        for bootstrap_version in (6, 8):
+            invalid_bootstrap_value = dict(open_value)
+            invalid_bootstrap_value["bootstrap_version"] = bootstrap_version
+            invalid_bootstrap = self.root / f"open-bootstrap-{bootstrap_version}.json"
+            invalid_bootstrap.write_text(
+                json.dumps(invalid_bootstrap_value, sort_keys=True), encoding="utf-8"
+            )
+            invalid_bootstrap_signature = self.sign(invalid_bootstrap)
+            invalid_bootstrap_command = list(open_command)
+            invalid_bootstrap_command[
+                invalid_bootstrap_command.index("--evidence") + 1
+            ] = str(invalid_bootstrap)
+            invalid_bootstrap_command[
+                invalid_bootstrap_command.index("--signature") + 1
+            ] = str(invalid_bootstrap_signature)
+            rejected_bootstrap = subprocess.run(
+                invalid_bootstrap_command,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            with self.subTest(bootstrap_version=bootstrap_version):
+                self.assertNotEqual(rejected_bootstrap.returncode, 0)
+                self.assertIn(
+                    "bootstrap/requestable version evidence is incomplete",
+                    rejected_bootstrap.stderr,
+                )
         invalid_pin_cases: tuple[tuple[str, str | None], ...] = (
             ("missing", None),
             ("placeholder", "user:usr_<43-char-base64url-sub>"),

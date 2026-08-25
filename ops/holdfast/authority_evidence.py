@@ -232,7 +232,7 @@ def validate_open(value: dict[str, Any], release: dict[str, str], args: argparse
     for field, expected_value in expected.items():
         if not expected_value or value.get(field) != expected_value:
             fail(f"{field} differs from the release pin")
-    if value.get("bootstrap_version") != 6 or value.get("requestable_version") != 2:
+    if value.get("bootstrap_version") != 7 or value.get("requestable_version") != 2:
         fail("bootstrap/requestable version evidence is incomplete")
     require_id(value.get("promotion_ceremony_id"), "promotion_ceremony_id")
     require_id(value.get("package_request_id"), "package_request_id")

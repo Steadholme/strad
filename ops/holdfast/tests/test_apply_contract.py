@@ -110,6 +110,53 @@ class ApplyContractTests(unittest.TestCase):
         )
         self.assertEqual(apply_absent, set(targets) & global_absent)
 
+    def test_full_env_renderer_sets_access_bootstrap_version_7(self) -> None:
+        stage = self.root / "full-env-stage"
+        deploy = stage / "deploy"
+        deploy.mkdir(parents=True)
+        (deploy / ".env").write_text(
+            "GATEWAY_HMAC_KEY=" + "g" * 32 + "\n"
+            "GATEWAY_ZONE_HMAC_KEY=" + "z" * 32 + "\n"
+            "VERDICT_DECISION_TOKEN=" + "v" * 32 + "\n",
+            encoding="utf-8",
+        )
+        example = deploy / "access-governance.env.example"
+        example.write_text(
+            "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=1\n", encoding="utf-8"
+        )
+        release = {
+            key: f"fixture-{key.lower()}"
+            for key in (
+                "ACCESS_GOVERNANCE_IMAGE",
+                "ACCESS_GOVERNANCE_ROLLBACK_IMAGE",
+                "RIKUNE_ANALYZER_IMAGE",
+                "STRAD_ANALYZER_IMAGE",
+                "STRAD_IMAGE",
+                "STRAD_VOLUME_INIT_IMAGE",
+                "VERDICT_IMAGE",
+                "NEWAPI_IMAGE",
+                "SLUICE_IMAGE",
+                "STRAD_NEWAPI_MODEL",
+            )
+        }
+        secrets = {
+            key: chr(ord("a") + index) * 32
+            for index, key in enumerate(render.SECRET_KEYS)
+        }
+
+        render.render_full_env(stage, release, secrets)
+
+        self.assertEqual(
+            render.parse_env(deploy / ".env")[
+                "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION"
+            ],
+            "7",
+        )
+        self.assertEqual(
+            example.read_text(encoding="utf-8"),
+            "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=7\n",
+        )
+
     def test_repository_package_shape_is_part_of_the_frozen_render_contract(self) -> None:
         relative = "access-governance/src/repository/postgres.rs"
         self.assertIn(relative, render.MUTATED_PATHS)

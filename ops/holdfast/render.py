@@ -1003,7 +1003,7 @@ def render_compose(stage_root: Path) -> None:
             ("GATEWAY_ZONE_HMAC_KEY: ${GATEWAY_ZONE_HMAC_KEY}", "GATEWAY_ZONE_HMAC_KEY: ${GATEWAY_ZONE_HMAC_KEY:?GATEWAY_ZONE_HMAC_KEY is required}"),
             (
                 "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION: ${ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-5}",
-                "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION: ${ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-6}",
+                "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION: ${ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-7}",
             ),
         ),
     )
@@ -1057,7 +1057,7 @@ def render_full_env(stage_root: Path, release: dict[str, str], secrets: dict[str
     if len(set(compared.values())) != len(compared):
         fail("Strad/gateway/Verdict secrets must be pairwise distinct")
     updates = {
-        "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION": "6",
+        "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION": "7",
         "ACCESS_GOVERNANCE_IMAGE": release["ACCESS_GOVERNANCE_IMAGE"],
         "ACCESS_GOVERNANCE_ROLLBACK_IMAGE": release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"],
         "RIKUNE_ANALYZER_IMAGE": release["RIKUNE_ANALYZER_IMAGE"],
@@ -1080,7 +1080,7 @@ def render_full_env(stage_root: Path, release: dict[str, str], secrets: dict[str
         replace_once(
             example_text,
             "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=1",
-            "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=6",
+            "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=7",
             "bootstrap example",
         ),
         encoding="utf-8",
