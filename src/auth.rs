@@ -62,7 +62,7 @@ impl AuthVerifier {
 
     pub fn verify_at(&self, headers: &HeaderMap, minute: i64) -> Result<Identity, AppError> {
         let raw_subject = exactly_one(headers, HEADER_SUBJECT)?;
-        let raw_groups = exactly_one(headers, HEADER_GROUPS)?;
+        let raw_groups = optional_exactly_one(headers, HEADER_GROUPS)?.unwrap_or_default();
         let raw_sig = exactly_one(headers, HEADER_SIG)?;
         if !is_lower_hex_64(raw_sig) {
             return Err(unauthenticated());
@@ -403,6 +403,17 @@ mod tests {
     }
 
     #[test]
+    fn accepts_sluice_identity_when_empty_groups_header_is_omitted() {
+        let config = Config::for_tests(std::env::temp_dir());
+        let verifier = AuthVerifier::new(&config);
+        let mut signed = headers(&verifier, "alice", "", 42);
+        signed.remove(HEADER_GROUPS);
+
+        let identity = verifier.verify_at(&signed, 42).unwrap();
+        assert_eq!(identity.subject, "user:alice");
+    }
+
+    #[test]
     fn rejects_double_prefix_duplicate_or_wrong_zone_signature() {
         let config = Config::for_tests(std::env::temp_dir());
         let verifier = AuthVerifier::new(&config);
@@ -412,6 +423,9 @@ mod tests {
         let mut duplicate = headers(&verifier, "alice", "", 42);
         duplicate.append(HEADER_SUBJECT, HeaderValue::from_static("bob"));
         assert!(verifier.verify_at(&duplicate, 42).is_err());
+        let mut duplicate_groups = headers(&verifier, "alice", "ops", 42);
+        duplicate_groups.append(HEADER_GROUPS, HeaderValue::from_static("analysts"));
+        assert!(verifier.verify_at(&duplicate_groups, 42).is_err());
         let mut wrong = headers(&verifier, "alice", "", 42);
         wrong.insert(
             HEADER_ZONE_SIG,
