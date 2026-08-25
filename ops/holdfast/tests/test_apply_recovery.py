@@ -553,10 +553,21 @@ class ApplyRecoveryTests(unittest.TestCase):
         self.docker = self.make_fake(
             "docker",
             'printf "docker %s\\n" "$*" >>"$HOLDFAST_TEST_LOG"\n'
+            'if [[ "${1:-}" == "volume" && "${2:-}" == "ls" ]]; then\n'
+            '  printf "%s" "${HOLDFAST_TEST_EXISTING_VOLUMES:-}"\n'
+            '  exit 0\n'
+            'fi\n'
+            'if [[ " $* " == *" compose "* && " $* " == *" exec -T postgres "* ]]; then\n'
+            '  query=$(cat)\n'
+            '  if [[ "$query" == *"FROM pg_database"* ]]; then printf "1\\n"; else printf "0\\n"; fi\n'
+            '  exit 0\n'
+            'fi\n'
             'if [[ " $* " == *" compose "* && " $* " == *" ps -aq "* ]]; then\n'
             '  service=${!#}\n'
             '  [[ "${HOLDFAST_TEST_DOCKER_PS_FAIL_SERVICE:-}" != "$service" ]] || exit 44\n'
-            '  all=" ${HOLDFAST_TEST_RUNNING_SERVICES:-} ${HOLDFAST_TEST_RESTARTING_SERVICES:-} ${HOLDFAST_TEST_CREATED_SERVICES:-} "\n'
+            '  after_up=""\n'
+            '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then after_up=${HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES:-}; fi\n'
+            '  all=" ${HOLDFAST_TEST_RUNNING_SERVICES:-} ${HOLDFAST_TEST_RESTARTING_SERVICES:-} ${HOLDFAST_TEST_CREATED_SERVICES:-} $after_up "\n'
             '  [[ "$all" == *" $service "* ]] && printf "cid-%s\\n" "$service"\n'
             '  exit 0\n'
             'fi\n'
@@ -567,25 +578,32 @@ class ApplyRecoveryTests(unittest.TestCase):
             'if [[ "${1:-}" == "ps" && " $* " == *" -aq "* ]]; then\n'
             '  service=${!#}; service=${service#label=com.docker.compose.service=}\n'
             '  [[ "${HOLDFAST_TEST_DOCKER_PS_FAIL_SERVICE:-}" != "$service" ]] || exit 44\n'
-            '  all=" ${HOLDFAST_TEST_RUNNING_SERVICES:-} ${HOLDFAST_TEST_RESTARTING_SERVICES:-} ${HOLDFAST_TEST_CREATED_SERVICES:-} "\n'
+            '  after_up=""\n'
+            '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then after_up=${HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES:-}; fi\n'
+            '  all=" ${HOLDFAST_TEST_RUNNING_SERVICES:-} ${HOLDFAST_TEST_RESTARTING_SERVICES:-} ${HOLDFAST_TEST_CREATED_SERVICES:-} $after_up "\n'
             '  [[ "$all" == *" $service "* ]] && printf "cid-%s\\n" "$service"\n'
             '  exit 0\n'
             'fi\n'
             'if [[ "${1:-}" == "inspect" ]]; then\n'
             '  service=${!#}; service=${service#cid-}\n'
+            '  [[ "${HOLDFAST_TEST_DOCKER_INSPECT_FAIL_SERVICE:-}" != "$service" ]] || exit 45\n'
             '  if [[ "$*" == *"State.Health"* ]]; then\n'
             '    if [[ " ${HOLDFAST_TEST_UNHEALTHY_SERVICES:-} " == *" $service "* ]]; then printf "unhealthy\\n"; else printf "healthy\\n"; fi\n'
             '    exit 0\n'
             '  fi\n'
             '  if [[ -e "$HOLDFAST_TEST_LOG.quiesced" && ! -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then printf "exited\\n"\n'
             '  elif [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_STOP_LEAK_SERVICES:-} " == *" $service "* ]]; then printf "running\\n"\n'
+            '  elif [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES:-} " == *" $service "* ]]; then printf "running\\n"\n'
             '  elif [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_RUNNING_SERVICES:-} " != *" $service "* ]]; then printf "exited\\n"\n'
             '  elif [[ " ${HOLDFAST_TEST_RUNNING_SERVICES:-} " == *" $service "* ]]; then printf "running\\n"\n'
             '  elif [[ " ${HOLDFAST_TEST_RESTARTING_SERVICES:-} " == *" $service "* ]]; then printf "restarting\\n"\n'
             '  elif [[ " ${HOLDFAST_TEST_CREATED_SERVICES:-} " == *" $service "* ]]; then printf "created\\n"\n'
             '  else printf "exited\\n"; fi\n'
             'fi\n'
-            'if [[ "${1:-}" == "stop" ]]; then touch "$HOLDFAST_TEST_LOG.quiesced"; fi\n'
+            'if [[ "${1:-}" == "stop" ]]; then\n'
+            '  touch "$HOLDFAST_TEST_LOG.quiesced"\n'
+            '  if [[ "${HOLDFAST_TEST_SIGKILL_ON_STOP:-0}" == "1" ]]; then kill -KILL "$PPID"; exit 137; fi\n'
+            'fi\n'
             'exit 0\n',
         )
         self.runtime_restore = self.make_fake(
@@ -910,6 +928,294 @@ class ApplyRecoveryTests(unittest.TestCase):
         self.assertEqual(len(list(self.state.glob("APPLY-RECOVERY-FAILED-*.receipt"))), 2)
         self.assertEqual(len(list(self.state.glob("APPLY-RECOVERY-FAILED-*.json"))), 2)
 
+    def test_writer_failure_retry_reuses_proven_runtime_and_estate_restore(self) -> None:
+        self.install_legacy_runtime()
+        running = "access-governance"
+        first = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES=running,
+            ),
+            legacy_empty_strad=True,
+        )
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        current = json.loads((self.state / "CURRENT.json").read_text(encoding="utf-8"))
+        self.assertEqual(current["state"], "restore_failed")
+        self.assertEqual(current["recovery_failure_stage"], "restore_prior_running_writers")
+        self.assertEqual(
+            (self.estate / "deploy/docker-compose.yml").read_bytes(), self.old_content
+        )
+        self.assertEqual(len(list(self.state.glob("RUNTIME-RESTORE-*.receipt"))), 1)
+        self.assertEqual(len(list(self.state.glob("ESTATE-RESTORE-*.json"))), 1)
+        (Path(str(self.log) + ".writers-stopped")).unlink()
+
+        second = self.recover(
+            "restore",
+            env=self.environment(HOLDFAST_TEST_RUNNING_SERVICES=running),
+            legacy_empty_strad=True,
+        )
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum(line.startswith("runtime-restore ") for line in calls), 1)
+        receipt = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt")).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("pre_restored_retry=true", receipt)
+        self.assertRegex(
+            receipt,
+            r"pre_restored_source_attempt=[0-9]{8}T[0-9]{6}Z-[0-9]+",
+        )
+        self.assertNotIn("runtime_restore_receipt_sha256=not-required", receipt)
+        self.assertNotIn("estate_restore_state_sha256=not-required", receipt)
+
+    def test_overwritten_current_reuses_historical_completed_restore_evidence(self) -> None:
+        self.install_legacy_runtime()
+        running = "access-governance"
+        first = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES=running,
+            ),
+            legacy_empty_strad=True,
+        )
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        current_path = self.state / "CURRENT.json"
+        first_current = json.loads(current_path.read_text(encoding="utf-8"))
+        first_attempt = first_current["recovery_attempt_id"]
+        self.assertEqual(first_current["recovery_failure_stage"], "restore_prior_running_writers")
+        runtime_snapshot = next(
+            self.state.glob(f"RUNTIME-RESTORE-{first_attempt}-*.receipt")
+        )
+        estate_snapshot = next(
+            self.state.glob(f"ESTATE-RESTORE-{first_attempt}-*.json")
+        )
+        Path(str(self.log) + ".writers-stopped").unlink()
+
+        second = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_EXISTING_VOLUMES="test_strad_uploads\n",
+                HOLDFAST_TEST_RESTORE_FAIL="1",
+            ),
+            legacy_empty_strad=True,
+        )
+        self.assertNotEqual(second.returncode, 0, second.stdout + second.stderr)
+        second_current = json.loads(current_path.read_text(encoding="utf-8"))
+        second_attempt = second_current["recovery_attempt_id"]
+        self.assertNotEqual(second_attempt, first_attempt)
+        self.assertEqual(
+            second_current["recovery_failure_stage"], "runtime_restore_after_writer_stop"
+        )
+        superseded_state = self.state / f"APPLY-RECOVERY-FAILED-{second_attempt}.json"
+        self.assertTrue(superseded_state.is_file())
+
+        third = self.recover(
+            "restore",
+            env=self.environment(HOLDFAST_TEST_RUNNING_SERVICES=running),
+            legacy_empty_strad=True,
+        )
+        self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum(line.startswith("runtime-restore ") for line in calls), 2)
+        receipt_path = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        receipt = dict(
+            line.split("=", 1)
+            for line in receipt_path.read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(receipt["pre_restored_retry"], "true")
+        self.assertEqual(receipt["pre_restored_source_attempt"], first_attempt)
+        self.assertEqual(
+            receipt["runtime_restore_receipt_sha256"], sha256(runtime_snapshot)
+        )
+        self.assertEqual(receipt["estate_restore_state_sha256"], sha256(estate_snapshot))
+        self.assertEqual(receipt["pre_restored_superseded_attempt"], second_attempt)
+        self.assertEqual(
+            receipt["pre_restored_superseded_failure_receipt_sha256"],
+            second_current["apply_failure_receipt_sha256"],
+        )
+        self.assertEqual(
+            receipt["pre_restored_superseded_state_sha256"], sha256(superseded_state)
+        )
+        self.assertFalse(current_path.exists())
+
+    def test_pre_restored_arm_sigkill_reentry_preserves_evidence_binding(self) -> None:
+        self.install_legacy_runtime()
+        running = "access-governance"
+        first = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES=running,
+            ),
+            legacy_empty_strad=True,
+        )
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        Path(str(self.log) + ".writers-stopped").unlink()
+
+        killed = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_SIGKILL_ON_STOP="1",
+            ),
+            legacy_empty_strad=True,
+        )
+        self.assertNotEqual(killed.returncode, 0, killed.stdout + killed.stderr)
+        current_path = self.state / "CURRENT.json"
+        armed = json.loads(current_path.read_text(encoding="utf-8"))
+        self.assertEqual(armed["state"], "apply_recovery_armed")
+        self.assertTrue(armed["pre_restored_retry"])
+        evidence_keys = (
+            "pre_restored_source_attempt",
+            "pre_restored_runtime_snapshot_sha256",
+            "pre_restored_estate_snapshot_sha256",
+            "pre_restored_superseded_attempt",
+            "pre_restored_superseded_failure_receipt_sha256",
+            "pre_restored_superseded_state_sha256",
+            "pre_restored_runtime_disposition",
+        )
+        evidence = {key: armed[key] for key in evidence_keys}
+        arm_path = self.state / armed["recovery_armed_receipt"]
+        arm_sha = sha256(arm_path)
+        arm_receipt = dict(
+            line.split("=", 1)
+            for line in arm_path.read_text(encoding="utf-8").splitlines()
+        )
+        for key, value in evidence.items():
+            self.assertEqual(arm_receipt[key], value)
+
+        resumed = self.recover(
+            "restore",
+            env=self.environment(HOLDFAST_TEST_RUNNING_SERVICES=running),
+            legacy_empty_strad=True,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum(line.startswith("runtime-restore ") for line in calls), 1)
+        receipt_path = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        receipt = dict(
+            line.split("=", 1)
+            for line in receipt_path.read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(receipt["pre_restored_retry"], "true")
+        self.assertEqual(receipt["recovery_armed_receipt_sha256"], arm_sha)
+        completion_evidence = {
+            key: value
+            for key, value in evidence.items()
+            if key
+            not in {
+                "pre_restored_runtime_snapshot_sha256",
+                "pre_restored_estate_snapshot_sha256",
+            }
+        }
+        completion_evidence.update(
+            runtime_restore_receipt_sha256=evidence[
+                "pre_restored_runtime_snapshot_sha256"
+            ],
+            estate_restore_state_sha256=evidence[
+                "pre_restored_estate_snapshot_sha256"
+            ],
+        )
+        for key, value in completion_evidence.items():
+            self.assertEqual(receipt[key], value)
+        self.assertFalse(current_path.exists())
+
+    def test_pre_restored_runtime_writer_inspect_failure_is_fail_closed(self) -> None:
+        self.install_legacy_runtime()
+        running = "access-governance"
+        first = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES=running,
+            ),
+            legacy_empty_strad=True,
+        )
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        current_path = self.state / "CURRENT.json"
+        original_current = current_path.read_bytes()
+        original_arms = list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt"))
+
+        rejected = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_CREATED_SERVICES="strad",
+                HOLDFAST_TEST_DOCKER_INSPECT_FAIL_SERVICE="strad",
+            ),
+            legacy_empty_strad=True,
+        )
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn(
+            "could not inspect runtime writer state before pre-restored retry: strad",
+            rejected.stderr,
+        )
+        self.assertEqual(current_path.read_bytes(), original_current)
+        self.assertEqual(
+            list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")), original_arms
+        )
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum(line.startswith("runtime-restore ") for line in calls), 1)
+
+    def test_live_preimage_without_completed_restore_evidence_cannot_skip_restore(self) -> None:
+        env = self.environment(HOLDFAST_TEST_RESTORE_FAIL="1")
+        first = self.recover("restore", env=env)
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        current = json.loads((self.state / "CURRENT.json").read_text(encoding="utf-8"))
+        self.assertEqual(current["recovery_failure_stage"], "runtime_restore_after_writer_stop")
+        (self.estate / "deploy/docker-compose.yml").write_bytes(self.old_content)
+
+        second = self.recover("restore", env=env)
+        self.assertNotEqual(second.returncode, 0, second.stdout + second.stderr)
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum(line.startswith("runtime-restore ") for line in calls), 2)
+        self.assertFalse(list(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt")))
+
+    def assert_reactivated_runtime_writer_forces_fresh_restore_on_retry(
+        self, writer: str
+    ) -> None:
+        self.install_legacy_runtime()
+        first = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=writer,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES=writer,
+            ),
+            legacy_empty_strad=True,
+        )
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        current = json.loads((self.state / "CURRENT.json").read_text(encoding="utf-8"))
+        self.assertEqual(current["recovery_failure_stage"], "restore_prior_running_writers")
+        manifest = self.state / current["restore_running_writers_manifest"]
+        self.assertEqual(manifest.read_text(encoding="utf-8").splitlines(), [writer])
+        (Path(str(self.log) + ".writers-stopped")).unlink()
+
+        second = self.recover(
+            "restore",
+            env=self.environment(HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES=writer),
+            legacy_empty_strad=True,
+        )
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum(line.startswith("runtime-restore ") for line in calls), 2)
+        receipt = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt")).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("pre_restored_retry=false", receipt)
+
+    def test_reactivated_strad_manifest_forces_fresh_restore_on_retry(self) -> None:
+        self.assert_reactivated_runtime_writer_forces_fresh_restore_on_retry("strad")
+
+    def test_reactivated_rikune_analyzer_manifest_forces_fresh_restore_on_retry(
+        self,
+    ) -> None:
+        self.assert_reactivated_runtime_writer_forces_fresh_restore_on_retry(
+            "rikune-analyzer"
+        )
+
     def test_restore_restarts_only_writers_that_were_running_before_mutation(self) -> None:
         running = "access-governance verdict newapi sluice sluice-internal"
         result = self.recover(
@@ -1038,6 +1344,44 @@ class ApplyRecoveryTests(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
         self.assertFalse((self.state / "CURRENT.json").exists())
         self.assertEqual(len(list(self.state.glob("APPLY-RECOVERY-COMPLETE-*.json"))), 1)
+
+    def test_legacy_armed_reentry_without_pre_restored_fields_remains_supported(self) -> None:
+        running = "access-governance"
+        killed = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_SIGKILL_RECOVERY="1",
+            ),
+        )
+        self.assertNotEqual(killed.returncode, 0)
+        current_path = self.state / "CURRENT.json"
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        self.assertEqual(current["state"], "apply_recovery_armed")
+        arm = self.state / current["recovery_armed_receipt"]
+        arm.write_text(
+            "".join(
+                line
+                for line in arm.read_text(encoding="utf-8").splitlines(keepends=True)
+                if not line.startswith("pre_restored_")
+            ),
+            encoding="utf-8",
+        )
+        current["recovery_armed_receipt_sha256"] = sha256(arm)
+        for key in (
+            "pre_restored_retry",
+            "pre_restored_source_attempt",
+            "pre_restored_runtime_snapshot_sha256",
+            "pre_restored_estate_snapshot_sha256",
+        ):
+            current.pop(key, None)
+        current_path.write_text(json.dumps(current) + "\n", encoding="utf-8")
+
+        resumed = self.recover(
+            "restore", env=self.environment(HOLDFAST_TEST_RUNNING_SERVICES=running)
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertFalse(current_path.exists())
 
     def test_completed_restore_finalization_is_idempotent(self) -> None:
         first = self.recover("restore")

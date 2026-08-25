@@ -954,6 +954,281 @@ for relative, applied in targets.items():
 PY
 }
 
+pre_restored_retry="false"
+pre_restored_source_attempt="none"
+pre_restored_runtime_snapshot="none"
+pre_restored_estate_snapshot="none"
+pre_restored_superseded_attempt="none"
+pre_restored_superseded_failure_sha="none"
+pre_restored_superseded_state_sha="none"
+pre_restored_runtime_disposition="not-applicable"
+
+pre_restored_runtime_writers_are_inactive() {
+  local service output state
+  local -a ids
+  for service in strad rikune-analyzer rikune-volume-init; do
+    ids=()
+    output=$(service_container_ids "$service") || \
+      holdfast_die "could not inspect runtime writer before pre-restored retry: $service"
+    if [[ -n "$output" ]]; then mapfile -t ids <<<"$output"; fi
+    ((${#ids[@]} <= 1)) || \
+      holdfast_die "multiple runtime writer containers exist before pre-restored retry: $service"
+    if ((${#ids[@]})); then
+      state=$("$docker_bin" inspect -f '{{.State.Status}}' "${ids[0]}") || \
+        holdfast_die "could not inspect runtime writer state before pre-restored retry: $service"
+      case "$state" in
+        created|exited|dead) ;;
+        running|restarting|paused) return 1 ;;
+        *) holdfast_die "runtime writer has an unknown state before pre-restored retry: $service" ;;
+      esac
+    fi
+  done
+  return 0
+}
+
+verify_legacy_pre_restored_runtime_disposition() {
+  local logical volume_state actual extra volume_output volume_count=0 volume_name
+  local database_exists public_tables user_relations connections
+  local -a frozen_compose
+  local -a expected_volumes=(
+    strad_uploads
+    rikune_workspaces
+    rikune_storage
+    rikune_state
+    rikune_cache
+    rikune_audit
+  )
+  [[ "$legacy_empty_strad" == "true" ]] || return 1
+  pre_restored_runtime_writers_are_inactive || return 1
+
+  volume_output=$("$docker_bin" volume ls --format '{{.Name}}') || \
+    holdfast_die "could not inspect runtime volumes before pre-restored retry"
+  while IFS=$'\t' read -r logical volume_state actual extra; do
+    [[ "$logical" == "${expected_volumes[$volume_count]:-}" ]] || \
+      holdfast_die "legacy pre-restored retry volume set or order differs"
+    ((volume_count += 1))
+    [[ -z "${extra:-}" && "$volume_state" == "absent" && \
+      "$actual" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]+$ ]] || \
+      holdfast_die "legacy pre-restored retry volume authority differs"
+    while IFS= read -r volume_name; do
+      [[ -z "$volume_name" || "$volume_name" != "$actual" ]] || return 1
+    done <<<"$volume_output"
+  done <"$backup/runtime/VOLUMES.tsv"
+  [[ "$volume_count" == "6" ]] || \
+    holdfast_die "legacy pre-restored retry volume count differs"
+
+  frozen_compose=("$docker_bin" compose -f "$backup/runtime/compose-config.json")
+  # The quoted program is intentionally expanded inside the PostgreSQL container.
+  # shellcheck disable=SC2016
+  database_exists=$("${frozen_compose[@]}" exec -T postgres sh -ceu \
+    'exec psql -U "$POSTGRES_USER" -d postgres -XAtq -v ON_ERROR_STOP=1' <<'SQL'
+SELECT count(*) FROM pg_database WHERE datname = 'strad';
+SQL
+  ) || holdfast_die "could not verify the pre-restored Strad database identity"
+  [[ "$database_exists" == "1" ]] || return 1
+  # The quoted program is intentionally expanded inside the PostgreSQL container.
+  # shellcheck disable=SC2016
+  public_tables=$("${frozen_compose[@]}" exec -T postgres sh -ceu \
+    'exec psql -U "$POSTGRES_USER" -d strad -XAtq -v ON_ERROR_STOP=1' <<'SQL'
+SELECT count(*) FROM pg_tables WHERE schemaname = 'public';
+SQL
+  ) || holdfast_die "could not verify the pre-restored Strad public schema"
+  [[ "$public_tables" == "0" ]] || return 1
+  # The quoted program is intentionally expanded inside the PostgreSQL container.
+  # shellcheck disable=SC2016
+  user_relations=$("${frozen_compose[@]}" exec -T postgres sh -ceu \
+    'exec psql -U "$POSTGRES_USER" -d strad -XAtq -v ON_ERROR_STOP=1' <<'SQL'
+SELECT count(*)
+  FROM pg_class AS c
+  JOIN pg_namespace AS n ON n.oid = c.relnamespace
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname !~ '^pg_toast'
+   AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f');
+SQL
+  ) || holdfast_die "could not verify the pre-restored Strad relations"
+  [[ "$user_relations" == "0" ]] || return 1
+  # The quoted program is intentionally expanded inside the PostgreSQL container.
+  # shellcheck disable=SC2016
+  connections=$("${frozen_compose[@]}" exec -T postgres sh -ceu \
+    'exec psql -U "$POSTGRES_USER" -d postgres -XAtq -v ON_ERROR_STOP=1' <<'SQL'
+SELECT count(*) FROM pg_stat_activity WHERE datname = 'strad';
+SQL
+  ) || holdfast_die "could not verify pre-restored Strad connections"
+  [[ "$connections" == "0" ]] || return 1
+  return 0
+}
+
+qualify_pre_restored_retry() {
+  local expected_source_attempt=${1:-}
+  local current_writers_sha candidate_state candidate_attempt candidate_failure_name
+  local candidate_failure candidate_arm_name candidate_arm candidate_writers_name
+  local candidate_writers expected_restore_mode expected_database_restore found
+  local qualified_attempt qualified_runtime_sha qualified_estate_sha
+  local superseded_attempt superseded_failure_sha superseded_state_sha
+  local -a candidate_states runtime_snapshots estate_snapshots
+
+  [[ "$legacy_empty_strad" == "true" ]] || return 1
+  current_writers_sha=$(jq -er '.restore_running_writers_sha256' "$state_file") || return 1
+  [[ "$current_writers_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  found="false"
+  shopt -s nullglob
+  candidate_states=("$state_dir"/APPLY-RECOVERY-FAILED-*.json)
+  shopt -u nullglob
+  for candidate_state in "${candidate_states[@]}"; do
+    require_root_file "$candidate_state"
+    if ! jq -e \
+      --arg backup "$backup" --arg estate "$estate_root" \
+      --arg transaction "$transaction_sha" --arg targets "$applied_targets_sha" \
+      --arg writers_sha "$current_writers_sha" --argjson legacy "$legacy_empty_strad" \
+      '.schema_version == 2 and .state == "restore_failed" and
+       .backup_dir == $backup and .estate_root == $estate and
+       .recovery_mode == "restore" and
+       (.recovery_failure_stage == "restore_prior_running_writers" or
+        .recovery_failure_stage == "post_recovery_closed_bracket") and
+       .transaction_sha256 == $transaction and
+       .applied_targets_sha256 == $targets and
+       .restore_running_writers_sha256 == $writers_sha and
+       .legacy_empty_strad == $legacy and
+       .recovery_route_database_state == "absent" and
+       .ingress_opened == false' "$candidate_state" >/dev/null; then
+      continue
+    fi
+
+    candidate_attempt=$(jq -er '.recovery_attempt_id' "$candidate_state")
+    [[ "$candidate_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+      "$(basename -- "$candidate_state")" == "APPLY-RECOVERY-FAILED-${candidate_attempt}.json" ]] || \
+      holdfast_die "pre-restored retry failure state identity is unsafe"
+    if [[ -n "$expected_source_attempt" && \
+      "$candidate_attempt" != "$expected_source_attempt" ]]; then
+      continue
+    fi
+
+    candidate_failure_name=$(jq -er '.apply_failure_receipt' "$candidate_state")
+    [[ "$candidate_failure_name" =~ ^APPLY-RECOVERY-FAILED-${candidate_attempt}(-retry-[0-9]+)?\.receipt$ ]] || \
+      holdfast_die "pre-restored retry failure receipt identity is unsafe"
+    candidate_failure="$state_dir/$candidate_failure_name"
+    require_root_file "$candidate_failure"
+    [[ "$(jq -er '.apply_failure_receipt_sha256' "$candidate_state")" == \
+      "$(holdfast_sha256 "$candidate_failure")" ]] || \
+      holdfast_die "pre-restored retry failure receipt was replaced"
+    [[ "$(holdfast_receipt_value "$candidate_failure" attempt_id)" == "$candidate_attempt" && \
+      "$(holdfast_receipt_value "$candidate_failure" mode)" == "restore" && \
+      "$(holdfast_receipt_value "$candidate_failure" estate_root)" == "$estate_root" && \
+      "$(holdfast_receipt_value "$candidate_failure" backup_dir)" == "$backup" && \
+      "$(holdfast_receipt_value "$candidate_failure" control_sha256)" == "$control_sha" && \
+      "$(holdfast_receipt_value "$candidate_failure" transaction_sha256)" == "$transaction_sha" && \
+      "$(holdfast_receipt_value "$candidate_failure" restore_running_writers_sha256)" == \
+        "$current_writers_sha" && \
+      "$(holdfast_receipt_value "$candidate_failure" route_database_state)" == "absent" && \
+      "$(holdfast_receipt_value "$candidate_failure" ingress_opened)" == "false" ]] || \
+      holdfast_die "pre-restored retry failure receipt authority differs"
+    case "$(holdfast_receipt_value "$candidate_failure" stage)" in
+      restore_prior_running_writers|post_recovery_closed_bracket) ;;
+      *) holdfast_die "pre-restored retry failure stage differs" ;;
+    esac
+
+    candidate_arm_name=$(jq -er '.recovery_armed_receipt' "$candidate_state")
+    [[ "$candidate_arm_name" == "APPLY-RECOVERY-ARMED-${candidate_attempt}.receipt" ]] || \
+      holdfast_die "pre-restored retry arm identity is unsafe"
+    candidate_arm="$state_dir/$candidate_arm_name"
+    require_root_file "$candidate_arm"
+    [[ "$(jq -er '.recovery_armed_receipt_sha256' "$candidate_state")" == \
+      "$(holdfast_sha256 "$candidate_arm")" && \
+      "$(holdfast_receipt_value "$candidate_failure" recovery_armed_receipt_sha256)" == \
+        "$(holdfast_sha256 "$candidate_arm")" ]] || \
+      holdfast_die "pre-restored retry arm was replaced"
+    [[ "$(holdfast_receipt_value "$candidate_arm" attempt_id)" == "$candidate_attempt" && \
+      "$(holdfast_receipt_value "$candidate_arm" mode)" == "restore" && \
+      "$(holdfast_receipt_value "$candidate_arm" estate_root)" == "$estate_root" && \
+      "$(holdfast_receipt_value "$candidate_arm" backup_dir)" == "$backup" && \
+      "$(holdfast_receipt_value "$candidate_arm" control_sha256)" == "$control_sha" && \
+      "$(holdfast_receipt_value "$candidate_arm" transaction_sha256)" == "$transaction_sha" && \
+      "$(holdfast_receipt_value "$candidate_arm" applied_targets_sha256)" == \
+        "$applied_targets_sha" && \
+      "$(holdfast_receipt_value "$candidate_arm" restore_running_writers_sha256)" == \
+        "$current_writers_sha" && \
+      "$(holdfast_receipt_value "$candidate_arm" legacy_empty_strad)" == "$legacy_empty_strad" ]] || \
+      holdfast_die "pre-restored retry arm authority differs"
+
+    candidate_writers_name=$(jq -er '.restore_running_writers_manifest' "$candidate_state")
+    [[ "$candidate_writers_name" == "RESTORE-RUNNING-WRITERS-${candidate_attempt}.txt" ]] || \
+      holdfast_die "pre-restored retry writer manifest identity is unsafe"
+    candidate_writers="$state_dir/$candidate_writers_name"
+    require_root_file "$candidate_writers"
+    [[ "$(holdfast_sha256 "$candidate_writers")" == "$current_writers_sha" ]] || \
+      holdfast_die "pre-restored retry writer manifest differs"
+    # If Strad or its analyzer was reactivated before the failed health check,
+    # it may already have changed the restored database or volumes. Only a
+    # retry whose frozen subset excludes both runtime writers may reuse the
+    # earlier runtime restore evidence.
+    if grep -Eq '^(strad|rikune-analyzer)$' "$candidate_writers"; then continue; fi
+
+    shopt -s nullglob
+    runtime_snapshots=("$state_dir/RUNTIME-RESTORE-${candidate_attempt}-"*.receipt)
+    estate_snapshots=("$state_dir/ESTATE-RESTORE-${candidate_attempt}-"*.json)
+    shopt -u nullglob
+    ((${#runtime_snapshots[@]} == 1 && ${#estate_snapshots[@]} == 1)) || \
+      holdfast_die "pre-restored retry lacks an exact runtime or estate snapshot"
+    require_root_file "${runtime_snapshots[0]}"
+    require_root_file "${estate_snapshots[0]}"
+    expected_restore_mode="schema-v2"
+    expected_database_restore="restored"
+    if [[ "$legacy_empty_strad" == "true" ]]; then
+      expected_restore_mode="legacy-empty-strad"
+      expected_database_restore="skipped_proven_empty"
+    fi
+    [[ "$(holdfast_receipt_value "${runtime_snapshots[0]}" schema_version)" == "2" && \
+      "$(holdfast_receipt_value "${runtime_snapshots[0]}" restore_mode)" == \
+        "$expected_restore_mode" && \
+      "$(holdfast_receipt_value "${runtime_snapshots[0]}" database_identity)" == \
+        "postgres:5432/strad" && \
+      "$(holdfast_receipt_value "${runtime_snapshots[0]}" database_restore)" == \
+        "$expected_database_restore" && \
+      "$(holdfast_receipt_value "${runtime_snapshots[0]}" runtime_writers_removed)" == "passed" && \
+      "$(holdfast_receipt_value "${runtime_snapshots[0]}" volume_mount_release)" == "passed" && \
+      "$(holdfast_receipt_value "${runtime_snapshots[0]}" volume_count)" == "6" ]] || \
+      holdfast_die "pre-restored retry runtime snapshot differs"
+    jq -e '.schema_version == 1 and .state == "restored" and
+      .mixed_estate_supported == true' "${estate_snapshots[0]}" >/dev/null || \
+      holdfast_die "pre-restored retry estate snapshot differs"
+
+    qualified_attempt="$candidate_attempt"
+    qualified_runtime_sha=$(holdfast_sha256 "${runtime_snapshots[0]}") || \
+      holdfast_die "could not hash the pre-restored runtime snapshot"
+    qualified_estate_sha=$(holdfast_sha256 "${estate_snapshots[0]}") || \
+      holdfast_die "could not hash the pre-restored estate snapshot"
+    [[ "$qualified_runtime_sha" =~ ^[0-9a-f]{64}$ && \
+      "$qualified_estate_sha" =~ ^[0-9a-f]{64}$ ]] || \
+      holdfast_die "pre-restored snapshot hash is invalid"
+    found="true"
+    break
+  done
+  [[ "$found" == "true" ]] || return 1
+  verify_live_disposition preimage || return 1
+  verify_legacy_pre_restored_runtime_disposition || return 1
+
+  if [[ "$prior_state" == "restore_failed" ]]; then
+    superseded_attempt=$(jq -er '.recovery_attempt_id' "$state_file") || \
+      holdfast_die "restore-failed retry lacks a superseded attempt"
+    superseded_failure_sha=$(jq -er '.apply_failure_receipt_sha256' "$state_file") || \
+      holdfast_die "restore-failed retry lacks a superseded failure receipt"
+    superseded_state_sha=$(holdfast_sha256 "$state_file") || \
+      holdfast_die "could not hash the superseded recovery state"
+    [[ "$superseded_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+      "$superseded_failure_sha" =~ ^[0-9a-f]{64}$ && \
+      "$superseded_state_sha" =~ ^[0-9a-f]{64}$ ]] || \
+      holdfast_die "superseded recovery authority is invalid"
+    pre_restored_superseded_attempt="$superseded_attempt"
+    pre_restored_superseded_failure_sha="$superseded_failure_sha"
+    pre_restored_superseded_state_sha="$superseded_state_sha"
+  fi
+  pre_restored_retry="true"
+  pre_restored_source_attempt="$qualified_attempt"
+  pre_restored_runtime_snapshot="$qualified_runtime_sha"
+  pre_restored_estate_snapshot="$qualified_estate_sha"
+  pre_restored_runtime_disposition="legacy-empty-strad+six-volumes-absent+runtime-writers-inactive"
+}
+
 finalize_interrupted_apply="false"
 if [[ -e "$apply_receipt" || -e "$pending_apply_receipt" || \
   "$prior_state" == "apply_finalizing_ingress_closed" ]]; then
@@ -1102,6 +1377,11 @@ fi
   ! -e "$pending_apply_receipt" && ! -L "$pending_apply_receipt" ]] || \
   holdfast_die "successful or pending apply receipt exists outside finalization"
 
+if [[ "$mode" == "restore" && "$transaction_is_preimage" != "true" && \
+  "$prior_state" == "restore_failed" ]]; then
+  if qualify_pre_restored_retry; then transaction_is_preimage="true"; fi
+fi
+
 if [[ "$transaction_is_preimage" == "true" ]]; then
   verify_live_disposition preimage
 elif [[ "$mode" == "resume" ]]; then
@@ -1111,6 +1391,10 @@ else
 fi
 verify_closed_bracket
 # Close the TOCTOU window between the external probe and the durable recovery arm.
+if [[ "$pre_restored_retry" == "true" ]]; then
+  verify_legacy_pre_restored_runtime_disposition || \
+    holdfast_die "legacy runtime disposition changed before the pre-restored recovery arm"
+fi
 if [[ "$transaction_is_preimage" == "true" ]]; then
   verify_live_disposition preimage
 elif [[ "$mode" == "resume" ]]; then
@@ -1248,6 +1532,83 @@ if [[ "$prior_state" == "apply_recovery_armed" ]]; then
     "$(jq -er '.applied_targets_sha256' "$state_file")" == "$applied_targets_sha" ]] || \
     holdfast_die "armed recovery state rollback authority differs"
   [[ "$(holdfast_receipt_value "$recovery_armed_receipt" legacy_empty_strad)" == "$legacy_empty_strad" ]] || holdfast_die "armed legacy recovery policy differs"
+  armed_pre_restored=$(holdfast_receipt_value "$recovery_armed_receipt" pre_restored_retry 2>/dev/null || printf legacy-absent)
+  armed_pre_restored_attempt=$(holdfast_receipt_value "$recovery_armed_receipt" pre_restored_source_attempt 2>/dev/null || printf legacy-absent)
+  armed_pre_restored_runtime=$(holdfast_receipt_value "$recovery_armed_receipt" pre_restored_runtime_snapshot_sha256 2>/dev/null || printf legacy-absent)
+  armed_pre_restored_estate=$(holdfast_receipt_value "$recovery_armed_receipt" pre_restored_estate_snapshot_sha256 2>/dev/null || printf legacy-absent)
+  armed_pre_restored_superseded_attempt=$(holdfast_receipt_value "$recovery_armed_receipt" pre_restored_superseded_attempt 2>/dev/null || printf legacy-absent)
+  armed_pre_restored_superseded_failure=$(holdfast_receipt_value "$recovery_armed_receipt" pre_restored_superseded_failure_receipt_sha256 2>/dev/null || printf legacy-absent)
+  armed_pre_restored_superseded_state=$(holdfast_receipt_value "$recovery_armed_receipt" pre_restored_superseded_state_sha256 2>/dev/null || printf legacy-absent)
+  armed_pre_restored_disposition=$(holdfast_receipt_value "$recovery_armed_receipt" pre_restored_runtime_disposition 2>/dev/null || printf legacy-absent)
+  if [[ "$armed_pre_restored" == "legacy-absent" && \
+    "$armed_pre_restored_attempt" == "legacy-absent" && \
+    "$armed_pre_restored_runtime" == "legacy-absent" && \
+    "$armed_pre_restored_estate" == "legacy-absent" && \
+    "$armed_pre_restored_superseded_attempt" == "legacy-absent" && \
+    "$armed_pre_restored_superseded_failure" == "legacy-absent" && \
+    "$armed_pre_restored_superseded_state" == "legacy-absent" && \
+    "$armed_pre_restored_disposition" == "legacy-absent" ]]; then
+    [[ "$pre_restored_retry" == "false" && \
+      "$(jq -er '(.pre_restored_retry // false) | tostring' "$state_file")" == "false" && \
+      "$(jq -er '.pre_restored_source_attempt // "none"' "$state_file")" == "none" && \
+      "$(jq -er '.pre_restored_runtime_snapshot_sha256 // "none"' "$state_file")" == "none" && \
+      "$(jq -er '.pre_restored_estate_snapshot_sha256 // "none"' "$state_file")" == "none" && \
+      "$(jq -er '.pre_restored_superseded_attempt // "none"' "$state_file")" == "none" && \
+      "$(jq -er '.pre_restored_superseded_failure_receipt_sha256 // "none"' "$state_file")" == "none" && \
+      "$(jq -er '.pre_restored_superseded_state_sha256 // "none"' "$state_file")" == "none" && \
+      "$(jq -er '.pre_restored_runtime_disposition // "not-applicable"' "$state_file")" == \
+        "not-applicable" ]] || \
+      holdfast_die "legacy armed recovery cannot claim a pre-restored retry"
+  else
+    [[ "$armed_pre_restored" == "true" || "$armed_pre_restored" == "false" ]] || \
+      holdfast_die "armed pre-restored retry flag differs"
+    if [[ "$armed_pre_restored" == "true" ]]; then
+      [[ "$armed_pre_restored_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+        "$armed_pre_restored_runtime" =~ ^[0-9a-f]{64}$ && \
+        "$armed_pre_restored_estate" =~ ^[0-9a-f]{64}$ && \
+        "$armed_pre_restored_superseded_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+        "$armed_pre_restored_superseded_failure" =~ ^[0-9a-f]{64}$ && \
+        "$armed_pre_restored_superseded_state" =~ ^[0-9a-f]{64}$ && \
+        "$armed_pre_restored_disposition" == \
+          "legacy-empty-strad+six-volumes-absent+runtime-writers-inactive" ]] || \
+        holdfast_die "armed pre-restored retry evidence is invalid"
+      qualify_pre_restored_retry "$armed_pre_restored_attempt" || \
+        holdfast_die "armed pre-restored retry evidence no longer qualifies"
+      [[ "$pre_restored_source_attempt" == "$armed_pre_restored_attempt" && \
+        "$pre_restored_runtime_snapshot" == "$armed_pre_restored_runtime" && \
+        "$pre_restored_estate_snapshot" == "$armed_pre_restored_estate" ]] || \
+        holdfast_die "armed pre-restored retry source differs"
+      pre_restored_superseded_attempt="$armed_pre_restored_superseded_attempt"
+      pre_restored_superseded_failure_sha="$armed_pre_restored_superseded_failure"
+      pre_restored_superseded_state_sha="$armed_pre_restored_superseded_state"
+      pre_restored_runtime_disposition="$armed_pre_restored_disposition"
+      transaction_is_preimage="true"
+    else
+      [[ "$armed_pre_restored_attempt" == "none" && \
+        "$armed_pre_restored_runtime" == "none" && \
+        "$armed_pre_restored_estate" == "none" && \
+        "$armed_pre_restored_superseded_attempt" == "none" && \
+        "$armed_pre_restored_superseded_failure" == "none" && \
+        "$armed_pre_restored_superseded_state" == "none" && \
+        "$armed_pre_restored_disposition" == "not-applicable" ]] || \
+        holdfast_die "inactive pre-restored retry carries evidence"
+    fi
+    [[ "$(jq -er '.pre_restored_retry | tostring' "$state_file")" == "$pre_restored_retry" && \
+      "$(jq -er '.pre_restored_source_attempt' "$state_file")" == \
+        "$pre_restored_source_attempt" && \
+      "$(jq -er '.pre_restored_runtime_snapshot_sha256' "$state_file")" == \
+        "$pre_restored_runtime_snapshot" && \
+      "$(jq -er '.pre_restored_estate_snapshot_sha256' "$state_file")" == \
+        "$pre_restored_estate_snapshot" && \
+      "$(jq -er '.pre_restored_superseded_attempt' "$state_file")" == \
+        "$pre_restored_superseded_attempt" && \
+      "$(jq -er '.pre_restored_superseded_failure_receipt_sha256' "$state_file")" == \
+        "$pre_restored_superseded_failure_sha" && \
+      "$(jq -er '.pre_restored_superseded_state_sha256' "$state_file")" == \
+        "$pre_restored_superseded_state_sha" && \
+      "$(jq -er '.pre_restored_runtime_disposition' "$state_file")" == \
+        "$pre_restored_runtime_disposition" ]] || holdfast_die "armed pre-restored retry state differs"
+  fi
   if [[ "$mode" == "restore" ]]; then
     restore_writers_name=$(jq -er '.restore_running_writers_manifest' "$state_file")
     [[ "$restore_writers_name" == "RESTORE-RUNNING-WRITERS-${attempt_id}.txt" ]] || \
@@ -1332,6 +1693,14 @@ else
     fi
     printf 'restore_running_writers_manifest=%s\n' "$([[ "$mode" == "restore" ]] && basename -- "$restore_writers_manifest" || printf not-applicable)"
     printf 'restore_running_writers_sha256=%s\n' "$restore_writers_sha"
+    printf 'pre_restored_retry=%s\n' "$pre_restored_retry"
+    printf 'pre_restored_source_attempt=%s\n' "$pre_restored_source_attempt"
+    printf 'pre_restored_runtime_snapshot_sha256=%s\n' "$pre_restored_runtime_snapshot"
+    printf 'pre_restored_estate_snapshot_sha256=%s\n' "$pre_restored_estate_snapshot"
+    printf 'pre_restored_superseded_attempt=%s\n' "$pre_restored_superseded_attempt"
+    printf 'pre_restored_superseded_failure_receipt_sha256=%s\n' "$pre_restored_superseded_failure_sha"
+    printf 'pre_restored_superseded_state_sha256=%s\n' "$pre_restored_superseded_state_sha"
+    printf 'pre_restored_runtime_disposition=%s\n' "$pre_restored_runtime_disposition"
     printf 'route_state=absent\n'
     printf 'public_host=analyze.w33d.xyz\n'
     printf 'db_public_db_bracket=absent-404-absent\n'
@@ -1348,8 +1717,15 @@ else
       --arg armed "$(basename -- "$recovery_armed_receipt")" --arg armed_sha "$recovery_armed_sha" \
       --arg writers "$([[ "$mode" == "restore" ]] && basename -- "$restore_writers_manifest" || printf not-applicable)" \
       --arg writers_sha "$restore_writers_sha" --arg legacy_empty "$legacy_empty_strad" \
+      --arg pre_restored "$pre_restored_retry" --arg pre_restored_attempt "$pre_restored_source_attempt" \
+      --arg pre_restored_runtime "$pre_restored_runtime_snapshot" \
+      --arg pre_restored_estate "$pre_restored_estate_snapshot" \
+      --arg pre_restored_superseded_attempt "$pre_restored_superseded_attempt" \
+      --arg pre_restored_superseded_failure "$pre_restored_superseded_failure_sha" \
+      --arg pre_restored_superseded_state "$pre_restored_superseded_state_sha" \
+      --arg pre_restored_disposition "$pre_restored_runtime_disposition" \
       --arg transaction "$transaction_sha" --arg applied_targets "$applied_targets_sha" \
-      '.state="apply_recovery_armed" | .recovery_prior_state=$prior | .recovery_mode=$mode | .recovery_attempt_id=$attempt | .recovery_armed_receipt=$armed | .recovery_armed_receipt_sha256=$armed_sha | .restore_running_writers_manifest=$writers | .restore_running_writers_sha256=$writers_sha | .legacy_empty_strad=($legacy_empty == "true") | .transaction_sha256=$transaction | .applied_targets_sha256=$applied_targets' \
+      '.state="apply_recovery_armed" | .recovery_prior_state=$prior | .recovery_mode=$mode | .recovery_attempt_id=$attempt | .recovery_armed_receipt=$armed | .recovery_armed_receipt_sha256=$armed_sha | .restore_running_writers_manifest=$writers | .restore_running_writers_sha256=$writers_sha | .legacy_empty_strad=($legacy_empty == "true") | .pre_restored_retry=($pre_restored == "true") | .pre_restored_source_attempt=$pre_restored_attempt | .pre_restored_runtime_snapshot_sha256=$pre_restored_runtime | .pre_restored_estate_snapshot_sha256=$pre_restored_estate | .pre_restored_superseded_attempt=$pre_restored_superseded_attempt | .pre_restored_superseded_failure_receipt_sha256=$pre_restored_superseded_failure | .pre_restored_superseded_state_sha256=$pre_restored_superseded_state | .pre_restored_runtime_disposition=$pre_restored_disposition | .transaction_sha256=$transaction | .applied_targets_sha256=$applied_targets' \
       "$state_file" >"$state_tmp"
   else
     jq -n \
@@ -1360,8 +1736,15 @@ else
       --arg writers "$([[ "$mode" == "restore" ]] && basename -- "$restore_writers_manifest" || printf not-applicable)" \
       --arg writers_sha "$restore_writers_sha" --arg legacy_empty "$legacy_empty_strad" \
       --arg legacy_adopted "$legacy_orphan" --arg armed_pointer_missing "$armed_pointer_missing" \
+      --arg pre_restored "$pre_restored_retry" --arg pre_restored_attempt "$pre_restored_source_attempt" \
+      --arg pre_restored_runtime "$pre_restored_runtime_snapshot" \
+      --arg pre_restored_estate "$pre_restored_estate_snapshot" \
+      --arg pre_restored_superseded_attempt "$pre_restored_superseded_attempt" \
+      --arg pre_restored_superseded_failure "$pre_restored_superseded_failure_sha" \
+      --arg pre_restored_superseded_state "$pre_restored_superseded_state_sha" \
+      --arg pre_restored_disposition "$pre_restored_runtime_disposition" \
       --arg transaction "$transaction_sha" --arg applied_targets "$applied_targets_sha" \
-      '{schema_version:2,state:"apply_recovery_armed",estate_root:$estate,backup_dir:$backup,apply_armed_receipt_sha256:$apply_armed_sha,release_evidence_sha256:$release,dry_run_receipt_sha256:$dry,control_sha256:$control,transaction_sha256:$transaction,applied_targets_sha256:$applied_targets,recovery_prior_state:$prior,recovery_mode:$mode,recovery_attempt_id:$attempt,recovery_armed_receipt:$armed,recovery_armed_receipt_sha256:$armed_sha,restore_running_writers_manifest:$writers,restore_running_writers_sha256:$writers_sha,legacy_orphan_adopted:($legacy_adopted == "true"),apply_armed_pointer_was_missing:($armed_pointer_missing == "true"),legacy_empty_strad:($legacy_empty == "true"),ingress_opened:false}' \
+      '{schema_version:2,state:"apply_recovery_armed",estate_root:$estate,backup_dir:$backup,apply_armed_receipt_sha256:$apply_armed_sha,release_evidence_sha256:$release,dry_run_receipt_sha256:$dry,control_sha256:$control,transaction_sha256:$transaction,applied_targets_sha256:$applied_targets,recovery_prior_state:$prior,recovery_mode:$mode,recovery_attempt_id:$attempt,recovery_armed_receipt:$armed,recovery_armed_receipt_sha256:$armed_sha,restore_running_writers_manifest:$writers,restore_running_writers_sha256:$writers_sha,legacy_orphan_adopted:($legacy_adopted == "true"),apply_armed_pointer_was_missing:($armed_pointer_missing == "true"),legacy_empty_strad:($legacy_empty == "true"),pre_restored_retry:($pre_restored == "true"),pre_restored_source_attempt:$pre_restored_attempt,pre_restored_runtime_snapshot_sha256:$pre_restored_runtime,pre_restored_estate_snapshot_sha256:$pre_restored_estate,pre_restored_superseded_attempt:$pre_restored_superseded_attempt,pre_restored_superseded_failure_receipt_sha256:$pre_restored_superseded_failure,pre_restored_superseded_state_sha256:$pre_restored_superseded_state,pre_restored_runtime_disposition:$pre_restored_disposition,ingress_opened:false}' \
       >"$state_tmp"
   fi
   chmod 0600 "$state_tmp"
@@ -1396,6 +1779,14 @@ record_recovery_failure() {
     printf 'transaction_sha256=%s\n' "$transaction_sha"
     printf 'recovery_armed_receipt_sha256=%s\n' "$recovery_armed_sha"
     printf 'restore_running_writers_sha256=%s\n' "$restore_writers_sha"
+    printf 'pre_restored_retry=%s\n' "$pre_restored_retry"
+    printf 'pre_restored_source_attempt=%s\n' "$pre_restored_source_attempt"
+    printf 'pre_restored_runtime_snapshot_sha256=%s\n' "$pre_restored_runtime_snapshot"
+    printf 'pre_restored_estate_snapshot_sha256=%s\n' "$pre_restored_estate_snapshot"
+    printf 'pre_restored_superseded_attempt=%s\n' "$pre_restored_superseded_attempt"
+    printf 'pre_restored_superseded_failure_receipt_sha256=%s\n' "$pre_restored_superseded_failure_sha"
+    printf 'pre_restored_superseded_state_sha256=%s\n' "$pre_restored_superseded_state_sha"
+    printf 'pre_restored_runtime_disposition=%s\n' "$pre_restored_runtime_disposition"
     printf 'route_database_state=%s\n' "$route_database_state"
     printf 'ingress_opened=false\n'
   } >"$failed_tmp" && chmod 0600 "$failed_tmp" && mv -fT -- "$failed_tmp" "$failed_receipt" && sync -f "$failed_receipt"
@@ -1453,8 +1844,15 @@ if [[ "$mode" == "restore" ]]; then
   done
 
   if [[ "$transaction_is_preimage" == "true" ]]; then
-    runtime_restore_snapshot="not-required"
-    estate_restore_state="not-required"
+    if [[ "$pre_restored_retry" == "true" ]]; then
+      verify_legacy_pre_restored_runtime_disposition || \
+        holdfast_die "legacy runtime disposition changed before pre-restored writer recovery"
+      runtime_restore_snapshot="$pre_restored_runtime_snapshot"
+      estate_restore_state="$pre_restored_estate_snapshot"
+    else
+      runtime_restore_snapshot="not-required"
+      estate_restore_state="not-required"
+    fi
     verify_live_disposition preimage
   else
     failure_stage="runtime_restore_after_writer_stop"
@@ -1568,7 +1966,23 @@ if [[ -f "$recovery_receipt" && ! -L "$recovery_receipt" ]]; then
   [[ "$(holdfast_receipt_value "$recovery_receipt" original_estate_transaction_sha256)" == \
     "$transaction_sha" && \
     "$(holdfast_receipt_value "$recovery_receipt" applied_targets_sha256)" == \
-    "$applied_targets_sha" ]] || holdfast_die "existing completion receipt rollback authority differs"
+      "$applied_targets_sha" ]] || holdfast_die "existing completion receipt rollback authority differs"
+  [[ "$(holdfast_receipt_value "$recovery_receipt" pre_restored_retry)" == \
+    "$pre_restored_retry" && \
+    "$(holdfast_receipt_value "$recovery_receipt" pre_restored_source_attempt)" == \
+      "$pre_restored_source_attempt" && \
+    "$(holdfast_receipt_value "$recovery_receipt" runtime_restore_receipt_sha256)" == \
+      "$runtime_restore_snapshot" && \
+    "$(holdfast_receipt_value "$recovery_receipt" estate_restore_state_sha256)" == \
+      "$estate_restore_state" && \
+    "$(holdfast_receipt_value "$recovery_receipt" pre_restored_superseded_attempt)" == \
+      "$pre_restored_superseded_attempt" && \
+    "$(holdfast_receipt_value "$recovery_receipt" pre_restored_superseded_failure_receipt_sha256)" == \
+      "$pre_restored_superseded_failure_sha" && \
+    "$(holdfast_receipt_value "$recovery_receipt" pre_restored_superseded_state_sha256)" == \
+      "$pre_restored_superseded_state_sha" && \
+    "$(holdfast_receipt_value "$recovery_receipt" pre_restored_runtime_disposition)" == \
+      "$pre_restored_runtime_disposition" ]] || holdfast_die "existing completion receipt pre-restored authority differs"
 else
   [[ ! -e "$recovery_receipt" && ! -L "$recovery_receipt" && ! -e "$recovery_receipt_tmp" && ! -L "$recovery_receipt_tmp" ]] || \
     holdfast_die "unsafe recovery completion receipt path"
@@ -1589,6 +2003,12 @@ else
     printf 'dry_run_receipt_sha256=%s\n' "$dry_receipt_sha"
     printf 'runtime_restore_receipt_sha256=%s\n' "$runtime_restore_snapshot"
     printf 'estate_restore_state_sha256=%s\n' "$estate_restore_state"
+    printf 'pre_restored_retry=%s\n' "$pre_restored_retry"
+    printf 'pre_restored_source_attempt=%s\n' "$pre_restored_source_attempt"
+    printf 'pre_restored_superseded_attempt=%s\n' "$pre_restored_superseded_attempt"
+    printf 'pre_restored_superseded_failure_receipt_sha256=%s\n' "$pre_restored_superseded_failure_sha"
+    printf 'pre_restored_superseded_state_sha256=%s\n' "$pre_restored_superseded_state_sha"
+    printf 'pre_restored_runtime_disposition=%s\n' "$pre_restored_runtime_disposition"
     printf 'restore_running_writers_manifest=%s\n' "$([[ "$mode" == "restore" ]] && basename -- "$restore_writers_manifest" || printf not-applicable)"
     printf 'restore_running_writers_sha256=%s\n' "$restore_writers_sha"
     printf 'writers_reactivated=%s\n' "$writers_reactivated"
