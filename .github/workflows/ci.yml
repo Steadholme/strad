@@ -51,6 +51,10 @@ jobs:
         run: npm test
       - name: Test frontend contracts
         run: node --test tests/frontend/*.test.js
+      - name: Establish Holdfast authority ownership
+        run: >-
+          sudo chown --recursive --no-dereference root:root --
+          "$GITHUB_WORKSPACE/ops/holdfast"
       - name: Test Holdfast tooling
         run: sudo python3 -m unittest discover -s ops/holdfast/tests -v
 
