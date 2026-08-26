@@ -225,6 +225,26 @@ atomic_copy_authority() {
     holdfast_die "atomically persisted authority differs from source: $target"
 }
 
+validate_successor_route_authority() {
+  local evidence=$1 authority_root=$2 field relative expected observed
+  [[ "$successor" == "true" ]] || return 0
+  require_root_control_file "$evidence"
+  for field in route_up_sha256 route_down_sha256; do
+    case "$field" in
+      route_up_sha256) relative=20260823_rikune_root_up.sql ;;
+      route_down_sha256) relative=20260823_rikune_root_down.sql ;;
+      *) holdfast_die "unsupported successor route authority field: $field" ;;
+    esac
+    require_root_control_file "$authority_root/assets/$relative"
+    expected=$(jq -er --arg field "$field" \
+      '.[$field] | select(type == "string" and test("^[0-9a-f]{64}$"))' \
+      "$evidence") || holdfast_die "successor release evidence lacks route authority: $field"
+    observed=$(holdfast_sha256 "$authority_root/assets/$relative")
+    [[ "$observed" == "$expected" ]] || \
+      holdfast_die "successor route authority differs from release evidence: $field"
+  done
+}
+
 archive_and_restore_predecessor_current() {
   local archive=$1 temporary
   require_root_control_file "$state_file"
@@ -276,11 +296,13 @@ persist_successor_generation_authority() {
   ((${#successor_generation_authorities[@]} == 6)) || \
     holdfast_die "successor generation authority set is not exactly six files"
   mkdir -m 0700 -- "$authority_dir/assets"
+  validate_successor_route_authority "$stage/RELEASE-EVIDENCE.json" "$script_dir"
   for relative in 20260823_rikune_root_up.sql 20260823_rikune_root_down.sql; do
     require_root_control_file "$script_dir/assets/$relative"
     atomic_copy_authority \
       "$script_dir/assets/$relative" "$authority_dir/assets/$relative"
   done
+  validate_successor_route_authority "$stage/RELEASE-EVIDENCE.json" "$authority_dir"
   require_root_control_file "$script_dir/../../Dockerfile.analyzer"
   atomic_copy_authority \
     "$script_dir/../../Dockerfile.analyzer" \
@@ -1203,6 +1225,10 @@ verify_release_bindings
 validate_runtime_backup_authority "$prior_running_manifest"
 verify_products_quiesced
 atomic_copy_authority "$stage/RELEASE-EVIDENCE.json" "$backup/RELEASE-EVIDENCE.json"
+if [[ "$successor" == "true" ]]; then
+  validate_successor_route_authority "$backup/RELEASE-EVIDENCE.json" \
+    "$backup/successor-authority"
+fi
 atomic_copy_authority "$release_env" "$backup/release.env"
 atomic_copy_authority "$receipt" "$backup/DRY-RUN.receipt"
 [[ "$(holdfast_sha256 "$backup/DRY-RUN.receipt")" == "$bound_dry_receipt_sha" ]] || \

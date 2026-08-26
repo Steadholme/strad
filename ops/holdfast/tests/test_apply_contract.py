@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +17,19 @@ sys.path.insert(0, str(OPS_ROOT))
 
 import render  # noqa: E402
 import render_input_binding  # noqa: E402
+
+
+def shell_function(source: str, name: str) -> str:
+    start = source.index(f"{name}() {{")
+    body_start = start + len(f"{name}() {{")
+    following = re.search(r"(?m)^[a-z_][a-z0-9_]*\(\) \{", source[body_start:])
+    if following is None:
+        return source[start:]
+    return source[start : body_start + following.start()]
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class ApplyContractTests(unittest.TestCase):
@@ -588,6 +605,156 @@ class ApplyContractTests(unittest.TestCase):
                 ops, binding, stage, evidence, "base"
             )
 
+    def test_successor_route_copy_is_release_bound_before_control(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        helper = script[
+            script.index("validate_successor_route_authority() {") : script.index(
+                "archive_and_restore_predecessor_current() {"
+            )
+        ]
+        self.assertIn("route_up_sha256 route_down_sha256", helper)
+        self.assertIn(".[$field]", helper)
+        self.assertIn(
+            '[[ "$observed" == "$expected" ]]',
+            helper,
+        )
+
+        persist = script[
+            script.index("persist_successor_generation_authority() {") : script.index(
+                "persist_successor_authority() {"
+            )
+        ]
+        pre_copy = persist.index(
+            'validate_successor_route_authority "$stage/RELEASE-EVIDENCE.json" "$script_dir"'
+        )
+        copy = persist.index(
+            '"$script_dir/assets/$relative" "$authority_dir/assets/$relative"'
+        )
+        post_copy = persist.index(
+            'validate_successor_route_authority "$stage/RELEASE-EVIDENCE.json" "$authority_dir"'
+        )
+        self.assertLess(pre_copy, copy)
+        self.assertLess(copy, post_copy)
+
+        persisted_evidence = script.index(
+            'atomic_copy_authority "$stage/RELEASE-EVIDENCE.json" "$backup/RELEASE-EVIDENCE.json"'
+        )
+        persisted_route_check = script.index(
+            'validate_successor_route_authority "$backup/RELEASE-EVIDENCE.json"',
+            persisted_evidence,
+        )
+        control = script.index('control_file="$backup/CONTROL.sha256"')
+        self.assertLess(persisted_evidence, persisted_route_check)
+        self.assertLess(persisted_route_check, control)
+
+    def test_successor_route_drift_after_precheck_is_rejected_after_copy(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        fixture_repo = self.root / "repo"
+        script_dir = fixture_repo / "ops/holdfast"
+        assets = script_dir / "assets"
+        stage = self.root / "stage"
+        backup = self.root / "backup"
+        fake_bin = self.root / "bin"
+        for directory in (assets, stage, backup, fake_bin, fixture_repo / "bridge"):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        route_names = (
+            "20260823_rikune_root_up.sql",
+            "20260823_rikune_root_down.sql",
+        )
+        for route_name in route_names:
+            (assets / route_name).write_text(
+                f"-- release-bound {route_name}\n", encoding="utf-8"
+            )
+        (stage / "RELEASE-EVIDENCE.json").write_text(
+            json.dumps(
+                {
+                    "route_up_sha256": sha256(assets / route_names[0]),
+                    "route_down_sha256": sha256(assets / route_names[1]),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        generation_names = tuple(f"generation-{index}.json" for index in range(6))
+        for name in generation_names:
+            (script_dir / name).write_text(f"{name}\n", encoding="utf-8")
+        render_inputs = stage / "RENDER-INPUTS.sha256"
+        render_inputs.write_text(
+            "".join(f"{sha256(script_dir / name)}  {name}\n" for name in generation_names),
+            encoding="utf-8",
+        )
+        (fixture_repo / "Dockerfile.analyzer").write_text(
+            "FROM scratch\n", encoding="utf-8"
+        )
+        (fixture_repo / "bridge/package-lock.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+
+        drift_marker = self.root / "route-drifted"
+        fake_install = fake_bin / "install"
+        fake_install.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'source_path=${@: -2:1}\n'
+            'if [[ "$source_path" == */20260823_rikune_root_down.sql && '
+            '! -e "$HOLDFAST_TEST_ROUTE_DRIFT_MARKER" ]]; then\n'
+            '  printf "\\n-- deterministic test-only drift\\n" >>"$source_path"\n'
+            '  touch "$HOLDFAST_TEST_ROUTE_DRIFT_MARKER"\n'
+            "fi\n"
+            'exec /usr/bin/install "$@"\n',
+            encoding="utf-8",
+        )
+        fake_install.chmod(0o755)
+
+        functions = "\n".join(
+            shell_function(script, name)
+            for name in (
+                "require_root_control_file",
+                "commit_atomic_file",
+                "atomic_copy_authority",
+                "validate_successor_route_authority",
+                "persist_successor_generation_authority",
+            )
+        )
+        harness = self.root / "route-copy-harness.sh"
+        harness.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            f'source "{OPS_ROOT / "common.sh"}"\n'
+            f"{functions}\n"
+            "successor_generation_authorities=()\n"
+            "successor=true\n"
+            f'script_dir="{script_dir}"\n'
+            f'stage="{stage}"\n'
+            f'backup="{backup}"\n'
+            f'render_inputs="{render_inputs}"\n'
+            "persist_successor_generation_authority\n",
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(harness)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "HOLDFAST_TEST_ROUTE_DRIFT_MARKER": str(drift_marker),
+            },
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(drift_marker.exists())
+        self.assertIn(
+            "successor route authority differs from release evidence: route_down_sha256",
+            result.stderr,
+        )
+        self.assertFalse(
+            (backup / "successor-authority/Dockerfile.analyzer").exists()
+        )
+
     def test_apply_preflights_before_backup_and_fully_rebinds_after_backup(self) -> None:
         script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
         first_rebind = script.index("\nverify_release_bindings\n")
@@ -827,9 +994,17 @@ class ApplyContractTests(unittest.TestCase):
             all(
                 "for relative in" in line
                 or "successor-authority/assets/" in line
+                or "route_up_sha256) relative=" in line
                 for line in route_up_lines
             ),
             "apply may freeze route-up authority but must never execute it",
+        )
+        self.assertNotIn(
+            '-f "$script_dir/assets/20260823_rikune_root_up.sql"', script
+        )
+        self.assertNotIn(
+            '-f "$backup/successor-authority/assets/20260823_rikune_root_up.sql"',
+            script,
         )
         for evidence in (
             "closed_bracket=passed",

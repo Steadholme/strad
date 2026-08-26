@@ -832,6 +832,69 @@ class RollbackLifecycleTests(unittest.TestCase):
             f"ROUTE-CLOSE-PREIMAGE-{older_identity}.jsonl",
         )
 
+    def test_successor_close_route_rejects_wrong_control_bound_sql_before_execution(
+        self,
+    ) -> None:
+        self.install_successor_lineage()
+        route = (
+            self.backup
+            / "successor-authority/assets/20260823_rikune_root_down.sql"
+        )
+        route.write_bytes(route.read_bytes() + b"\n-- wrong frozen route authority\n")
+
+        control = self.backup / "CONTROL.sha256"
+        control_lines = []
+        for line in control.read_text(encoding="utf-8").splitlines():
+            digest, relative = line.split("  ", 1)
+            if relative == "successor-authority/assets/20260823_rikune_root_down.sql":
+                digest = sha256(route)
+            control_lines.append(f"{digest}  {relative}\n")
+        control.write_text("".join(control_lines), encoding="utf-8")
+        route_identity = sha256(control)
+
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        state.update(
+            {
+                "state": "applied_ingress_closed",
+                "control_sha256": route_identity,
+                "route_database_state": "absent",
+                "public_ipv4_ipv6_closed_status": 404,
+                "ingress_opened": False,
+            }
+        )
+        for key in (
+            "route_close_receipt",
+            "route_close_receipt_sha256",
+            "route_close_preimage",
+            "route_close_preimage_sha256",
+        ):
+            state.pop(key, None)
+        self.state_file.write_text(json.dumps(state) + "\n", encoding="utf-8")
+
+        tracing_psql = self.make_executable(
+            "psql-route-trace",
+            "#!/bin/sh\n"
+            'printf "route-down-executed\\n" >>"$HOLDFAST_TEST_LIFECYCLE_LOG"\n'
+            'printf "ok\\n"\n',
+        )
+        rejected = self.run_close_route(
+            environment=self.environment(HOLDFAST_PSQL_BIN=str(tracing_psql))
+        )
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn("route-down SQL differs from release evidence", rejected.stderr)
+        calls = (
+            self.lifecycle_log.read_text(encoding="utf-8")
+            if self.lifecycle_log.exists()
+            else ""
+        )
+        self.assertNotIn("route-down-executed", calls)
+        self.assertFalse(
+            (
+                self.state_dir
+                / f"ROUTE-CLOSE-PREIMAGE-{route_identity}.jsonl"
+            ).exists()
+        )
+
     def test_activate_services_remains_compatible_but_does_not_expand_the_subset(self) -> None:
         result = self.run_rollback(activate=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

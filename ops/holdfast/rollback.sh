@@ -587,8 +587,21 @@ verify_closed_bracket() {
   verify_database_absent
 }
 
+validate_route_down_authority_for_execution() {
+  local expected_route_down
+  require_root_file "$backup/RELEASE-EVIDENCE.json"
+  require_root_file "$route_down_authority"
+  expected_route_down=$(jq -er \
+    '.route_down_sha256 | select(type == "string" and test("^[0-9a-f]{64}$"))' \
+    "$backup/RELEASE-EVIDENCE.json") || \
+    holdfast_die "release evidence lacks a valid route-down authority"
+  [[ "$expected_route_down" == "$(holdfast_sha256 "$route_down_authority")" ]] || \
+    holdfast_die "route-down SQL differs from release evidence"
+}
+
 execute_frozen_route_down() {
   local temporary target status
+  validate_route_down_authority_for_execution
   temporary="$state_dir/.ROUTE-CLOSE-DOWN.$$"
   if [[ -e "$route_preimage" || -L "$route_preimage" ]]; then
     [[ -f "$route_preimage" && ! -L "$route_preimage" ]] || holdfast_die "unsafe route-close preimage evidence"

@@ -898,9 +898,7 @@ complete_runtime_caller_recovery() {
     require_root_file "$runtime_recovery_archive"
     original_state_sha=$(holdfast_sha256 "$runtime_recovery_archive")
     if [[ "$successor_recovery" == "true" ]]; then
-      [[ -f "$state_file" && ! -L "$state_file" && \
-        "$(holdfast_sha256 "$state_file")" == "$predecessor_current_sha" ]] || \
-        holdfast_die "runtime backup recovery archive lacks predecessor CURRENT"
+      restore_immediate_predecessor_current "$runtime_recovery_archive"
     else
       [[ ! -e "$state_file" && ! -L "$state_file" ]] || \
         holdfast_die "runtime backup recovery archive has an unexpected active CURRENT"
@@ -987,9 +985,10 @@ if [[ -f "$runtime_caller_receipt" && ! -L "$runtime_caller_receipt" ]]; then
       holdfast_die "runtime backup recovery completion requires non-legacy restore mode"
     validate_runtime_caller_authority "$runtime_recovery_archive"
     if [[ "$successor_recovery" == "true" ]]; then
-      [[ -f "$state_file" && ! -L "$state_file" && \
-        "$(holdfast_sha256 "$state_file")" == "$predecessor_current_sha" ]] || \
-        holdfast_die "completed successor runtime recovery CURRENT differs from predecessor"
+      require_root_file "$state_file"
+      [[ "$(holdfast_sha256 "$state_file")" == "$predecessor_current_sha" || \
+        "$(holdfast_sha256 "$state_file")" == "$(holdfast_sha256 "$runtime_recovery_archive")" ]] || \
+        holdfast_die "successor runtime recovery CURRENT differs from predecessor and archive"
     else
       [[ ! -e "$state_file" && ! -L "$state_file" ]] || \
         holdfast_die "completed first-apply runtime recovery unexpectedly has CURRENT"

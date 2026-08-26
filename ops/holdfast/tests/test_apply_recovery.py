@@ -810,6 +810,49 @@ class ApplyRecoveryTests(unittest.TestCase):
         current_path.write_text(json.dumps(current) + "\n", encoding="utf-8")
         return predecessor_bytes
 
+    def install_successor_runtime_caller_state(self) -> tuple[bytes, bytes]:
+        predecessor_bytes = self.install_successor_activation_failed_state()
+        caller = self.backup / "RUNTIME-BACKUP-CALLER-ARMED.receipt"
+        caller_values = dict(
+            line.split("=", 1)
+            for line in caller.read_text(encoding="utf-8").splitlines()
+        )
+        current_path = self.state / "CURRENT.json"
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        current.update(
+            {
+                "state": "runtime_backup_armed",
+                "runtime_backup_armed_at": caller_values["armed_at"],
+                "dry_run_dir": caller_values["dry_run_dir"],
+                "runtime_backup_dir": caller_values["runtime_backup_dir"],
+                "runtime_backup_caller_armed_receipt": caller.name,
+                "runtime_backup_caller_armed_receipt_sha256": sha256(caller),
+                "runtime_backup_armed_receipt": caller_values[
+                    "runtime_backup_armed_receipt"
+                ],
+                "release_env_sha256": caller_values["release_env_sha256"],
+                "release_evidence_sha256": caller_values[
+                    "release_evidence_sha256"
+                ],
+                "dry_run_receipt_sha256": caller_values[
+                    "dry_run_receipt_sha256"
+                ],
+                "targets_sha256": caller_values["targets_sha256"],
+                "apply_preimages_sha256": caller_values[
+                    "apply_preimages_sha256"
+                ],
+                "apply_absent_sha256": caller_values["apply_absent_sha256"],
+                "render_inputs_sha256": caller_values["render_inputs_sha256"],
+                "stop_authority_contract": caller_values[
+                    "stop_authority_contract"
+                ],
+                "ingress_opened": False,
+            }
+        )
+        runtime_bytes = (json.dumps(current) + "\n").encode()
+        current_path.write_bytes(runtime_bytes)
+        return predecessor_bytes, runtime_bytes
+
     def install_estate_rollback_recovery_state(self) -> Path:
         (self.backup / "TARGETS.sha256").write_bytes(
             (self.backup / "estate/APPLIED-TARGETS.sha256").read_bytes()
@@ -1253,45 +1296,8 @@ class ApplyRecoveryTests(unittest.TestCase):
         self.assertEqual(self.recovery_mutations(), mutations)
 
     def test_successor_runtime_caller_restore_boundary_is_adopted(self) -> None:
-        predecessor_bytes = self.install_successor_activation_failed_state()
-        caller = self.backup / "RUNTIME-BACKUP-CALLER-ARMED.receipt"
-        caller_values = dict(
-            line.split("=", 1)
-            for line in caller.read_text(encoding="utf-8").splitlines()
-        )
+        predecessor_bytes, _ = self.install_successor_runtime_caller_state()
         current_path = self.state / "CURRENT.json"
-        current = json.loads(current_path.read_text(encoding="utf-8"))
-        current.update(
-            {
-                "state": "runtime_backup_armed",
-                "runtime_backup_armed_at": caller_values["armed_at"],
-                "dry_run_dir": caller_values["dry_run_dir"],
-                "runtime_backup_dir": caller_values["runtime_backup_dir"],
-                "runtime_backup_caller_armed_receipt": caller.name,
-                "runtime_backup_caller_armed_receipt_sha256": sha256(caller),
-                "runtime_backup_armed_receipt": caller_values[
-                    "runtime_backup_armed_receipt"
-                ],
-                "release_env_sha256": caller_values["release_env_sha256"],
-                "release_evidence_sha256": caller_values[
-                    "release_evidence_sha256"
-                ],
-                "dry_run_receipt_sha256": caller_values[
-                    "dry_run_receipt_sha256"
-                ],
-                "targets_sha256": caller_values["targets_sha256"],
-                "apply_preimages_sha256": caller_values[
-                    "apply_preimages_sha256"
-                ],
-                "apply_absent_sha256": caller_values["apply_absent_sha256"],
-                "render_inputs_sha256": caller_values["render_inputs_sha256"],
-                "stop_authority_contract": caller_values[
-                    "stop_authority_contract"
-                ],
-                "ingress_opened": False,
-            }
-        )
-        current_path.write_text(json.dumps(current) + "\n", encoding="utf-8")
 
         interrupted = self.recover(
             "restore",
@@ -1299,7 +1305,9 @@ class ApplyRecoveryTests(unittest.TestCase):
                 HOLDFAST_TEST_SIGKILL_AFTER_RUNTIME_PREDECESSOR_CURRENT_RESTORE="1"
             ),
         )
-        self.assertEqual(interrupted.returncode, -9, interrupted.stdout + interrupted.stderr)
+        self.assertEqual(
+            interrupted.returncode, -9, interrupted.stdout + interrupted.stderr
+        )
         self.assertEqual(current_path.read_bytes(), predecessor_bytes)
         self.assertEqual(len(list(self.state.glob("RUNTIME-BACKUP-ABORTED-*.json"))), 1)
         self.assertFalse(
@@ -1316,6 +1324,75 @@ class ApplyRecoveryTests(unittest.TestCase):
             len(list(self.state.glob("RUNTIME-BACKUP-RECOVERY-COMPLETE-*.receipt"))),
             1,
         )
+
+    def test_successor_runtime_caller_archive_boundary_is_adopted(self) -> None:
+        predecessor_bytes, runtime_bytes = self.install_successor_runtime_caller_state()
+        current_path = self.state / "CURRENT.json"
+
+        interrupted = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_SIGKILL_AFTER_SUCCESSOR_CURRENT_ARCHIVE="1"
+            ),
+        )
+        self.assertEqual(
+            interrupted.returncode, -9, interrupted.stdout + interrupted.stderr
+        )
+        self.assertEqual(current_path.read_bytes(), runtime_bytes)
+        archives = list(self.state.glob("RUNTIME-BACKUP-ABORTED-*.json"))
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(archives[0].read_bytes(), runtime_bytes)
+        self.assertFalse(
+            list(self.state.glob("RUNTIME-BACKUP-RECOVERY-COMPLETE-*.receipt"))
+        )
+
+        mutations = self.recovery_mutations()
+        estate_bytes = (self.estate / "deploy/docker-compose.yml").read_bytes()
+        resumed = self.recover("restore")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn("previously completed runtime backup recovery", resumed.stdout)
+        self.assertEqual(current_path.read_bytes(), predecessor_bytes)
+        self.assertEqual(
+            (self.estate / "deploy/docker-compose.yml").read_bytes(), estate_bytes
+        )
+        self.assertEqual(self.recovery_mutations(), mutations)
+        self.assertEqual(
+            len(list(self.state.glob("RUNTIME-BACKUP-RECOVERY-COMPLETE-*.receipt"))),
+            1,
+        )
+
+    def test_successor_runtime_caller_archive_rejects_unrelated_current(self) -> None:
+        _, runtime_bytes = self.install_successor_runtime_caller_state()
+        current_path = self.state / "CURRENT.json"
+        interrupted = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_SIGKILL_AFTER_SUCCESSOR_CURRENT_ARCHIVE="1"
+            ),
+        )
+        self.assertEqual(
+            interrupted.returncode, -9, interrupted.stdout + interrupted.stderr
+        )
+        archive = next(self.state.glob("RUNTIME-BACKUP-ABORTED-*.json"))
+        unrelated_bytes = b'{"schema_version":2,"state":"unrelated"}\n'
+        current_path.write_bytes(unrelated_bytes)
+
+        mutations = self.recovery_mutations()
+        estate_bytes = (self.estate / "deploy/docker-compose.yml").read_bytes()
+        rejected = self.recover("restore")
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn(
+            "CURRENT differs from predecessor and archive", rejected.stderr
+        )
+        self.assertEqual(current_path.read_bytes(), unrelated_bytes)
+        self.assertEqual(archive.read_bytes(), runtime_bytes)
+        self.assertFalse(
+            list(self.state.glob("RUNTIME-BACKUP-RECOVERY-COMPLETE-*.receipt"))
+        )
+        self.assertEqual(
+            (self.estate / "deploy/docker-compose.yml").read_bytes(), estate_bytes
+        )
+        self.assertEqual(self.recovery_mutations(), mutations)
 
     def test_successor_lineage_tamper_fails_before_recovery_mutation(self) -> None:
         self.install_successor_activation_failed_state()
