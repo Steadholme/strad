@@ -23,14 +23,16 @@ const HISTORY_BUDGET: usize = 4_608;
 const MAX_HISTORY_MESSAGES: usize = 32;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_LINE_BYTES: usize = 64 * 1024;
-const READINESS_INPUT_TOKENS: usize = 32_700;
-const READINESS_BODY_LIMIT: usize = 256 * 1024;
 const MODEL_CATALOG_BODY_LIMIT: usize = 256 * 1024;
 const MODEL_CATALOG_TTL: Duration = Duration::from_secs(60);
 const MODEL_CATALOG_FAILURE_TTL: Duration = Duration::from_secs(5);
 const MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
+// NewAPI bounds its own readiness work at two seconds. Leave transport and
+// scheduling headroom while staying below Strad's five-second readycheck.
+const NEWAPI_READINESS_TIMEOUT: Duration = Duration::from_secs(3);
 const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 const MODELS_PATH: &str = "/v1/models";
+const READINESS_PATH: &str = "/readyz";
 
 pub const SYSTEM_INSTRUCTION: &str = "You are Strad, a security-focused binary-analysis assistant. Answer only from the supplied Rikune evidence. Cite every factual claim with [ref:<id>]. Never invent an artifact, address, symbol, behavior, or finding. Clearly label hypotheses and uncertainty. Do not request, expose, or infer secrets, internal paths, raw binaries, memory dumps, credentials, or data from another analysis. Dynamic execution and transformations are prohibited.";
 
@@ -52,10 +54,10 @@ pub struct NewApiClient {
     http: reqwest::Client,
     endpoint: String,
     models_endpoint: String,
+    readiness_endpoint: String,
     api_key: String,
     model: String,
     catalog: Arc<tokio::sync::Mutex<ModelCatalogCache>>,
-    readiness_request: Arc<FrozenChatRequest>,
 }
 
 impl std::fmt::Debug for NewApiClient {
@@ -63,6 +65,7 @@ impl std::fmt::Debug for NewApiClient {
         f.debug_struct("NewApiClient")
             .field("endpoint", &self.endpoint)
             .field("models_endpoint", &self.models_endpoint)
+            .field("readiness_endpoint", &self.readiness_endpoint)
             .field("model", &self.model)
             .finish_non_exhaustive()
     }
@@ -136,34 +139,6 @@ impl TokenBudgeter {
         }))
         // UTF-8 bytes are a safe, deliberately pessimistic runtime upper bound.
         .unwrap_or(value.len())
-    }
-
-    fn readiness_content(&self, target_tokens: usize) -> std::result::Result<String, String> {
-        let mut source = String::with_capacity(target_tokens.saturating_mul(5));
-        for counter in 0u32..4096 {
-            let digest = Sha256::digest(
-                [
-                    b"strad-newapi-readiness-v1:".as_slice(),
-                    &counter.to_be_bytes(),
-                ]
-                .concat(),
-            );
-            source.push_str(&hex::encode(digest));
-            source.push('\n');
-        }
-        let tokens = self.tokenizer.encode_with_special_tokens(&source);
-        if tokens.len() < target_tokens {
-            return Err("failed to construct the 32k NewAPI readiness probe".into());
-        }
-        let content = self
-            .tokenizer
-            .decode(tokens[..target_tokens].to_vec())
-            .map_err(|_| "failed to decode the 32k NewAPI readiness probe".to_string())?;
-        let verified = self.tokenizer.encode_with_special_tokens(&content).len();
-        if !(target_tokens.saturating_sub(8)..=target_tokens).contains(&verified) {
-            return Err("the 32k NewAPI readiness probe is not tokenizer-stable".into());
-        }
-        Ok(content)
     }
 
     pub fn truncate(&self, value: &str, limit: usize) -> (String, bool) {
@@ -360,7 +335,7 @@ impl TokenBudgeter {
 }
 
 impl NewApiClient {
-    pub fn new(config: &Config, budgeter: &TokenBudgeter) -> std::result::Result<Self, String> {
+    pub fn new(config: &Config) -> std::result::Result<Self, String> {
         if !valid_model_id(&config.newapi_model) {
             return Err("STRAD_NEWAPI_MODEL is invalid".to_string());
         }
@@ -371,24 +346,15 @@ impl NewApiClient {
             .build()
             .map_err(|_| "failed to build NewAPI client".to_string())?;
         let models_endpoint = derive_models_endpoint(&config.newapi_url)?;
-        let readiness_request = FrozenChatRequest {
-            model: config.newapi_model.clone(),
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: budgeter.readiness_content(READINESS_INPUT_TOKENS)?,
-            }],
-            max_tokens: 1,
-            stream: true,
-            user: hex::encode(Sha256::digest(b"strad-readiness")),
-        };
+        let readiness_endpoint = derive_readiness_endpoint(&config.newapi_url)?;
         Ok(Self {
             http,
             endpoint: config.newapi_url.clone(),
             models_endpoint,
+            readiness_endpoint,
             api_key: config.newapi_key.clone(),
             model: config.newapi_model.clone(),
             catalog: Arc::new(tokio::sync::Mutex::new(ModelCatalogCache::default())),
-            readiness_request: Arc::new(readiness_request),
         })
     }
 
@@ -520,68 +486,34 @@ impl NewApiClient {
     }
 
     pub async fn readiness_probe(&self) -> Result<(), AppError> {
-        // Startup reaches this method with an empty cache and therefore refreshes.
-        // Routine /readyz probes share the bounded cache instead of queueing forced
-        // catalog fetches ahead of conversation traffic.
-        let models = self.models().await?;
-        if models
-            .binary_search_by(|available| available.as_str().cmp(self.model()))
-            .is_err()
-        {
+        let response = self
+            .http
+            .get(&self.readiness_endpoint)
+            .timeout(NEWAPI_READINESS_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| assistant_unavailable())?;
+        if response.status() != reqwest::StatusCode::OK {
             return Err(assistant_unavailable());
         }
-        let response = self.send(&self.readiness_request).await?;
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        if !content_type.starts_with("text/event-stream") {
-            return Err(assistant_unavailable());
-        }
-        let mut stream = response.bytes_stream();
-        let mut buffered = Vec::new();
-        let mut total = 0usize;
-        let mut saw_choice = false;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| assistant_unavailable())?;
-            total = total.saturating_add(chunk.len());
-            if total > READINESS_BODY_LIMIT {
-                return Err(assistant_unavailable());
-            }
-            buffered.extend_from_slice(&chunk);
-            while let Some(end) = buffered.iter().position(|byte| *byte == b'\n') {
-                let line: Vec<u8> = buffered.drain(..=end).collect();
-                let line = std::str::from_utf8(&line)
-                    .map_err(|_| assistant_unavailable())?
-                    .trim();
-                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-                    continue;
-                };
-                if data == "[DONE]" {
-                    return saw_choice.then_some(()).ok_or_else(assistant_unavailable);
-                }
-                let event: serde_json::Value =
-                    serde_json::from_str(data).map_err(|_| assistant_unavailable())?;
-                if event.get("error").is_some() {
-                    return Err(assistant_unavailable());
-                }
-                saw_choice |= event
-                    .get("choices")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|choices| !choices.is_empty());
-            }
-        }
-        Err(assistant_unavailable())
+        Ok(())
     }
 }
 
 fn derive_models_endpoint(endpoint: &str) -> std::result::Result<String, String> {
+    derive_sibling_endpoint(endpoint, MODELS_PATH)
+}
+
+fn derive_readiness_endpoint(endpoint: &str) -> std::result::Result<String, String> {
+    derive_sibling_endpoint(endpoint, READINESS_PATH)
+}
+
+fn derive_sibling_endpoint(endpoint: &str, path: &str) -> std::result::Result<String, String> {
     let base = endpoint
         .strip_suffix(CHAT_COMPLETIONS_PATH)
         .filter(|base| !base.is_empty())
         .ok_or_else(|| "STRAD_NEWAPI_URL must end with /v1/chat/completions".to_string())?;
-    Ok(format!("{base}{MODELS_PATH}"))
+    Ok(format!("{base}{path}"))
 }
 
 fn valid_model_id(model: &str) -> bool {
@@ -809,7 +741,7 @@ mod tests {
         let mut config = crate::config::Config::for_tests(temporary.path().to_path_buf());
         config.newapi_url = format!("http://{address}/v1/chat/completions");
         config.newapi_model = model.to_string();
-        NewApiClient::new(&config, &TokenBudgeter::load().unwrap()).unwrap()
+        NewApiClient::new(&config).unwrap()
     }
 
     #[test]
@@ -855,18 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_probe_contains_a_real_32k_token_prompt() {
-        let budgeter = TokenBudgeter::load().unwrap();
-        let content = budgeter.readiness_content(READINESS_INPUT_TOKENS).unwrap();
-        let exact = budgeter
-            .tokenizer
-            .encode_with_special_tokens(&content)
-            .len();
-        assert!((READINESS_INPUT_TOKENS - 8..=READINESS_INPUT_TOKENS).contains(&exact));
-    }
-
-    #[test]
-    fn model_ids_and_models_endpoint_are_strictly_bounded() {
+    fn model_ids_and_derived_endpoints_are_strictly_bounded() {
         assert!(valid_model_id("glm-5.2"));
         assert!(valid_model_id("vendor/model_name:v1"));
         assert!(valid_model_id(&"a".repeat(128)));
@@ -879,7 +800,12 @@ mod tests {
             derive_models_endpoint("http://newapi:9080/v1/chat/completions").unwrap(),
             "http://newapi:9080/v1/models"
         );
+        assert_eq!(
+            derive_readiness_endpoint("http://newapi:9080/v1/chat/completions").unwrap(),
+            "http://newapi:9080/readyz"
+        );
         assert!(derive_models_endpoint("http://newapi:9080/v1/responses").is_err());
+        assert!(derive_readiness_endpoint("http://newapi:9080/v1/responses").is_err());
     }
 
     #[test]
@@ -1073,52 +999,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_posts_the_full_32k_probe_with_one_output_token() {
+    async fn readiness_checks_only_newapi_readyz_without_auth_or_body() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let budgeter = TokenBudgeter::load().unwrap();
-        let expected_content = budgeter.readiness_content(READINESS_INPUT_TOKENS).unwrap();
-        let server_expected = expected_content.clone();
         let server = tokio::spawn(async move {
-            let (mut catalog_socket, _) = listener.accept().await.unwrap();
-            let (catalog_headers, catalog_body) = read_request(&mut catalog_socket).await;
-            assert!(catalog_headers.starts_with("GET /v1/models HTTP/1.1\r\n"));
-            assert!(catalog_headers
-                .to_ascii_lowercase()
-                .contains("authorization: bearer nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"));
-            assert!(catalog_body.is_empty());
-            write_json_response(
-                &mut catalog_socket,
-                "200 OK",
-                br#"{"success":true,"object":"list","data":[{"id":"test-model","supported_endpoint_types":["openai"]}]}"#,
-            )
-            .await;
-
             let (mut socket, _) = listener.accept().await.unwrap();
-            let (headers, request_body) = read_request(&mut socket).await;
-            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
-            assert!(headers
-                .to_ascii_lowercase()
-                .contains("authorization: bearer nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"));
-            let body: serde_json::Value = serde_json::from_slice(&request_body).unwrap();
-            assert_eq!(body["max_tokens"], 1);
-            assert_eq!(body["stream"], true);
-            assert_eq!(body["model"], "test-model");
-            assert_eq!(body["messages"][0]["content"], server_expected);
-            let events =
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                events.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.write_all(events).await.unwrap();
+            let (headers, body) = read_request(&mut socket).await;
+            assert!(headers.starts_with("GET /readyz HTTP/1.1\r\n"));
+            assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+            assert!(body.is_empty());
+            write_json_response(&mut socket, "200 OK", br#"{"status":"ready"}"#).await;
         });
-        let temporary = tempfile::tempdir().unwrap();
-        let mut config = crate::config::Config::for_tests(temporary.path().to_path_buf());
-        config.newapi_url = format!("http://{address}/v1/chat/completions");
-        let client = NewApiClient::new(&config, &budgeter).unwrap();
+        let client = client_for(address, "test-model");
         client.readiness_probe().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_newapi_non_ok_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut socket).await;
+            write_json_response(&mut socket, "503 Service Unavailable", br#"{}"#).await;
+        });
+        let client = client_for(address, "test-model");
+        assert_eq!(
+            client.readiness_probe().await.unwrap_err().code(),
+            "assistant_unavailable"
+        );
         server.await.unwrap();
     }
 

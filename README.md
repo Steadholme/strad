@@ -9,6 +9,10 @@ and records the user's explicit choice on every turn. `STRAD_NEWAPI_MODEL` remai
 release-pinned default (`glm-5.2` for the current release); retries always reuse the recorded model
 and never fail over silently.
 
+Startup and `/readyz` check only NewAPI's own `/readyz` endpoint. Health probes never request a
+model catalog or create a billable chat completion. Catalog, credential, selected-model, and
+provider validity are checked on demand when the corresponding user action needs them.
+
 ## Repository layout
 
 - `src/`, `templates/`, and `static/`: the Rust service and server-rendered workbench.

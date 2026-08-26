@@ -1210,7 +1210,7 @@ async fn postgres_chat_terminal_citation_retry_delete_replay_and_promote_order()
     let engine = ChatEngine::new(
         store.clone(),
         BridgeClient::new(&config).unwrap(),
-        NewApiClient::new(&config, &budgeter).unwrap(),
+        NewApiClient::new(&config).unwrap(),
         budgeter,
     );
     assert!(engine.run_once().await.unwrap());

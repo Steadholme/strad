@@ -62,7 +62,7 @@ impl AppState {
         let bridge = BridgeClient::new(&config)?;
         let verdict = VerdictClient::new(&config)?;
         let budgeter = TokenBudgeter::load()?;
-        let newapi = NewApiClient::new(&config, &budgeter)?;
+        let newapi = NewApiClient::new(&config)?;
         let templates = TemplateRenderer::new(config.template_root.clone())
             .map_err(|_| "failed to initialize SSR renderer".to_string())?;
         let upload = UploadService::new(&config, store.clone(), bridge.clone())
