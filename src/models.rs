@@ -118,6 +118,7 @@ pub struct Turn {
     pub client_seq: i64,
     pub operation_id: Uuid,
     pub request_sha256: String,
+    pub model_alias: String,
     pub state: String,
     pub context_marker: Option<String>,
     pub context_sha256: Option<String>,
@@ -206,4 +207,5 @@ pub struct UpdatePersonaInput {
 pub struct CreateTurnInput {
     pub client_seq: i64,
     pub message: String,
+    pub model: Option<String>,
 }

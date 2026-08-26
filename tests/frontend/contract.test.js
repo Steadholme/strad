@@ -58,6 +58,8 @@ test('templates bind endpoint-specific server-issued operation ids', () => {
   assert.match(conv, /data-wb-new-session>[\s\S]*?value="\{\{ create_conversation_operation_id \}\}"/);
   assert.match(conv, /value="\{\{ persona_operation_id \}\}"/);
   assert.match(conv, /value="\{\{ turn_operation_id \}\}"/);
+  assert.match(conv, /select[^>]*name="model"[^>]*data-wb-model-select/, 'conversation exposes a model selector');
+  assert.match(conv, /value="\{\{ default_model \}\}"/, 'selector preserves the configured default without JavaScript');
   const wb = read('templates/workbench.html');
   assert.match(wb, /name="operation_id" value="\{\{ upload_create_operation_id \}\}"/);
   const list = read('templates/list.html');
@@ -76,4 +78,15 @@ test('SSE reader enforces a buffer cap, watchdog, and scoped cursor', () => {
   assert.match(core, /idleMs\s*\|\|\s*45000/, 'a ~45s idle watchdog');
   assert.match(core, /new AbortController\(\)/, 'a fresh AbortController per connect');
   assert.match(core, /rikune\.sse\.lid\./, 'analysis-scoped Last-Event-ID cursor in sessionStorage');
+});
+
+test('conversation loads the authenticated model catalog and submits the selected model', () => {
+  const core = read('static/rikune.js');
+  assert.match(core, /\/api\/analyses\/'\s*\+\s*encodeURIComponent\(analysisId\)\s*\+\s*'\/models'/);
+  assert.match(core, /model:\s*selectedModel/);
+  assert.match(core, /var selectedModel = models\.indexOf\(previous\) >= 0 \? previous : '';/, 'a removed model never silently falls back');
+  assert.match(core, /err\.code === 'invalid_model'[\s\S]*?modelSelect\.value = '';/, 'stale selections are cleared before refresh');
+  assert.match(core, /The previous selection is unavailable\. Choose a model for this turn\./, 'missing selections require an explicit choice');
+  assert.match(core, /removeChild\(optimisticUser\)/, 'rejected turns remove optimistic UI state');
+  assert.match(core, /invalid_model:/, 'a stale selection has a stable safe error');
 });

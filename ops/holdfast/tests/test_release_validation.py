@@ -79,6 +79,23 @@ class AnalyzerImageBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "RIKUNE_ACCEPTANCE_SUBJECT"):
             render.validate_release(invalid, False)
 
+    def test_release_rejects_model_alias_outside_runtime_policy(self) -> None:
+        for model in (
+            "",
+            "bad model",
+            "model?query",
+            "model\\alias",
+            "模型",
+            "a" * 129,
+            "REQUIRED_existing_newapi_alias",
+        ):
+            invalid = copy.deepcopy(self.release)
+            invalid["STRAD_NEWAPI_MODEL"] = model
+            with self.subTest(model=model), self.assertRaisesRegex(
+                SystemExit, "STRAD_NEWAPI_MODEL"
+            ):
+                render.validate_release(invalid, False)
+
     def test_release_rejects_malformed_placeholder_or_privileged_acceptance_subject(
         self,
     ) -> None:

@@ -29,6 +29,7 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST = re.compile(r"^[^\s:@]+(?:/[^\s:@]+)+@sha256:[0-9a-f]{64}$")
 RIKUNE_ACCEPTANCE_SUBJECT = re.compile(r"^user:usr_[A-Za-z0-9_-]{43}$")
+MODEL_ALIAS = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 PRIVILEGED_ACCEPTANCE_SUBJECTS = frozenset({"user:u_admin", "user:w33d"})
 
 MUTATED_PATHS = (
@@ -259,7 +260,7 @@ def validate_release(values: dict[str, str], catalog_only: bool) -> None:
     if not HEX40.fullmatch(values["STRAD_REVISION"]):
         fail("STRAD_REVISION must be a 40-character lowercase commit id")
     model = values["STRAD_NEWAPI_MODEL"]
-    if len(model) > 128 or re.search(r"\s", model) or model.startswith("REQUIRED"):
+    if not MODEL_ALIAS.fullmatch(model) or model.startswith("REQUIRED"):
         fail("STRAD_NEWAPI_MODEL must be a pinned existing alias")
     if values["ACCESS_GOVERNANCE_IMAGE"] == values["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"]:
         fail("Access Governance candidate and rollback images must differ")

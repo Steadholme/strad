@@ -124,6 +124,7 @@ pub fn router(state: AppState) -> Router {
         .route("/analyses/{id}/stages", get(analysis_stages))
         .route("/analyses/{id}/conversation", get(analysis_conversation))
         .route("/api/analyses/{id}/context-preview", get(context_preview))
+        .route("/api/analyses/{id}/models", get(analysis_models))
         .route("/api/analyses/{id}/events", get(analysis_events))
         .route("/api/analyses/{id}/promote", post(promote_analysis))
         .route("/api/analyses/{id}/delete", post(delete_analysis))
@@ -978,6 +979,7 @@ async fn analysis_conversation(
                 "conversations_json": conversations,
                 "selected_conversation": selected_conversation,
                 "selected_conversation_id": selected_conversation_id,
+                "default_model": state.newapi.model(),
                 "next_client_seq": next_client_seq,
                 "messages": messages,
                 "messages_json": messages
@@ -985,6 +987,32 @@ async fn analysis_conversation(
         )
         .await?;
     html_with_csrf(html, &csrf)
+}
+
+async fn analysis_models(
+    State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(analysis_id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    state
+        .store
+        .get_analysis(&identity.subject, analysis_id)
+        .await?;
+    state
+        .verdict
+        .authorize(
+            &identity,
+            "rikune.conversation.use",
+            "rikune-conversation",
+            &format!("analysis:{analysis_id}"),
+            Risk::Medium,
+        )
+        .await?;
+    let models = state.newapi.available_models().await?;
+    Ok(Json(json!({
+        "default_model": state.newapi.model(),
+        "models": models,
+    })))
 }
 
 async fn context_preview(
@@ -1383,6 +1411,7 @@ async fn update_persona(
 struct TurnForm {
     client_seq: i64,
     message: String,
+    model: Option<String>,
     csrf_token: String,
     operation_id: Uuid,
 }
@@ -1418,6 +1447,7 @@ async fn create_turn(
             CreateTurnInput {
                 client_seq: form.client_seq,
                 message: form.message,
+                model: form.model,
             },
             form.operation_id,
         )
@@ -1451,6 +1481,28 @@ async fn create_turn(
         &identity.subject,
         &body,
     );
+    if let Some(replay) = state
+        .store
+        .idempotency_replay(
+            &identity.subject,
+            "POST /api/analyses/:id/conversations/:cid/turns",
+            operation_id,
+            &request_sha,
+        )
+        .await?
+    {
+        if wants_html(&headers) {
+            return redirect(&format!(
+                "/analyses/{analysis_id}/conversation?conversation_id={conversation_id}"
+            ));
+        }
+        return replay_response(replay, &headers);
+    }
+    let selected_model = input
+        .model
+        .as_deref()
+        .unwrap_or_else(|| state.newapi.model());
+    state.newapi.validate_model(selected_model).await?;
     let turn = state
         .store
         .create_turn(
@@ -1460,13 +1512,18 @@ async fn create_turn(
             operation_id,
             input.client_seq,
             &request_sha,
+            selected_model,
             &input.message,
         )
         .await?;
-    let location = format!(
-        "/api/analyses/{analysis_id}/conversations/{conversation_id}/turns/{}",
-        turn.id
-    );
+    let location = if wants_html(&headers) {
+        format!("/analyses/{analysis_id}/conversation?conversation_id={conversation_id}")
+    } else {
+        format!(
+            "/api/analyses/{analysis_id}/conversations/{conversation_id}/turns/{}",
+            turn.id
+        )
+    };
     mutation_success(
         &headers,
         StatusCode::ACCEPTED,

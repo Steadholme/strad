@@ -1,4 +1,8 @@
-use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{
+    panic::AssertUnwindSafe,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures_util::StreamExt;
 use reqwest::redirect::Policy;
@@ -21,6 +25,12 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_LINE_BYTES: usize = 64 * 1024;
 const READINESS_INPUT_TOKENS: usize = 32_700;
 const READINESS_BODY_LIMIT: usize = 256 * 1024;
+const MODEL_CATALOG_BODY_LIMIT: usize = 256 * 1024;
+const MODEL_CATALOG_TTL: Duration = Duration::from_secs(60);
+const MODEL_CATALOG_FAILURE_TTL: Duration = Duration::from_secs(5);
+const MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
+const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+const MODELS_PATH: &str = "/v1/models";
 
 pub const SYSTEM_INSTRUCTION: &str = "You are Strad, a security-focused binary-analysis assistant. Answer only from the supplied Rikune evidence. Cite every factual claim with [ref:<id>]. Never invent an artifact, address, symbol, behavior, or finding. Clearly label hypotheses and uncertainty. Do not request, expose, or infer secrets, internal paths, raw binaries, memory dumps, credentials, or data from another analysis. Dynamic execution and transformations are prohibited.";
 
@@ -41,8 +51,10 @@ impl std::fmt::Debug for TokenBudgeter {
 pub struct NewApiClient {
     http: reqwest::Client,
     endpoint: String,
+    models_endpoint: String,
     api_key: String,
     model: String,
+    catalog: Arc<tokio::sync::Mutex<ModelCatalogCache>>,
     readiness_request: Arc<FrozenChatRequest>,
 }
 
@@ -50,9 +62,17 @@ impl std::fmt::Debug for NewApiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NewApiClient")
             .field("endpoint", &self.endpoint)
+            .field("models_endpoint", &self.models_endpoint)
             .field("model", &self.model)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Default)]
+struct ModelCatalogCache {
+    fetched_at: Option<Instant>,
+    failed_at: Option<Instant>,
+    models: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -341,12 +361,16 @@ impl TokenBudgeter {
 
 impl NewApiClient {
     pub fn new(config: &Config, budgeter: &TokenBudgeter) -> std::result::Result<Self, String> {
+        if !valid_model_id(&config.newapi_model) {
+            return Err("STRAD_NEWAPI_MODEL is invalid".to_string());
+        }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(180))
             .redirect(Policy::none())
             .build()
             .map_err(|_| "failed to build NewAPI client".to_string())?;
+        let models_endpoint = derive_models_endpoint(&config.newapi_url)?;
         let readiness_request = FrozenChatRequest {
             model: config.newapi_model.clone(),
             messages: vec![ChatMessage {
@@ -360,8 +384,10 @@ impl NewApiClient {
         Ok(Self {
             http,
             endpoint: config.newapi_url.clone(),
+            models_endpoint,
             api_key: config.newapi_key.clone(),
             model: config.newapi_model.clone(),
+            catalog: Arc::new(tokio::sync::Mutex::new(ModelCatalogCache::default())),
             readiness_request: Arc::new(readiness_request),
         })
     }
@@ -370,16 +396,111 @@ impl NewApiClient {
         &self.model
     }
 
+    pub async fn available_models(&self) -> Result<Vec<String>, AppError> {
+        self.models().await
+    }
+
+    pub async fn validate_model(&self, model: &str) -> Result<(), AppError> {
+        if !valid_model_id(model) {
+            return Err(invalid_model());
+        }
+        let models = self.available_models().await?;
+        if models
+            .binary_search_by(|available| available.as_str().cmp(model))
+            .is_err()
+        {
+            return Err(invalid_model());
+        }
+        Ok(())
+    }
+
     pub async fn send_stream(
         &self,
         frozen: &FrozenChatRequest,
     ) -> Result<reqwest::Response, AppError> {
-        if frozen.model != self.model || frozen.max_tokens != OUTPUT_BUDGET || !frozen.stream {
+        if frozen.max_tokens != OUTPUT_BUDGET || !frozen.stream {
             return Err(AppError::Invariant(
-                "frozen chat request violates model policy",
+                "frozen chat request violates response policy",
             ));
         }
+        self.validate_model(&frozen.model).await?;
         self.send(frozen).await
+    }
+
+    async fn models(&self) -> Result<Vec<String>, AppError> {
+        let mut catalog = self.catalog.lock().await;
+        if let Some(fetched_at) = catalog.fetched_at {
+            if fetched_at.elapsed() < MODEL_CATALOG_TTL {
+                return Ok(catalog.models.clone());
+            }
+        }
+        if catalog
+            .failed_at
+            .is_some_and(|failed_at| failed_at.elapsed() < MODEL_CATALOG_FAILURE_TTL)
+        {
+            return Err(assistant_unavailable());
+        }
+
+        match self.fetch_models().await {
+            Ok(models) => {
+                catalog.models = models.clone();
+                catalog.fetched_at = Some(Instant::now());
+                catalog.failed_at = None;
+                Ok(models)
+            }
+            Err(error) => {
+                // An expired catalog must never authorize a model after refresh failure.
+                catalog.models.clear();
+                catalog.fetched_at = None;
+                catalog.failed_at = Some(Instant::now());
+                Err(error)
+            }
+        }
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<String>, AppError> {
+        let response = self
+            .http
+            .get(&self.models_endpoint)
+            .bearer_auth(&self.api_key)
+            .timeout(MODEL_CATALOG_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| assistant_unavailable())?;
+        if response.status() != reqwest::StatusCode::OK {
+            // Raw provider error bodies are deliberately not read, stored, or logged.
+            return Err(assistant_unavailable());
+        }
+        if !response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+            })
+        {
+            return Err(assistant_unavailable());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MODEL_CATALOG_BODY_LIMIT as u64)
+        {
+            return Err(assistant_unavailable());
+        }
+
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| assistant_unavailable())?;
+            if body.len().saturating_add(chunk.len()) > MODEL_CATALOG_BODY_LIMIT {
+                return Err(assistant_unavailable());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        parse_model_catalog(&body)
     }
 
     async fn send(&self, request: &FrozenChatRequest) -> Result<reqwest::Response, AppError> {
@@ -399,6 +520,16 @@ impl NewApiClient {
     }
 
     pub async fn readiness_probe(&self) -> Result<(), AppError> {
+        // Startup reaches this method with an empty cache and therefore refreshes.
+        // Routine /readyz probes share the bounded cache instead of queueing forced
+        // catalog fetches ahead of conversation traffic.
+        let models = self.models().await?;
+        if models
+            .binary_search_by(|available| available.as_str().cmp(self.model()))
+            .is_err()
+        {
+            return Err(assistant_unavailable());
+        }
         let response = self.send(&self.readiness_request).await?;
         let content_type = response
             .headers()
@@ -443,6 +574,55 @@ impl NewApiClient {
         }
         Err(assistant_unavailable())
     }
+}
+
+fn derive_models_endpoint(endpoint: &str) -> std::result::Result<String, String> {
+    let base = endpoint
+        .strip_suffix(CHAT_COMPLETIONS_PATH)
+        .filter(|base| !base.is_empty())
+        .ok_or_else(|| "STRAD_NEWAPI_URL must end with /v1/chat/completions".to_string())?;
+    Ok(format!("{base}{MODELS_PATH}"))
+}
+
+fn valid_model_id(model: &str) -> bool {
+    crate::config::valid_model_alias(model)
+}
+
+fn parse_model_catalog(body: &[u8]) -> Result<Vec<String>, AppError> {
+    let payload: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| assistant_unavailable())?;
+    let object = payload.as_object().ok_or_else(assistant_unavailable)?;
+    if object.get("success") != Some(&serde_json::Value::Bool(true))
+        || object.get("object").and_then(serde_json::Value::as_str) != Some("list")
+    {
+        return Err(assistant_unavailable());
+    }
+    let data = object
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(assistant_unavailable)?;
+
+    let mut models = Vec::new();
+    for entry in data {
+        let id = entry.as_object().and_then(|model| {
+            supports_chat_completions(model)
+                .then(|| model.get("id").and_then(serde_json::Value::as_str))
+                .flatten()
+        });
+        if let Some(id) = id.filter(|id| valid_model_id(id)) {
+            models.push(id.to_string());
+        }
+    }
+    models.sort_unstable();
+    models.dedup();
+    Ok(models)
+}
+
+fn supports_chat_completions(model: &serde_json::Map<String, serde_json::Value>) -> bool {
+    model
+        .get("supported_endpoint_types")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|types| types.iter().any(|value| value.as_str() == Some("openai")))
 }
 
 pub fn response_limits() -> (usize, usize) {
@@ -543,10 +723,18 @@ fn assistant_unavailable() -> AppError {
     )
 }
 
+fn invalid_model() -> AppError {
+    AppError::invalid(
+        "invalid_model",
+        "The selected model is not available for this analysis.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use time::OffsetDateTime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use uuid::Uuid;
 
     fn message(seq: i64, role: &str, content: &str, turn: Uuid) -> Message {
@@ -570,6 +758,58 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0u8; 8192];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end])
+            .unwrap()
+            .to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while request.len() - header_end < content_length {
+            let mut chunk = [0u8; 8192];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&chunk[..count]);
+        }
+        (
+            headers,
+            request[header_end..header_end + content_length].to_vec(),
+        )
+    }
+
+    async fn write_json_response(socket: &mut tokio::net::TcpStream, status: &str, body: &[u8]) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(body).await.unwrap();
+    }
+
+    fn client_for(address: std::net::SocketAddr, model: &str) -> NewApiClient {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::for_tests(temporary.path().to_path_buf());
+        config.newapi_url = format!("http://{address}/v1/chat/completions");
+        config.newapi_model = model.to_string();
+        NewApiClient::new(&config, &TokenBudgeter::load().unwrap()).unwrap()
     }
 
     #[test]
@@ -625,50 +865,245 @@ mod tests {
         assert!((READINESS_INPUT_TOKENS - 8..=READINESS_INPUT_TOKENS).contains(&exact));
     }
 
+    #[test]
+    fn model_ids_and_models_endpoint_are_strictly_bounded() {
+        assert!(valid_model_id("glm-5.2"));
+        assert!(valid_model_id("vendor/model_name:v1"));
+        assert!(valid_model_id(&"a".repeat(128)));
+        assert!(!valid_model_id(""));
+        assert!(!valid_model_id(&"a".repeat(129)));
+        assert!(!valid_model_id("bad model"));
+        assert!(!valid_model_id("模型"));
+        assert!(!valid_model_id("model?variant=1"));
+        assert_eq!(
+            derive_models_endpoint("http://newapi:9080/v1/chat/completions").unwrap(),
+            "http://newapi:9080/v1/models"
+        );
+        assert!(derive_models_endpoint("http://newapi:9080/v1/responses").is_err());
+    }
+
+    #[test]
+    fn catalog_parser_filters_sorts_and_deduplicates_models() {
+        let payload = json!({
+            "success": true,
+            "object": "list",
+            "data": [
+                {"id":"z-model","supported_endpoint_types":["openai"]},
+                {"id":"response-only","supported_endpoint_types":["openai-response"]},
+                {"id":"a/model","supported_endpoint_types":["anthropic", "openai"]},
+                {"id":"legacy-model"},
+                {"id":"null-metadata","supported_endpoint_types":null},
+                {"id":"empty-metadata","supported_endpoint_types":[]},
+                {"id":"wrong-metadata","supported_endpoint_types":"openai"},
+                {"id":"bad model","supported_endpoint_types":["openai"]},
+                {"id":"z-model","supported_endpoint_types":["openai"]},
+                "string-model"
+            ]
+        });
+        let models = parse_model_catalog(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(models, vec!["a/model", "z-model"]);
+        assert!(!models.iter().any(|model| model == "response-only"));
+        assert!(!models.iter().any(|model| model == "bad model"));
+        assert_eq!(
+            parse_model_catalog(br#"{"success":false,"data":[]}"#)
+                .unwrap_err()
+                .code(),
+            "assistant_unavailable"
+        );
+        assert_eq!(
+            parse_model_catalog(br#"{"data":"not-an-array"}"#)
+                .unwrap_err()
+                .code(),
+            "assistant_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_uses_bearer_get_and_shared_fresh_cache() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (headers, body) = read_request(&mut socket).await;
+            assert!(headers.starts_with("GET /v1/models HTTP/1.1\r\n"));
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"));
+            assert!(body.is_empty());
+            write_json_response(
+                &mut socket,
+                "200 OK",
+                br#"{"success":true,"object":"list","data":[{"id":"glm-5.2","supported_endpoint_types":["openai"]}]}"#,
+            )
+            .await;
+        });
+        let client = client_for(address, "glm-5.2");
+        let cloned = client.clone();
+        assert_eq!(client.available_models().await.unwrap(), vec!["glm-5.2"]);
+        assert_eq!(cloned.available_models().await.unwrap(), vec!["glm-5.2"]);
+        client.validate_model("glm-5.2").await.unwrap();
+        assert_eq!(
+            client
+                .validate_model("missing-model")
+                .await
+                .unwrap_err()
+                .code(),
+            "invalid_model"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_rejects_non_json_and_declared_oversize_responses() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut wrong_type, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut wrong_type).await;
+            wrong_type
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+
+            let (mut oversized, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut oversized).await;
+            oversized
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 262145\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let client = client_for(address, "glm-5.2");
+        assert_eq!(
+            client.available_models().await.unwrap_err().code(),
+            "assistant_unavailable"
+        );
+        client.catalog.lock().await.failed_at = None;
+        assert_eq!(
+            client.available_models().await.unwrap_err().code(),
+            "assistant_unavailable"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_posts_the_selected_catalog_model_without_failover() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut catalog_socket, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut catalog_socket).await;
+            write_json_response(
+                &mut catalog_socket,
+                "200 OK",
+                br#"{"success":true,"object":"list","data":[{"id":"alternate-model","supported_endpoint_types":["openai"]}]}"#,
+            )
+            .await;
+
+            let (mut chat_socket, _) = listener.accept().await.unwrap();
+            let (headers, body) = read_request(&mut chat_socket).await;
+            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+            let request: FrozenChatRequest = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request.model, "alternate-model");
+            assert_eq!(request.max_tokens, OUTPUT_BUDGET);
+            assert!(request.stream);
+            write_json_response(&mut chat_socket, "200 OK", br#"{}"#).await;
+        });
+        let client = client_for(address, "glm-5.2");
+        let selected = FrozenChatRequest {
+            model: "alternate-model".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+            max_tokens: OUTPUT_BUDGET,
+            stream: true,
+            user: "pseudonymous".into(),
+        };
+        client.send_stream(&selected).await.unwrap();
+
+        let mut unlisted = selected;
+        unlisted.model = "unlisted-model".into();
+        assert_eq!(
+            client.send_stream(&unlisted).await.unwrap_err().code(),
+            "invalid_model"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_catalog_is_cleared_when_refresh_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut first).await;
+            write_json_response(
+                &mut first,
+                "200 OK",
+                br#"{"success":true,"object":"list","data":[{"id":"glm-5.2","supported_endpoint_types":["openai"]}]}"#,
+            )
+            .await;
+            let (mut second, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut second).await;
+            write_json_response(&mut second, "503 Service Unavailable", b"upstream error").await;
+        });
+        let client = client_for(address, "glm-5.2");
+        assert_eq!(client.available_models().await.unwrap(), vec!["glm-5.2"]);
+        {
+            let mut catalog = client.catalog.lock().await;
+            catalog.fetched_at = Some(Instant::now() - MODEL_CATALOG_TTL - Duration::from_secs(1));
+        }
+        assert_eq!(
+            client.available_models().await.unwrap_err().code(),
+            "assistant_unavailable"
+        );
+        assert_eq!(
+            client.available_models().await.unwrap_err().code(),
+            "assistant_unavailable"
+        );
+        let catalog = client.catalog.lock().await;
+        assert!(catalog.models.is_empty());
+        assert!(catalog.fetched_at.is_none());
+        assert!(catalog.failed_at.is_some());
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn readiness_posts_the_full_32k_probe_with_one_output_token() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let budgeter = TokenBudgeter::load().unwrap();
         let expected_content = budgeter.readiness_content(READINESS_INPUT_TOKENS).unwrap();
         let server_expected = expected_content.clone();
         let server = tokio::spawn(async move {
+            let (mut catalog_socket, _) = listener.accept().await.unwrap();
+            let (catalog_headers, catalog_body) = read_request(&mut catalog_socket).await;
+            assert!(catalog_headers.starts_with("GET /v1/models HTTP/1.1\r\n"));
+            assert!(catalog_headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"));
+            assert!(catalog_body.is_empty());
+            write_json_response(
+                &mut catalog_socket,
+                "200 OK",
+                br#"{"success":true,"object":"list","data":[{"id":"test-model","supported_endpoint_types":["openai"]}]}"#,
+            )
+            .await;
+
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let header_end = loop {
-                let mut chunk = [0u8; 8192];
-                let count = socket.read(&mut chunk).await.unwrap();
-                assert!(count > 0);
-                request.extend_from_slice(&chunk[..count]);
-                if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                    break index + 4;
-                }
-            };
-            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let (headers, request_body) = read_request(&mut socket).await;
+            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
             assert!(headers
                 .to_ascii_lowercase()
                 .contains("authorization: bearer nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"));
-            let content_length: usize = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(str::trim)
-                        .and_then(|value| value.parse().ok())
-                })
-                .unwrap();
-            while request.len() - header_end < content_length {
-                let mut chunk = [0u8; 8192];
-                let count = socket.read(&mut chunk).await.unwrap();
-                assert!(count > 0);
-                request.extend_from_slice(&chunk[..count]);
-            }
-            let body: serde_json::Value =
-                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request_body).unwrap();
             assert_eq!(body["max_tokens"], 1);
             assert_eq!(body["stream"], true);
+            assert_eq!(body["model"], "test-model");
             assert_eq!(body["messages"][0]["content"], server_expected);
             let events =
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";

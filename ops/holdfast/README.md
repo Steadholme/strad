@@ -19,7 +19,9 @@ The release env also pins:
 - the exact Access build-input, permission catalog, and package catalog hashes;
 - the independent acceptance account's exact canonical `user:usr_*` subject in
   `RIKUNE_ACCEPTANCE_SUBJECT`;
-- the 40-character Strad source revision and real NewAPI alias;
+- the 40-character Strad source revision and the real NewAPI default alias (`glm-5.2` for the
+  current release); the Web selector may expose other aliases returned for the same service key,
+  but retries never change a turn's recorded model;
 - the authority and supply-chain public-key hashes;
 - detached supply-chain evidence/signature hashes.
 

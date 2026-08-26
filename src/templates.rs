@@ -737,6 +737,7 @@ mod tests {
                     "create_conversation_operation_id":operation_id,
                     "persona_operation_id":uuid::Uuid::new_v4(),
                     "turn_operation_id":uuid::Uuid::new_v4(),
+                    "default_model":"glm-5.2",
                     "analysis_id":analysis_id,"analysis_json":analysis,
                     "selected_conversation_id":conversation_id,"next_client_seq":1,
                     "conversations":[],"conversations_json":[],"messages":[],"messages_json":[],

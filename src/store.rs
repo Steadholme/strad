@@ -21,8 +21,8 @@ const CHUNK_COLUMNS: &str =
     "upload_id,chunk_index,start_byte,end_byte,byte_size,sha256,storage_key,committed_at";
 const CONVERSATION_COLUMNS: &str =
     "id,analysis_id,owner_sub,title,persona_id,custom_persona,next_seq,created_at,updated_at";
-const TURN_COLUMNS: &str = "id,conversation_id,analysis_id,owner_sub,client_seq,operation_id,request_sha256,state,context_marker,context_sha256,context_pack,frozen_request,frozen_prompt_sha256,generation_lease_token,provider_attempt,error_code,created_at,updated_at";
-const TURN_COLUMNS_T: &str = "t.id,t.conversation_id,t.analysis_id,t.owner_sub,t.client_seq,t.operation_id,t.request_sha256,t.state,t.context_marker,t.context_sha256,t.context_pack,t.frozen_request,t.frozen_prompt_sha256,t.generation_lease_token,t.provider_attempt,t.error_code,t.created_at,t.updated_at";
+const TURN_COLUMNS: &str = "id,conversation_id,analysis_id,owner_sub,client_seq,operation_id,request_sha256,model_alias,state,context_marker,context_sha256,context_pack,frozen_request,frozen_prompt_sha256,generation_lease_token,provider_attempt,error_code,created_at,updated_at";
+const TURN_COLUMNS_T: &str = "t.id,t.conversation_id,t.analysis_id,t.owner_sub,t.client_seq,t.operation_id,t.request_sha256,t.model_alias,t.state,t.context_marker,t.context_sha256,t.context_pack,t.frozen_request,t.frozen_prompt_sha256,t.generation_lease_token,t.provider_attempt,t.error_code,t.created_at,t.updated_at";
 const MESSAGE_COLUMNS: &str = "id,turn_id,conversation_id,analysis_id,owner_sub,seq,role,client_seq,status,content,token_count,created_at,updated_at";
 const ARTIFACT_COLUMNS: &str = "id,analysis_id,owner_sub,upstream_artifact_id,artifact_type,artifact_ref,path,sha256,mime,metadata,created_at";
 
@@ -2066,6 +2066,7 @@ impl Store {
         operation_id: Uuid,
         client_seq: i64,
         request_sha256: &str,
+        model_alias: &str,
         message: &str,
     ) -> Result<Turn> {
         let mut tx = self.pool.begin().await?;
@@ -2109,8 +2110,8 @@ impl Store {
         let user_seq = conversation.next_seq;
         let assistant_seq = user_seq + 1;
         sqlx::query(
-            "INSERT INTO turns(id,conversation_id,analysis_id,owner_sub,client_seq,operation_id,request_sha256,state) \
-             VALUES($1,$2,$3,$4,$5,$6,$7,'accepted')",
+            "INSERT INTO turns(id,conversation_id,analysis_id,owner_sub,client_seq,operation_id,request_sha256,model_alias,state) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,'accepted')",
         )
         .bind(turn_id)
         .bind(conversation_id)
@@ -2119,6 +2120,7 @@ impl Store {
         .bind(client_seq)
         .bind(operation_id)
         .bind(request_sha256)
+        .bind(model_alias)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -2155,7 +2157,11 @@ impl Store {
         .bind(format!(
             "/api/analyses/{analysis_id}/conversations/{conversation_id}/turns/{turn_id}"
         ))
-        .bind(json!({"turn_id": turn_id, "state": "accepted"}))
+        .bind(json!({
+            "turn_id": turn_id,
+            "state": "accepted",
+            "model_alias": model_alias
+        }))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -2368,6 +2374,11 @@ impl Store {
         completion_tokens: i32,
         model: &str,
     ) -> Result<()> {
+        if model != turn.model_alias {
+            return Err(AppError::Invariant(
+                "turn model does not match the persisted model",
+            ));
+        }
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query(
             "UPDATE turns SET state=$3,error_code=$4,terminal_at=now(),generation_lease_token=NULL,\

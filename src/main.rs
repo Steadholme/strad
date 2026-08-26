@@ -66,7 +66,7 @@ async fn http_check(path: &'static str) -> Result<(), Box<dyn std::error::Error>
 fn runtime_contract() -> Result<(), Box<dyn std::error::Error>> {
     let model = std::env::var("STRAD_NEWAPI_MODEL")
         .map_err(|_| "STRAD_NEWAPI_MODEL is required for runtime-contract")?;
-    if model.is_empty() || model.len() > 128 || model.contains(char::is_whitespace) {
+    if !strad::config::valid_model_alias(&model) {
         return Err("STRAD_NEWAPI_MODEL is invalid".into());
     }
     let context_tokens: u32 = std::env::var("STRAD_NEWAPI_CONTEXT_TOKENS")

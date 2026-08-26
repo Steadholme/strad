@@ -55,7 +55,7 @@ impl ChatEngine {
                     Some("generation_interrupted"),
                     0,
                     assistant.token_count,
-                    self.newapi.model(),
+                    &turn.model_alias,
                 )
                 .await?;
             let _ = citation::resolve(&self.store, &self.bridge, &turn, &assistant).await;
@@ -73,7 +73,7 @@ impl ChatEngine {
                         Some("assistant_unavailable"),
                         0,
                         0,
-                        self.newapi.model(),
+                        &turn.model_alias,
                     )
                     .await?;
                 return Ok(true);
@@ -91,6 +91,11 @@ impl ChatEngine {
             let recomputed = hex::encode(Sha256::digest(encoded));
             if turn.frozen_prompt_sha256.as_deref() != Some(&recomputed) {
                 self.fail_claimed_turn(&turn, "frozen_prompt_mismatch", 0)
+                    .await?;
+                return Ok(true);
+            }
+            if request.model != turn.model_alias {
+                self.fail_claimed_turn(&turn, "frozen_model_mismatch", 0)
                     .await?;
                 return Ok(true);
             }
@@ -143,7 +148,7 @@ impl ChatEngine {
                 Some(error_code),
                 prompt_tokens,
                 0,
-                self.newapi.model(),
+                &turn.model_alias,
             )
             .await
     }
@@ -189,7 +194,7 @@ impl ChatEngine {
         self.materialize_context_artifacts(&turn.owner_sub, turn.analysis_id, &context)
             .await?;
         self.budgeter.build(
-            self.newapi.model(),
+            &turn.model_alias,
             &turn.owner_sub,
             &persona(&conversation),
             &user_message.content,
@@ -266,7 +271,7 @@ impl ChatEngine {
                         Some("assistant_unavailable"),
                         prompt_tokens as i32,
                         0,
-                        self.newapi.model(),
+                        &request.model,
                     )
                     .await?;
                 return Ok(());
@@ -358,7 +363,7 @@ impl ChatEngine {
                 error,
                 prompt_tokens as i32,
                 self.budgeter.count(&content) as i32,
-                self.newapi.model(),
+                &request.model,
             )
             .await?;
         let assistant = self.store.assistant_message(turn.id).await?;

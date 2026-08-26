@@ -141,6 +141,13 @@
               <label class="sr-only" for="wb-message">Your question</label>
               <textarea id="wb-message" name="message" rows="3" maxlength="8192" required placeholder="Ask about this binary…" data-wb-message></textarea>
               <div class="wb-composer__row">
+                <div class="wb-composer__controls">
+                  <label for="wb-model">Model</label>
+                  <select id="wb-model" class="select" name="model" required data-wb-model-select aria-describedby="wb-model-status">
+                    <option value="{{ default_model }}">{{ default_model }}</option>
+                  </select>
+                  <span class="hint" id="wb-model-status" data-wb-model-status aria-live="polite">Default model</span>
+                </div>
                 <span class="charcount" data-wb-charcount aria-hidden="true">0 / 8192</span>
                 <button type="submit" class="btn btn-primary btn-sm" data-wb-send>
                   Send
@@ -148,7 +155,7 @@
                 </button>
               </div>
             </form>
-            <p class="hint">The AI may be temporarily unavailable; your message is always saved so you can try again.</p>
+            <p class="hint">The selected model is recorded for this turn, and retries never switch models. The AI may be temporarily unavailable; accepted messages remain saved.</p>
           </div>
         </div>
 

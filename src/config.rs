@@ -5,7 +5,7 @@ pub const CHUNK_BYTES: i64 = 8_388_608;
 pub const OWNER_BYTES: i64 = 10 * 1024 * 1024 * 1024;
 pub const MAX_ANALYSES: i32 = 25;
 pub const MAX_IN_FLIGHT: i64 = 3;
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 pub const CANONICAL_HOST: &str = "analyze.w33d.xyz";
 pub const CANONICAL_ROUTE: &str = "rikune-root";
 pub const TOKENIZER_NAME: &str = "cl100k_base";
@@ -106,7 +106,7 @@ impl Config {
             9080,
         )?;
         let newapi_model = required("STRAD_NEWAPI_MODEL")?;
-        if newapi_model.len() > 128 || newapi_model.contains(char::is_whitespace) {
+        if !valid_model_alias(&newapi_model) {
             return Err("STRAD_NEWAPI_MODEL is invalid".to_string());
         }
         let newapi_context_tokens: u32 = required("STRAD_NEWAPI_CONTEXT_TOKENS")?
@@ -176,6 +176,14 @@ impl Config {
             session_ttl: Duration::from_secs(86400),
         }
     }
+}
+
+pub fn valid_model_alias(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 128
+        && model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
+        })
 }
 
 fn required(name: &str) -> std::result::Result<String, String> {
@@ -297,5 +305,16 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn model_aliases_use_one_shared_fail_closed_policy() {
+        assert!(valid_model_alias("glm-5.2"));
+        assert!(valid_model_alias("vendor/model_name:v1"));
+        assert!(!valid_model_alias(""));
+        assert!(!valid_model_alias("model with spaces"));
+        assert!(!valid_model_alias("model?query"));
+        assert!(!valid_model_alias("模型"));
+        assert!(!valid_model_alias(&"a".repeat(129)));
     }
 }

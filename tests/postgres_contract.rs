@@ -1,12 +1,12 @@
 use sha2::{Digest, Sha256};
-use sqlx::Executor;
+use sqlx::{Connection, Executor};
 use strad::{
     analysis::AnalysisController,
     bridge::BridgeClient,
     chat::ChatEngine,
     config::{Config, OWNER_BYTES},
     migrations,
-    newapi::{NewApiClient, TokenBudgeter},
+    newapi::{ChatMessage, FrozenChatRequest, NewApiClient, TokenBudgeter},
     store::{SampleDeleteClaim, Store},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1185,6 +1185,7 @@ async fn postgres_chat_terminal_citation_retry_delete_replay_and_promote_order()
             Uuid::new_v4(),
             1,
             &"5".repeat(64),
+            "test-model",
             "Explain the binary.",
         )
         .await
@@ -1230,7 +1231,7 @@ async fn postgres_chat_terminal_citation_retry_delete_replay_and_promote_order()
         )
     );
 
-    let cited = store
+    let frozen_model_mismatch = store
         .create_turn(
             &owner,
             created.analysis.id,
@@ -1238,6 +1239,110 @@ async fn postgres_chat_terminal_citation_retry_delete_replay_and_promote_order()
             Uuid::new_v4(),
             2,
             &"6".repeat(64),
+            "glm-5.2",
+            "Keep the selected model.",
+        )
+        .await
+        .unwrap();
+    let other_model_request = FrozenChatRequest {
+        model: "other-model".into(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: "bounded".into(),
+        }],
+        max_tokens: 2048,
+        stream: true,
+        user: "b".repeat(64),
+    };
+    let other_model_value = serde_json::to_value(&other_model_request).unwrap();
+    let other_model_sha = hex::encode(Sha256::digest(
+        serde_json::to_vec(&other_model_request).unwrap(),
+    ));
+    sqlx::query("UPDATE turns SET frozen_request=$2,frozen_prompt_sha256=$3 WHERE id=$1")
+        .bind(frozen_model_mismatch.id)
+        .bind(other_model_value)
+        .bind(other_model_sha)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(engine.run_once().await.unwrap());
+    let frozen_failure: (String, Option<String>) =
+        sqlx::query_as("SELECT state,error_code FROM turns WHERE id=$1")
+            .bind(frozen_model_mismatch.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        frozen_failure,
+        ("failed".into(), Some("frozen_model_mismatch".into()))
+    );
+
+    let selected_model = "glm-5.2";
+    let audited_operation = Uuid::new_v4();
+    let audited = store
+        .create_turn(
+            &owner,
+            created.analysis.id,
+            conversation.id,
+            audited_operation,
+            3,
+            &"7".repeat(64),
+            selected_model,
+            "Audit the selected model.",
+        )
+        .await
+        .unwrap();
+    assert_eq!(audited.model_alias, selected_model);
+    let replay = store
+        .idempotency_replay(
+            &owner,
+            "POST /api/analyses/:id/conversations/:cid/turns",
+            audited_operation,
+            &"7".repeat(64),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.body.unwrap()["model_alias"], selected_model);
+    let first_claim = store.claim_turn().await.unwrap().unwrap();
+    assert_eq!(first_claim.id, audited.id);
+    assert_eq!(first_claim.model_alias, selected_model);
+    store
+        .release_turn_for_retry(&first_claim, "test_retry")
+        .await
+        .unwrap();
+    let retry_claim = store.claim_turn().await.unwrap().unwrap();
+    assert_eq!(retry_claim.id, audited.id);
+    assert_eq!(retry_claim.model_alias, selected_model);
+    store
+        .finish_turn(
+            &retry_claim,
+            "completed",
+            "complete",
+            None,
+            7,
+            3,
+            selected_model,
+        )
+        .await
+        .unwrap();
+    let usage_model: String =
+        sqlx::query_scalar("SELECT model_alias FROM ai_usage WHERE turn_id=$1")
+            .bind(audited.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(usage_model, selected_model);
+
+    let cited = store
+        .create_turn(
+            &owner,
+            created.analysis.id,
+            conversation.id,
+            Uuid::new_v4(),
+            4,
+            &"8".repeat(64),
+            "test-model",
             "Give one fact.",
         )
         .await
@@ -1366,6 +1471,7 @@ async fn postgres_ssr_projection_and_server_operation_claims_are_owner_scoped() 
             Uuid::new_v4(),
             1,
             &"a".repeat(64),
+            "test-model",
             "Question",
         )
         .await
@@ -1478,6 +1584,173 @@ async fn postgres_ssr_projection_and_server_operation_claims_are_owner_scoped() 
             .status,
         202
     );
+}
+
+#[tokio::test]
+async fn postgres_schema_v1_turn_models_upgrade_and_ledger_are_fail_closed() {
+    let database_url = std::env::var("STRAD_TEST_DATABASE_URL")
+        .expect("STRAD_TEST_DATABASE_URL is required; PostgreSQL contract tests never skip");
+    let mut connection = sqlx::PgConnection::connect(&database_url).await.unwrap();
+    connection
+        .execute(
+            "CREATE TABLE strad_schema_migrations(\
+             version bigint PRIMARY KEY,\
+             name text NOT NULL,\
+             sha256 char(64) NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),\
+             applied_at timestamptz NOT NULL)",
+        )
+        .await
+        .unwrap();
+    let v1_sql = include_str!("../migrations/0001_strad_core.sql");
+    connection.execute(v1_sql).await.unwrap();
+    sqlx::query(
+        "INSERT INTO strad_schema_migrations(version,name,sha256,applied_at) \
+         VALUES(1,'strad_core',$1,now())",
+    )
+    .bind(hex::encode(Sha256::digest(v1_sql.as_bytes())))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    let owner = format!("user:test-{}", Uuid::new_v4());
+    let upload_id = Uuid::new_v4();
+    let analysis_id = Uuid::new_v4();
+    let conversation_id = Uuid::new_v4();
+    let frozen_turn_id = Uuid::new_v4();
+    let usage_turn_id = Uuid::new_v4();
+    let legacy_turn_id = Uuid::new_v4();
+    let mut tx = connection.begin().await.unwrap();
+    sqlx::query("INSERT INTO owner_quotas(owner_sub) VALUES($1)")
+        .bind(&owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO upload_sessions(\
+           id,operation_id,owner_sub,request_sha256,filename,total_bytes,chunk_count,\
+           reserved_bytes,state,staging_key,analysis_id,expires_at) \
+         VALUES($1,$2,$3,$4,'legacy.bin',1,1,1,'reserved',$5,$6,now()+interval '1 hour')",
+    )
+    .bind(upload_id)
+    .bind(Uuid::new_v4())
+    .bind(&owner)
+    .bind("a".repeat(64))
+    .bind(upload_id.to_string())
+    .bind(analysis_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO analyses(id,owner_sub,upload_id,display_name,state,retention_until) \
+         VALUES($1,$2,$3,'legacy.bin','created',now()+interval '1 day')",
+    )
+    .bind(analysis_id)
+    .bind(&owner)
+    .bind(upload_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations(id,analysis_id,owner_sub,title,persona_id) \
+         VALUES($1,$2,$3,'Legacy','binary-analyst')",
+    )
+    .bind(conversation_id)
+    .bind(analysis_id)
+    .bind(&owner)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    for (client_seq, turn_id, frozen_request) in [
+        (
+            1_i64,
+            frozen_turn_id,
+            Some(serde_json::json!({"model":"frozen-model"})),
+        ),
+        (2_i64, usage_turn_id, None),
+        (3_i64, legacy_turn_id, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO turns(\
+               id,conversation_id,analysis_id,owner_sub,client_seq,operation_id,\
+               request_sha256,state,frozen_request) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,'accepted',$8)",
+        )
+        .bind(turn_id)
+        .bind(conversation_id)
+        .bind(analysis_id)
+        .bind(&owner)
+        .bind(client_seq)
+        .bind(Uuid::new_v4())
+        .bind(format!("{client_seq:x}").repeat(64))
+        .bind(frozen_request)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO ai_usage(\
+           owner_sub,analysis_id,turn_id,prompt_tokens,completion_tokens,model_alias) \
+         VALUES($1,$2,$3,1,1,'usage-model')",
+    )
+    .bind(&owner)
+    .bind(analysis_id)
+    .bind(usage_turn_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    drop(connection);
+
+    migrations::run(&database_url).await.unwrap();
+    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let migrated: Vec<(i64, String)> =
+        sqlx::query_as("SELECT client_seq,model_alias FROM turns ORDER BY client_seq")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        migrated,
+        vec![
+            (1, "frozen-model".into()),
+            (2, "usage-model".into()),
+            (3, "openai/gpt-5.6-luna".into()),
+        ]
+    );
+    assert!(migrations::schema_compatible(&pool).await);
+    assert!(
+        sqlx::query("UPDATE turns SET model_alias='bad model' WHERE id=$1")
+            .bind(legacy_turn_id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    migrations::run(&database_url).await.unwrap();
+    let ledger: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT version,name,sha256 FROM strad_schema_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger.len(), 2);
+    assert_eq!(ledger[0].0, 1);
+    assert_eq!(ledger[0].1, "strad_core");
+    assert_eq!(ledger[1].0, 2);
+    assert_eq!(ledger[1].1, "turn_model_alias");
+    assert_eq!(
+        ledger[1].2,
+        hex::encode(Sha256::digest(
+            include_str!("../migrations/0002_turn_model_alias.sql").as_bytes()
+        ))
+    );
+
+    sqlx::query("DELETE FROM strad_schema_migrations WHERE version=1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!migrations::schema_compatible(&pool).await);
+    assert!(migrations::run(&database_url)
+        .await
+        .unwrap_err()
+        .contains("contiguous prefix"));
 }
 
 fn bridge_test_config(database_url: &str, bridge_url: &str, root: &std::path::Path) -> Config {

@@ -9,11 +9,18 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "strad_core",
-    sql: include_str!("../migrations/0001_strad_core.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "strad_core",
+        sql: include_str!("../migrations/0001_strad_core.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "turn_model_alias",
+        sql: include_str!("../migrations/0002_turn_model_alias.sql"),
+    },
+];
 
 pub async fn run(database_url: &str) -> std::result::Result<(), String> {
     let mut connection = PgConnection::connect(database_url)
@@ -59,15 +66,18 @@ async fn run_locked(connection: &mut PgConnection) -> std::result::Result<(), St
         .last()
         .map(|row| row.get::<i64, _>("version"))
         .unwrap_or(0);
-    if !(CURRENT_SCHEMA_VERSION - 1..=CURRENT_SCHEMA_VERSION).contains(&current) {
+    if current != 0 && !(CURRENT_SCHEMA_VERSION - 1..=CURRENT_SCHEMA_VERSION).contains(&current) {
         return Err(format!(
             "database schema version {current} is incompatible with application schema {CURRENT_SCHEMA_VERSION}"
         ));
     }
-    for row in rows {
+    for (index, row) in rows.into_iter().enumerate() {
         let version: i64 = row.get("version");
         let name: String = row.get("name");
         let sha: String = row.get("sha256");
+        if version != index as i64 + 1 {
+            return Err("migration ledger is not a contiguous prefix".to_string());
+        }
         let expected = MIGRATIONS
             .iter()
             .find(|migration| migration.version == version)
@@ -178,16 +188,35 @@ async fn exact_introspect(connection: &mut PgConnection) -> std::result::Result<
 }
 
 pub async fn schema_compatible(pool: &sqlx::PgPool) -> bool {
-    let version = sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(MAX(version),0) FROM strad_schema_migrations",
-    )
-    .fetch_one(pool)
-    .await;
-    matches!(version, Ok(version) if version == CURRENT_SCHEMA_VERSION || version == CURRENT_SCHEMA_VERSION - 1)
+    let rows =
+        sqlx::query("SELECT version,name,sha256 FROM strad_schema_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await;
+    let Ok(rows) = rows else {
+        return false;
+    };
+    let version = rows.len() as i64;
+    if version != CURRENT_SCHEMA_VERSION && version != CURRENT_SCHEMA_VERSION - 1 {
+        return false;
+    }
+    rows.iter().enumerate().all(|(index, row)| {
+        let expected = &MIGRATIONS[index];
+        row.get::<i64, _>("version") == index as i64 + 1
+            && row.get::<String, _>("name") == expected.name
+            && row.get::<String, _>("sha256") == sha256(expected.sql.as_bytes())
+    })
 }
 
-pub fn migration_sha256() -> String {
-    sha256(MIGRATIONS[0].sql.as_bytes())
+pub fn migration_manifest_sha256() -> String {
+    let mut digest = Sha256::new();
+    for migration in MIGRATIONS {
+        digest.update(migration.version.to_be_bytes());
+        digest.update((migration.name.len() as u64).to_be_bytes());
+        digest.update(migration.name.as_bytes());
+        digest.update((migration.sql.len() as u64).to_be_bytes());
+        digest.update(migration.sql.as_bytes());
+    }
+    hex::encode(digest.finalize())
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -205,12 +234,22 @@ mod tests {
 
     #[test]
     fn migration_is_checksum_bound_and_contains_frozen_tenant_constraints() {
-        assert_eq!(migration_sha256().len(), 64);
+        assert_eq!(migration_manifest_sha256().len(), 64);
         let sql = MIGRATIONS[0].sql;
         assert!(sql.contains("DEFERRABLE INITIALLY DEFERRED"));
         assert!(sql.contains("FOREIGN KEY (upload_id, id, owner_sub)"));
         assert!(sql.contains("source_outbox_id uuid UNIQUE"));
         assert!(sql.contains("retained_from_seq bigint NOT NULL"));
         assert!(sql.contains("frozen_request jsonb"));
+    }
+
+    #[test]
+    fn turn_model_migration_is_additive_and_bounded() {
+        let sql = MIGRATIONS[1].sql;
+        assert_eq!(MIGRATIONS[1].version, CURRENT_SCHEMA_VERSION);
+        assert!(sql.contains("ALTER TABLE turns ADD COLUMN model_alias text"));
+        assert!(sql.contains("ALTER COLUMN model_alias SET NOT NULL"));
+        assert!(sql.contains("turns_model_alias_valid"));
+        assert!(sql.contains("openai/gpt-5.6-luna"));
     }
 }

@@ -4,6 +4,11 @@ Strad is the w33d AI binary-analysis workbench. It provides an Axum web applicat
 TypeScript bridge to Rikune's locked static MCP profile, and a fail-closed Holdfast release
 package for deployment and rollback.
 
+The conversation composer discovers the models currently exposed to Strad's NewAPI service key
+and records the user's explicit choice on every turn. `STRAD_NEWAPI_MODEL` remains the
+release-pinned default (`glm-5.2` for the current release); retries always reuse the recorded model
+and never fail over silently.
+
 ## Repository layout
 
 - `src/`, `templates/`, and `static/`: the Rust service and server-rendered workbench.

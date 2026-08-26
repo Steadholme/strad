@@ -63,19 +63,23 @@ test('promote and delete each send their own endpoint-specific server id', async
   assert.notStrictEqual(p.headers['Idempotency-Key'], d.headers['Idempotency-Key'], 'no cross-operation id reuse');
 });
 
-test('a conversation turn sends the server-issued turn_operation_id', async () => {
+test('a conversation turn sends the server-issued turn_operation_id and selected model', async () => {
   const hidden = H.el('input', { name: 'operation_id', value: TURN_OP });
   const textarea = H.el('textarea', { 'data-wb-message': '', name: 'message' });
   const seq = H.el('input', { 'data-wb-client-seq': '', name: 'client_seq', value: '1' });
+  const model = H.el('select', { 'data-wb-model-select': '', name: 'model', value: 'glm-5.2' });
+  model.value = 'glm-5.2';
+  const modelStatus = H.el('span', { 'data-wb-model-status': '' });
   const send = H.el('button', { 'data-wb-send': '', type: 'submit' });
   const count = H.el('span', { 'data-wb-charcount': '' });
-  const turnForm = H.el('form', { 'data-wb-turn': '', method: 'post', action: '/api/analyses/' + AID + '/conversations/' + CID + '/turns' }, [hidden, textarea, seq, count, send]);
+  const turnForm = H.el('form', { 'data-wb-turn': '', method: 'post', action: '/api/analyses/' + AID + '/conversations/' + CID + '/turns' }, [hidden, textarea, seq, model, modelStatus, count, send]);
   const thread = H.el('div', { 'data-wb-thread': '' });
   const threadEmpty = H.el('div', { 'data-wb-thread-empty': '' });
   const root = H.el('div', { class: 'wb-root' }, [thread, threadEmpty, turnForm]);
   root.dataset = { wbAnalysisId: AID, wbConversationId: CID };
   const toasts = H.el('div', { 'data-wb-toasts': '' });
   const fetchImpl = recorder((u, m) => {
+    if (m === 'GET' && u.endsWith('/models')) return H.jsonResponse(200, { default_model: 'glm-5.2', models: ['glm-5.2', 'glm-4.7'] });
     if (m === 'POST' && u.endsWith('/turns')) return H.jsonResponse(202, { turn: { id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', state: 'pending' } });
     if (m === 'GET' && u.endsWith('/turns/dddddddd-dddd-4ddd-8ddd-dddddddddddd')) return H.jsonResponse(200, { turn: { state: 'completed' }, assistant: { content: 'done' } });
     if (m === 'GET') return htmlResp();
@@ -84,11 +88,14 @@ test('a conversation turn sends the server-issued turn_operation_id', async () =
   const env = H.makeEnv({ page: 'conversation', href: 'https://rikune.example/analyses/' + AID + '/conversation?conversation_id=' + CID, fetch: fetchImpl, bodyChildren: [root, toasts] });
   lastRestore = H.install(env);
   H.loadScript('rikune.js');
+  await H.waitFor(() => modelStatus.textContent === '2 models available');
+  model.value = 'glm-4.7';
   textarea.value = 'What does this binary do?';
   turnForm.dispatchEvent(H.makeEvent('submit'));
   await H.waitFor(() => endsWith(fetchImpl.calls, 'POST', '/turns'));
   const t = endsWith(fetchImpl.calls, 'POST', '/turns');
   assert.strictEqual(t.headers['Idempotency-Key'], TURN_OP, 'turn uses turn_operation_id');
+  assert.strictEqual(JSON.parse(t.body).model, 'glm-4.7', 'turn carries the fetched catalog selection');
   assert.notStrictEqual(t.headers['Idempotency-Key'], PROMOTE_OP);
   assert.notStrictEqual(t.headers['Idempotency-Key'], DELETE_OP);
 });

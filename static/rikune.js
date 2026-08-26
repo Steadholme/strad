@@ -108,9 +108,10 @@
     not_found: 'This item was not found.',
     invalid_upload: 'The upload is invalid.',
     invalid_request: 'The request is invalid.',
+    invalid_model: 'That AI model is no longer available. Choose another model and try again.',
     authorization_unavailable: 'Service is temporarily unavailable. Please try again shortly.',
     analyzer_unavailable: 'The analyzer is temporarily unavailable. Please try again shortly.',
-    assistant_unavailable: 'The AI is unavailable right now. Your message was saved.'
+    assistant_unavailable: 'The AI is unavailable right now. Please try again shortly.'
   };
   function errorText(code, message) {
     if (message && typeof message === 'string') return message;
@@ -518,6 +519,7 @@
     renderSessions(sessions, selectedCid, analysisId);
     renderThread(messages, analysisId);
     enhancePersona();
+    loadModels(analysisId);
     wireComposer(analysisId, selectedCid, messages);
     var selectNote = q('[data-wb-select-note]');
     if (selectNote) selectNote.hidden = !!selectedCid;
@@ -596,12 +598,52 @@
       sel.addEventListener('change', sync); sync();
     });
   }
+  function loadModels(analysisId) {
+    var select = q('[data-wb-model-select]');
+    var status = q('[data-wb-model-status]');
+    if (!select || !analysisId) return;
+    select.setAttribute('aria-busy', 'true');
+    if (status) status.textContent = 'Loading available models…';
+    api('GET', '/api/analyses/' + encodeURIComponent(analysisId) + '/models')
+      .then(function (payload) {
+        var models = payload && Array.isArray(payload.models) ? payload.models : [];
+        var defaultModel = payload && typeof payload.default_model === 'string' ? payload.default_model : select.value;
+        if (!models.length) throw new Error('No AI models are currently available.');
+        var previous = select.value;
+        var selectedModel = models.indexOf(previous) >= 0 ? previous : '';
+        var frag = document.createDocumentFragment();
+        if (!selectedModel) {
+          var placeholder = document.createElement('option');
+          placeholder.value = '';
+          placeholder.textContent = 'Choose a model…';
+          placeholder.disabled = true;
+          placeholder.selected = true;
+          frag.appendChild(placeholder);
+        }
+        models.forEach(function (model) {
+          var option = document.createElement('option');
+          option.value = model;
+          option.textContent = model === defaultModel ? model + ' (default)' : model;
+          frag.appendChild(option);
+        });
+        select.replaceChildren(frag);
+        select.value = selectedModel;
+        if (status) status.textContent = selectedModel
+          ? models.length + (models.length === 1 ? ' model available' : ' models available')
+          : 'The previous selection is unavailable. Choose a model for this turn.';
+      })
+      .catch(function () {
+        if (status) status.textContent = 'The model list could not be revalidated. Try again shortly.';
+      })
+      .then(function () { select.removeAttribute('aria-busy'); });
+  }
   function wireComposer(analysisId, selectedCid, messages) {
     var form = q('form[data-wb-turn]');
     if (!form) return;
     var textarea = q('[data-wb-message]', form);
     var count = q('[data-wb-charcount]', form);
     var seqInput = q('[data-wb-client-seq]', form);
+    var modelSelect = q('[data-wb-model-select]', form);
     var maxSeq = 0;
     messages.forEach(function (m) { if (m.client_seq && m.client_seq > maxSeq) maxSeq = m.client_seq; });
     if (seqInput && (!seqInput.value || seqInput.value === '{{ next_client_seq }}')) seqInput.value = String(maxSeq + 1);
@@ -624,14 +666,21 @@
       e.preventDefault();
       var msg = textarea ? textarea.value.trim() : '';
       if (!msg) return;
+      var selectedModel = modelSelect ? modelSelect.value : '';
+      if (!selectedModel) {
+        if (modelSelect) modelSelect.focus();
+        toast('Choose an available AI model before sending.', 'error');
+        return;
+      }
       var clientSeq = Number(seqInput ? seqInput.value : maxSeq + 1) || (maxSeq + 1);
       var thread = q('[data-wb-thread]');
       var empty = q('[data-wb-thread-empty]'); if (empty) empty.hidden = true;
-      if (thread) thread.appendChild(messageEl({ role: 'user', content: msg, status: 'committed', client_seq: clientSeq }, analysisId));
+      var optimisticUser = messageEl({ role: 'user', content: msg, status: 'committed', client_seq: clientSeq }, analysisId);
+      if (thread) thread.appendChild(optimisticUser);
       var pending = messageEl({ role: 'assistant', content: '_Working…_', status: 'generating' }, analysisId);
       if (thread) { thread.appendChild(pending); thread.scrollTop = thread.scrollHeight; }
       var send = q('[data-wb-send]', form); if (send) send.setAttribute('aria-busy', 'true');
-      api('POST', form.getAttribute('action'), { client_seq: clientSeq, message: msg }, { 'Idempotency-Key': idem })
+      api('POST', form.getAttribute('action'), { client_seq: clientSeq, message: msg, model: selectedModel }, { 'Idempotency-Key': idem })
         .then(function (res) {
           if (textarea) { textarea.value = ''; if (count) count.textContent = '0 / 8192'; }
           maxSeq = clientSeq; if (seqInput) seqInput.value = String(maxSeq + 1);
@@ -645,7 +694,13 @@
         })
         .catch(function (err) {
           if (send) send.removeAttribute('aria-busy');
-          pending.innerHTML = renderMarkdown('_' + err.message + '_', analysisId);
+          if (optimisticUser.parentNode) optimisticUser.parentNode.removeChild(optimisticUser);
+          if (pending.parentNode) pending.parentNode.removeChild(pending);
+          if (empty && thread && !thread.children.length) empty.hidden = false;
+          if (err.code === 'invalid_model') {
+            if (modelSelect) modelSelect.value = '';
+            loadModels(analysisId);
+          }
           toast(err.message, 'error');
         });
     });

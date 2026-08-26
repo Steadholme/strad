@@ -67,6 +67,7 @@ jobs:
           - postgres_promote_and_checkpoint_uncertain_reconcile_the_original_operations
           - postgres_chat_terminal_citation_retry_delete_replay_and_promote_order
           - postgres_ssr_projection_and_server_operation_claims_are_owner_scoped
+          - postgres_schema_v1_turn_models_upgrade_and_ledger_are_fail_closed
     services:
       postgres:
         image: postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
