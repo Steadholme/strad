@@ -4,6 +4,7 @@ const SAMPLE_ID = /^sha256:[0-9a-f]{64}$/
 const SHA256 = /^[0-9a-f]{64}$/
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const ARTIFACT_READ_MAX_BYTES = 256 * 1024
 const safeText = (max: number) => z.string().trim().min(1).max(max)
 
 const startSchema = z
@@ -67,7 +68,7 @@ const artifactSchema = z
     scan_roots: [],
     select_latest: true,
     include_content: value.read_mode !== 'profile',
-    max_bytes: 2 * 1024 * 1024,
+    max_bytes: ARTIFACT_READ_MAX_BYTES,
     encoding: 'auto' as const,
     parse_json: false,
     ioc_highlights: false,

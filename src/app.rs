@@ -9,9 +9,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::Bytes;
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -20,15 +22,15 @@ use crate::{
         csrf_cookie, csrf_from_headers, existing_or_new_csrf, identity_middleware,
         security_headers, verify_csrf, AuthVerifier, Identity,
     },
-    bridge::BridgeClient,
+    bridge::{ArtifactReadRequest, ArtifactReadResult, BridgeClient},
     chat::ChatEngine,
     cleanup::CleanupService,
     config::{Config, CHUNK_BYTES, MAX_FILE_BYTES},
     error::{AppError, Result},
     events, migrations,
     models::{
-        CreateAnalysisInput, CreateAnalysisOutput, CreateConversationInput, CreateTurnInput,
-        UpdatePersonaInput,
+        Artifact, CreateAnalysisInput, CreateAnalysisOutput, CreateConversationInput,
+        CreateTurnInput, UpdatePersonaInput,
     },
     newapi::{NewApiClient, TokenBudgeter},
     store::{canonical_request_sha, server_operation_id, CreatedUpload, IdempotencyReplay, Store},
@@ -39,6 +41,24 @@ use crate::{
 
 const JSON_LIMIT: usize = 1024 * 1024;
 const MULTIPART_LIMIT: usize = 536_870_912;
+const ARTIFACT_READ_MAX_BYTES: u64 = 256 * 1024;
+const ANALYSIS_MODELS_ROUTE: &str = "/api/analyses/{id}/models";
+const ANALYSIS_ARTIFACT_CONTENT_ROUTE: &str = "/api/analyses/{id}/artifacts/{artifact_id}/content";
+const ANALYSIS_RESOURCE_TYPE: &str = "rikune-analysis";
+const CONVERSATION_RESOURCE_TYPE: &str = "rikune-conversation";
+const TURN_RESOURCE_TYPE: &str = "rikune-turn";
+
+fn analysis_resource(analysis_id: Uuid) -> (&'static str, String) {
+    (ANALYSIS_RESOURCE_TYPE, analysis_id.to_string())
+}
+
+fn conversation_resource(conversation_id: Uuid) -> (&'static str, String) {
+    (CONVERSATION_RESOURCE_TYPE, conversation_id.to_string())
+}
+
+fn turn_resource(turn_id: Uuid) -> (&'static str, String) {
+    (TURN_RESOURCE_TYPE, turn_id.to_string())
+}
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -124,7 +144,11 @@ pub fn router(state: AppState) -> Router {
         .route("/analyses/{id}/stages", get(analysis_stages))
         .route("/analyses/{id}/conversation", get(analysis_conversation))
         .route("/api/analyses/{id}/context-preview", get(context_preview))
-        .route("/api/analyses/{id}/models", get(analysis_models))
+        .route(ANALYSIS_MODELS_ROUTE, get(analysis_models))
+        .route(
+            ANALYSIS_ARTIFACT_CONTENT_ROUTE,
+            get(analysis_artifact_content),
+        )
         .route("/api/analyses/{id}/events", get(analysis_events))
         .route("/api/analyses/{id}/promote", post(promote_analysis))
         .route("/api/analyses/{id}/delete", post(delete_analysis))
@@ -919,13 +943,14 @@ async fn analysis_conversation(
         .store
         .get_analysis(&identity.subject, analysis_id)
         .await?;
+    let (resource_type, resource_id) = analysis_resource(analysis_id);
     state
         .verdict
         .authorize(
             &identity,
             "rikune.conversation.use",
-            "rikune-conversation",
-            &format!("analysis:{analysis_id}"),
+            resource_type,
+            &resource_id,
             Risk::Medium,
         )
         .await?;
@@ -998,13 +1023,14 @@ async fn analysis_models(
         .store
         .get_analysis(&identity.subject, analysis_id)
         .await?;
+    let (resource_type, resource_id) = analysis_resource(analysis_id);
     state
         .verdict
         .authorize(
             &identity,
             "rikune.conversation.use",
-            "rikune-conversation",
-            &format!("analysis:{analysis_id}"),
+            resource_type,
+            &resource_id,
             Risk::Medium,
         )
         .await?;
@@ -1013,6 +1039,205 @@ async fn analysis_models(
         "default_model": state.newapi.model(),
         "models": models,
     })))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactContentState {
+    InlineText,
+    Binary,
+    TooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ArtifactContentEncoding {
+    Utf8,
+    Base64,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifiedArtifactContent {
+    content: Option<String>,
+    content_state: ArtifactContentState,
+    content_encoding: ArtifactContentEncoding,
+    truncated: bool,
+    bytes_read: u64,
+    total_size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactContentResponse {
+    artifact: Artifact,
+    #[serde(flatten)]
+    verified: VerifiedArtifactContent,
+}
+
+async fn analysis_artifact_content(
+    State(state): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path((analysis_id, artifact_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ArtifactContentResponse>> {
+    let analysis = state
+        .store
+        .get_analysis(&identity.subject, analysis_id)
+        .await?;
+    let (resource_type, resource_id) = analysis_resource(analysis_id);
+    state
+        .verdict
+        .authorize(
+            &identity,
+            "rikune.analysis.read",
+            resource_type,
+            &resource_id,
+            Risk::Medium,
+        )
+        .await?;
+    let artifact = state
+        .store
+        .get_artifact(&identity.subject, analysis_id, artifact_id)
+        .await?;
+    let sample_id = analysis.sample_id.ok_or(AppError::Invariant(
+        "owned analysis omitted sample id for artifact read",
+    ))?;
+    if artifact.upstream_artifact_id.is_empty() {
+        return Err(AppError::Invariant(
+            "stored artifact omitted upstream artifact id",
+        ));
+    }
+    let response = state
+        .bridge
+        .artifact_read(&ArtifactReadRequest {
+            sample_id: &sample_id,
+            artifact_id: Some(&artifact.upstream_artifact_id),
+            artifact_type: None,
+            path: None,
+            read_mode: "content",
+        })
+        .await?;
+    let verified = verified_artifact_content(response, &sample_id, &artifact)?;
+    Ok(Json(ArtifactContentResponse { artifact, verified }))
+}
+
+fn verified_artifact_content(
+    response: ArtifactReadResult,
+    expected_sample_id: &str,
+    expected_artifact: &Artifact,
+) -> Result<VerifiedArtifactContent> {
+    fn required_string<'a>(
+        object: &'a serde_json::Map<String, Value>,
+        key: &'static str,
+    ) -> Result<&'a str> {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or(AppError::Invariant(key))
+    }
+    if required_string(&response.value, "sample_id")? != expected_sample_id {
+        return Err(AppError::Invariant("bridge artifact sample id mismatch"));
+    }
+    if required_string(&response.value, "read_mode")? != "content" {
+        return Err(AppError::Invariant("bridge artifact read mode mismatch"));
+    }
+    let upstream_artifact = response
+        .value
+        .get("artifact")
+        .and_then(Value::as_object)
+        .ok_or(AppError::Invariant(
+            "bridge artifact response omitted artifact identity",
+        ))?;
+    for (key, expected) in [
+        ("id", expected_artifact.upstream_artifact_id.as_str()),
+        ("type", expected_artifact.artifact_type.as_str()),
+        ("path", expected_artifact.path.as_str()),
+        ("sha256", expected_artifact.sha256.as_str()),
+    ] {
+        if required_string(upstream_artifact, key)? != expected {
+            return Err(AppError::Invariant("bridge artifact identity mismatch"));
+        }
+    }
+
+    let content = response
+        .value
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or(AppError::Invariant(
+            "bridge artifact response omitted string content",
+        ))?;
+    let content_encoding = match required_string(&response.value, "content_encoding")? {
+        "utf8" => ArtifactContentEncoding::Utf8,
+        "base64" => ArtifactContentEncoding::Base64,
+        _ => return Err(AppError::Invariant("unsupported artifact content encoding")),
+    };
+    let bytes_read = response
+        .value
+        .get("bytes_read")
+        .and_then(Value::as_u64)
+        .ok_or(AppError::Invariant(
+            "bridge artifact response omitted byte count",
+        ))?;
+    let total_size = response
+        .value
+        .get("total_size")
+        .and_then(Value::as_u64)
+        .ok_or(AppError::Invariant(
+            "bridge artifact response omitted total size",
+        ))?;
+    let truncated = response
+        .value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .ok_or(AppError::Invariant(
+            "bridge artifact response omitted truncation state",
+        ))?;
+    if bytes_read > ARTIFACT_READ_MAX_BYTES
+        || bytes_read > total_size
+        || truncated != (bytes_read < total_size)
+    {
+        return Err(AppError::Invariant(
+            "bridge artifact byte counts are inconsistent",
+        ));
+    }
+
+    let raw_content = match content_encoding {
+        ArtifactContentEncoding::Utf8 => content.as_bytes().to_vec(),
+        ArtifactContentEncoding::Base64 => BASE64_STANDARD
+            .decode(content)
+            .map_err(|_| AppError::Invariant("bridge artifact base64 is invalid"))?,
+    };
+    if u64::try_from(raw_content.len()).ok() != Some(bytes_read) {
+        return Err(AppError::Invariant(
+            "bridge artifact decoded length mismatch",
+        ));
+    }
+
+    if truncated {
+        return Ok(VerifiedArtifactContent {
+            content: None,
+            content_state: ArtifactContentState::TooLarge,
+            content_encoding,
+            truncated,
+            bytes_read,
+            total_size,
+        });
+    }
+    if hex::encode(Sha256::digest(&raw_content)) != expected_artifact.sha256 {
+        return Err(AppError::Invariant("artifact content sha256 mismatch"));
+    }
+    let (content_state, content) = match content_encoding {
+        ArtifactContentEncoding::Utf8 => {
+            (ArtifactContentState::InlineText, Some(content.to_owned()))
+        }
+        ArtifactContentEncoding::Base64 => (ArtifactContentState::Binary, None),
+    };
+    Ok(VerifiedArtifactContent {
+        content,
+        content_state,
+        content_encoding,
+        truncated,
+        bytes_read,
+        total_size,
+    })
 }
 
 async fn context_preview(
@@ -1227,13 +1452,14 @@ async fn create_conversation(
         .store
         .get_analysis(&identity.subject, analysis_id)
         .await?;
+    let (resource_type, resource_id) = analysis_resource(analysis_id);
     state
         .verdict
         .authorize(
             &identity,
             "rikune.conversation.use",
-            "rikune-conversation",
-            &format!("analysis:{analysis_id}"),
+            resource_type,
+            &resource_id,
             Risk::Medium,
         )
         .await?;
@@ -1329,13 +1555,14 @@ async fn update_persona(
         .store
         .get_conversation(&identity.subject, analysis_id, conversation_id)
         .await?;
+    let (resource_type, resource_id) = conversation_resource(conversation_id);
     state
         .verdict
         .authorize(
             &identity,
             "rikune.conversation.use",
-            "rikune-conversation",
-            &conversation_id.to_string(),
+            resource_type,
+            &resource_id,
             Risk::Medium,
         )
         .await?;
@@ -1426,13 +1653,14 @@ async fn create_turn(
         .store
         .get_conversation(&identity.subject, analysis_id, conversation_id)
         .await?;
+    let (resource_type, resource_id) = conversation_resource(conversation_id);
     state
         .verdict
         .authorize(
             &identity,
             "rikune.conversation.use",
-            "rikune-turn",
-            &format!("conversation:{conversation_id}"),
+            resource_type,
+            &resource_id,
             Risk::Medium,
         )
         .await?;
@@ -1541,13 +1769,14 @@ async fn turn_status(
         .store
         .get_turn(&identity.subject, analysis_id, conversation_id, turn_id)
         .await?;
+    let (resource_type, resource_id) = turn_resource(turn_id);
     state
         .verdict
         .authorize(
             &identity,
             "rikune.conversation.use",
-            "rikune-turn",
-            &turn_id.to_string(),
+            resource_type,
+            &resource_id,
             Risk::Medium,
         )
         .await?;
@@ -1586,13 +1815,14 @@ async fn delete_conversation(
         .store
         .assert_analysis_owner(&identity.subject, analysis_id)
         .await?;
+    let (resource_type, resource_id) = conversation_resource(conversation_id);
     state
         .verdict
         .authorize(
             &identity,
             "rikune.conversation.use",
-            "rikune-conversation",
-            &conversation_id.to_string(),
+            resource_type,
+            &resource_id,
             Risk::Medium,
         )
         .await?;
@@ -2000,6 +2230,370 @@ mod tests {
         assert_eq!(
             response.headers().get(header::LOCATION).unwrap(),
             "/analyses/00000000-0000-0000-0000-000000000001"
+        );
+    }
+
+    const TEST_SAMPLE_ID: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn artifact_fixture(raw_content: &[u8]) -> Artifact {
+        Artifact {
+            id: Uuid::nil(),
+            analysis_id: Uuid::nil(),
+            owner_sub: "user:test".into(),
+            upstream_artifact_id: "upstream-artifact".into(),
+            artifact_type: "summary".into(),
+            artifact_ref: "ref:summary".into(),
+            path: "summary.json".into(),
+            sha256: hex::encode(Sha256::digest(raw_content)),
+            mime: Some("application/json".into()),
+            metadata: json!({}),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn artifact_read_result(
+        artifact: &Artifact,
+        content: &str,
+        content_encoding: &str,
+        bytes_read: u64,
+        total_size: u64,
+        truncated: bool,
+    ) -> ArtifactReadResult {
+        ArtifactReadResult {
+            value: json!({
+                "sample_id": TEST_SAMPLE_ID,
+                "read_mode": "content",
+                "artifact": {
+                    "id": artifact.upstream_artifact_id,
+                    "type": artifact.artifact_type,
+                    "path": artifact.path,
+                    "sha256": artifact.sha256,
+                },
+                "content": content,
+                "content_encoding": content_encoding,
+                "bytes_read": bytes_read,
+                "total_size": total_size,
+                "truncated": truncated,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        }
+    }
+
+    fn assert_artifact_invariant(error: AppError) {
+        assert_eq!(error.code(), "server_invariant_violation");
+    }
+
+    #[test]
+    fn complete_utf8_artifact_is_verified_and_inlined() {
+        let content = "verified artifact content ☃";
+        let artifact = artifact_fixture(content.as_bytes());
+        let verified = verified_artifact_content(
+            artifact_read_result(
+                &artifact,
+                content,
+                "utf8",
+                content.len() as u64,
+                content.len() as u64,
+                false,
+            ),
+            TEST_SAMPLE_ID,
+            &artifact,
+        )
+        .unwrap();
+
+        assert_eq!(verified.content.as_deref(), Some(content));
+        assert_eq!(verified.content_state, ArtifactContentState::InlineText);
+        assert_eq!(verified.content_encoding, ArtifactContentEncoding::Utf8);
+        assert!(!verified.truncated);
+        assert_eq!(verified.bytes_read, content.len() as u64);
+        assert_eq!(verified.total_size, content.len() as u64);
+    }
+
+    #[test]
+    fn complete_base64_artifact_is_verified_without_exposing_binary() {
+        let raw_content = [0, 159, 146, 150, 255];
+        let content = BASE64_STANDARD.encode(raw_content);
+        let artifact = artifact_fixture(&raw_content);
+        let verified = verified_artifact_content(
+            artifact_read_result(
+                &artifact,
+                &content,
+                "base64",
+                raw_content.len() as u64,
+                raw_content.len() as u64,
+                false,
+            ),
+            TEST_SAMPLE_ID,
+            &artifact,
+        )
+        .unwrap();
+
+        assert_eq!(verified.content, None);
+        assert_eq!(verified.content_state, ArtifactContentState::Binary);
+        assert_eq!(verified.content_encoding, ArtifactContentEncoding::Base64);
+        assert!(!verified.truncated);
+        assert_eq!(verified.bytes_read, raw_content.len() as u64);
+        assert_eq!(verified.total_size, raw_content.len() as u64);
+    }
+
+    #[test]
+    fn truncated_utf8_and_base64_artifacts_are_not_exposed() {
+        let full_utf8 = b"prefix and omitted suffix";
+        let utf8_prefix = "prefix";
+        let utf8_artifact = artifact_fixture(full_utf8);
+        let utf8 = verified_artifact_content(
+            artifact_read_result(
+                &utf8_artifact,
+                utf8_prefix,
+                "utf8",
+                utf8_prefix.len() as u64,
+                full_utf8.len() as u64,
+                true,
+            ),
+            TEST_SAMPLE_ID,
+            &utf8_artifact,
+        )
+        .unwrap();
+
+        let full_binary = [0, 1, 2, 3, 4, 5, 6];
+        let binary_prefix = [0, 1, 2];
+        let binary_artifact = artifact_fixture(&full_binary);
+        let base64 = verified_artifact_content(
+            artifact_read_result(
+                &binary_artifact,
+                &BASE64_STANDARD.encode(binary_prefix),
+                "base64",
+                binary_prefix.len() as u64,
+                full_binary.len() as u64,
+                true,
+            ),
+            TEST_SAMPLE_ID,
+            &binary_artifact,
+        )
+        .unwrap();
+
+        for verified in [utf8, base64] {
+            assert_eq!(verified.content, None);
+            assert_eq!(verified.content_state, ArtifactContentState::TooLarge);
+            assert!(verified.truncated);
+            assert!(verified.bytes_read < verified.total_size);
+        }
+    }
+
+    #[test]
+    fn artifact_identity_drift_fails_closed() {
+        let content = "verified artifact content";
+        let artifact = artifact_fixture(content.as_bytes());
+        for (field, replacement) in [
+            ("id", "other-artifact"),
+            ("type", "other-type"),
+            ("path", "other/path"),
+            (
+                "sha256",
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
+        ] {
+            let mut response = artifact_read_result(
+                &artifact,
+                content,
+                "utf8",
+                content.len() as u64,
+                content.len() as u64,
+                false,
+            );
+            response.value.get_mut("artifact").unwrap()[field] = json!(replacement);
+            assert_artifact_invariant(
+                verified_artifact_content(response, TEST_SAMPLE_ID, &artifact).unwrap_err(),
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_base64_fails_closed() {
+        let artifact = artifact_fixture(b"binary");
+        let response = artifact_read_result(&artifact, "%%%", "base64", 2, 2, false);
+        assert_artifact_invariant(
+            verified_artifact_content(response, TEST_SAMPLE_ID, &artifact).unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn artifact_length_truncation_encoding_and_digest_drift_fail_closed() {
+        let content = "abc";
+        let artifact = artifact_fixture(content.as_bytes());
+        for response in [
+            artifact_read_result(&artifact, content, "utf8", 2, 2, false),
+            artifact_read_result(&artifact, content, "utf8", 3, 4, false),
+            artifact_read_result(&artifact, content, "utf8", 3, 3, true),
+            artifact_read_result(
+                &artifact,
+                content,
+                "utf8",
+                ARTIFACT_READ_MAX_BYTES + 1,
+                ARTIFACT_READ_MAX_BYTES + 1,
+                false,
+            ),
+            artifact_read_result(&artifact, content, "hex", 3, 3, false),
+        ] {
+            assert_artifact_invariant(
+                verified_artifact_content(response, TEST_SAMPLE_ID, &artifact).unwrap_err(),
+            );
+        }
+
+        let mut digest_drift = artifact_fixture(content.as_bytes());
+        digest_drift.sha256 = "0".repeat(64);
+        let response = artifact_read_result(&digest_drift, content, "utf8", 3, 3, false);
+        assert_artifact_invariant(
+            verified_artifact_content(response, TEST_SAMPLE_ID, &digest_drift).unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn artifact_content_response_has_exact_top_level_contract() {
+        let artifact = artifact_fixture(b"content");
+        let response = serde_json::to_value(ArtifactContentResponse {
+            artifact,
+            verified: VerifiedArtifactContent {
+                content: Some("content".into()),
+                content_state: ArtifactContentState::InlineText,
+                content_encoding: ArtifactContentEncoding::Utf8,
+                truncated: false,
+                bytes_read: 7,
+                total_size: 7,
+            },
+        })
+        .unwrap();
+        let object = response.as_object().unwrap();
+        let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "artifact",
+                "bytes_read",
+                "content",
+                "content_encoding",
+                "content_state",
+                "total_size",
+                "truncated",
+            ])
+        );
+        assert_eq!(object["content_state"], "inline_text");
+        assert_eq!(object["content_encoding"], "utf8");
+    }
+
+    #[test]
+    fn authz_manifest_matches_runtime_resource_contracts() {
+        let manifest: Value =
+            serde_json::from_str(include_str!("../ops/holdfast/assets/rikune-authz-v1.json"))
+                .unwrap();
+        let functions = manifest["functions"].as_array().unwrap();
+        let permissions = manifest["permissions"].as_array().unwrap();
+        for (method, router_path, handler, permission, resource_type, resource_field) in [
+            (
+                "GET",
+                "/analyses/{id}/conversation",
+                "conversation-page",
+                "rikune.conversation.use",
+                ANALYSIS_RESOURCE_TYPE,
+                "id",
+            ),
+            (
+                "GET",
+                ANALYSIS_MODELS_ROUTE,
+                "analysis-models",
+                "rikune.conversation.use",
+                ANALYSIS_RESOURCE_TYPE,
+                "id",
+            ),
+            (
+                "GET",
+                ANALYSIS_ARTIFACT_CONTENT_ROUTE,
+                "analysis-artifact-content",
+                "rikune.analysis.read",
+                ANALYSIS_RESOURCE_TYPE,
+                "id",
+            ),
+            (
+                "POST",
+                "/api/analyses/{id}/conversations",
+                "conversation-create",
+                "rikune.conversation.use",
+                ANALYSIS_RESOURCE_TYPE,
+                "id",
+            ),
+            (
+                "POST",
+                "/api/analyses/{id}/conversations/{cid}/persona",
+                "conversation-persona",
+                "rikune.conversation.use",
+                CONVERSATION_RESOURCE_TYPE,
+                "cid",
+            ),
+            (
+                "POST",
+                "/api/analyses/{id}/conversations/{cid}/turns",
+                "turn-create",
+                "rikune.conversation.use",
+                CONVERSATION_RESOURCE_TYPE,
+                "cid",
+            ),
+            (
+                "GET",
+                "/api/analyses/{id}/conversations/{cid}/turns/{tid}",
+                "turn-status",
+                "rikune.conversation.use",
+                TURN_RESOURCE_TYPE,
+                "tid",
+            ),
+            (
+                "POST",
+                "/api/analyses/{id}/conversations/{cid}/delete",
+                "conversation-delete",
+                "rikune.conversation.use",
+                CONVERSATION_RESOURCE_TYPE,
+                "cid",
+            ),
+        ] {
+            let manifest_path = router_path.replace('{', ":").replace('}', "");
+            let matching: Vec<&Value> = functions
+                .iter()
+                .filter(|entry| {
+                    entry["method"] == method && entry["path"] == manifest_path.as_str()
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "manifest route {manifest_path}");
+            let entry = matching[0];
+            assert_eq!(entry["handler"], handler);
+            assert_eq!(entry["action"], permission);
+            assert_eq!(entry["permission"], permission);
+            assert_eq!(entry["resource"]["type"], resource_type);
+            assert_eq!(entry["resource"]["source"], "path");
+            assert_eq!(entry["resource"]["field"], resource_field);
+
+            let permission_entry = permissions
+                .iter()
+                .find(|entry| entry["key"] == permission)
+                .unwrap();
+            assert_eq!(permission_entry["risk"], "medium");
+        }
+
+        let analysis_id = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let conversation_id = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let turn_id = Uuid::parse_str("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
+        assert_eq!(
+            analysis_resource(analysis_id),
+            (ANALYSIS_RESOURCE_TYPE, analysis_id.to_string())
+        );
+        assert_eq!(
+            conversation_resource(conversation_id),
+            (CONVERSATION_RESOURCE_TYPE, conversation_id.to_string())
+        );
+        assert_eq!(
+            turn_resource(turn_id),
+            (TURN_RESOURCE_TYPE, turn_id.to_string())
         );
     }
 }

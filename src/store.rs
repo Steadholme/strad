@@ -1493,6 +1493,25 @@ impl Store {
             .await?)
     }
 
+    pub async fn get_artifact(
+        &self,
+        owner_sub: &str,
+        analysis_id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<Artifact> {
+        let query = format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifacts \
+             WHERE id=$1 AND analysis_id=$2 AND owner_sub=$3"
+        );
+        sqlx::query_as::<_, Artifact>(&query)
+            .bind(artifact_id)
+            .bind(analysis_id)
+            .bind(owner_sub)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(AppError::not_found)
+    }
+
     pub async fn begin_promote(
         &self,
         owner_sub: &str,

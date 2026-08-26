@@ -21,7 +21,9 @@ from render_input_binding import (
     write_binding,
 )
 from successor_binding import (
+    SUCCESSOR_STATIC_ASSET_SOURCES,
     validate_predecessor,
+    validate_static_asset_transition,
     validate_supporting_snapshot,
     write_delta_manifest,
 )
@@ -418,6 +420,9 @@ def copy_successor_stage(
     stage_root: Path,
     catalog_only: bool,
     policy: dict[str, object],
+    preimages: dict[str, str],
+    static_targets: dict[str, str],
+    authority_root: Path,
 ) -> None:
     if stage_root.exists() or stage_root.is_symlink():
         fail(f"stage root must not already exist: {stage_root}")
@@ -442,6 +447,22 @@ def copy_successor_stage(
         shutil.copy2(source, destination)
         if sha256_file(destination) != raw.get("after_sha256"):
             fail(f"successor overlay copy differs: {relative}")
+
+    static_asset_sources = validate_static_asset_transition(
+        preimages, static_targets, authority_root
+    )
+    if tuple(static_asset_sources.items()) != SUCCESSOR_STATIC_ASSET_SOURCES:
+        fail("successor static asset source order differs")
+    for relative, source_relative in static_asset_sources.items():
+        source = authority_root / source_relative
+        destination = stage_root / relative
+        require_regular(source)
+        require_regular(destination)
+        if sha256_file(destination) != preimages[relative]:
+            fail(f"successor static asset preimage differs: {relative}")
+        shutil.copy2(source, destination)
+        if sha256_file(destination) != static_targets[relative]:
+            fail(f"successor static asset copy differs: {relative}")
 
     copy_successor_tree(
         predecessor_candidate / "verdict", stage_root / "verdict"
@@ -1610,25 +1631,34 @@ def main() -> int:
             fail("successor policy validation returned an invalid value")
         if not args.catalog_only:
             validate_successor_release(release, policy)
-        copy_successor_stage(
-            estate_root,
-            successor_context["predecessor_candidate"],
-            stage_root,
-            args.catalog_only,
-            policy,
-        )
         successor_preimages = successor_context.get("successor_preimages")
         if not isinstance(successor_preimages, dict) or not all(
             isinstance(key, str) and isinstance(value, str)
             for key, value in successor_preimages.items()
         ):
             fail("successor validation returned invalid preimage authority")
+        static_targets = successor_context.get("successor_static_targets")
+        if not isinstance(static_targets, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in static_targets.items()
+        ):
+            fail("successor validation returned invalid static target authority")
         supporting_targets = successor_context.get("successor_supporting_targets")
         if not isinstance(supporting_targets, dict) or not all(
             isinstance(key, str) and isinstance(value, str)
             for key, value in supporting_targets.items()
         ):
             fail("successor validation returned invalid supporting authority")
+        copy_successor_stage(
+            estate_root,
+            successor_context["predecessor_candidate"],
+            stage_root,
+            args.catalog_only,
+            policy,
+            successor_preimages,
+            static_targets,
+            OPS_ROOT,
+        )
         validate_successor_snapshot(
             stage_root,
             policy,

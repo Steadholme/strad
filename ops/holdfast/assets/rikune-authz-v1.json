@@ -505,6 +505,70 @@
     },
     {
       "method": "GET",
+      "path": "/api/analyses/:id/models",
+      "handler": "analysis-models",
+      "action": "rikune.conversation.use",
+      "permission": "rikune.conversation.use",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "analysis-models",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/analyses/:id/artifacts/:artifact_id/content",
+      "handler": "analysis-artifact-content",
+      "action": "rikune.analysis.read",
+      "permission": "rikune.analysis.read",
+      "plane": "browser-safe",
+      "resource": {
+        "type": "rikune-analysis",
+        "source": "path",
+        "resolution": "pre-handler",
+        "cardinality": "single",
+        "field": "id",
+        "format": "identifier",
+        "max_bytes": 128
+      },
+      "zone": "external",
+      "mfa": "none",
+      "approval": {
+        "required": false,
+        "min_approvals": 1
+      },
+      "consequence": {
+        "required": false,
+        "token_class": "none"
+      },
+      "audit": {
+        "required": false,
+        "target": "analysis-artifact-content",
+        "severity": "info"
+      }
+    },
+    {
+      "method": "GET",
       "path": "/api/analyses/:id/events",
       "handler": "analysis-events",
       "action": "rikune.analysis.read",

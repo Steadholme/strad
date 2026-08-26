@@ -34,6 +34,12 @@ SUPPORTING_RELAY_PATHS = frozenset(
         "relay/upstream/new-api/router/newapi-authz-v1.json",
     }
 )
+SUCCESSOR_STATIC_ASSET_SOURCES = (
+    (
+        "access-governance/catalog/rikune-authz-v1.json",
+        "assets/rikune-authz-v1.json",
+    ),
+)
 
 
 def fail(message: str) -> NoReturn:
@@ -167,6 +173,36 @@ def parse_path_manifest(path: Path) -> set[str]:
     return result
 
 
+def validate_static_asset_transition(
+    preimages: dict[str, str],
+    static_targets: dict[str, str],
+    authority_root: Path,
+) -> dict[str, str]:
+    expected_paths = set(FROZEN_STATIC_PATHS)
+    if not expected_paths.issubset(preimages) or set(static_targets) != expected_paths:
+        fail("successor static transition path set is not exact")
+    sources = dict(SUCCESSOR_STATIC_ASSET_SOURCES)
+    if len(sources) != len(SUCCESSOR_STATIC_ASSET_SOURCES):
+        fail("successor static asset source path set contains duplicates")
+    changed_paths = {
+        relative
+        for relative in FROZEN_STATIC_PATHS
+        if preimages[relative] != static_targets[relative]
+    }
+    if changed_paths != set(sources):
+        fail("successor static asset transition path set is not exact")
+    root = require_directory(authority_root)
+    for relative, source_relative in sources.items():
+        safe_relative(relative, "successor static asset target")
+        safe_relative(source_relative, "successor static asset source")
+        source = require_regular(root / source_relative)
+        if source.resolve() != source or root not in source.resolve().parents:
+            fail(f"successor static asset source escapes authority: {relative}")
+        if sha256(source) != static_targets[relative]:
+            fail(f"successor static asset source differs: {relative}")
+    return sources
+
+
 def verify_checksum_manifest(root: Path, manifest: Path) -> None:
     base = require_directory(root)
     for relative, expected in parse_checksum_manifest(manifest).items():
@@ -251,6 +287,7 @@ def validate_policy(path: Path) -> dict[str, Any]:
         {
             "generator",
             "access_build_input_schema",
+            "source_access_build_input_sha256",
             "access_build_input_sha256",
             "preimages_manifest",
             "absent_manifest",
@@ -265,6 +302,10 @@ def validate_policy(path: Path) -> dict[str, Any]:
         or successor["access_build_input_schema"] != BUILD_INPUT_V2
     ):
         fail("successor generator or build-input schema differs")
+    require_hex(
+        successor["source_access_build_input_sha256"],
+        "successor source build input",
+    )
     require_hex(successor["access_build_input_sha256"], "successor build input")
     for key in (
         "preimages_manifest",
@@ -402,6 +443,7 @@ def validate_predecessor(
     )
     if set(static_targets) != set(FROZEN_STATIC_PATHS):
         fail("successor static target path set is not exact")
+    validate_static_asset_transition(preimages, static_targets, authority_root)
     supporting_targets = parse_checksum_manifest(
         authority_root / successor["supporting_targets_manifest"]
     )
@@ -505,8 +547,8 @@ def validate_predecessor(
     observed_build_input = access_tree_build_input_sha_v2(
         estate / "access-governance"
     )
-    if observed_build_input != successor["access_build_input_sha256"]:
-        fail("live exact successor Access build input differs")
+    if observed_build_input != successor["source_access_build_input_sha256"]:
+        fail("live exact successor Access source build input differs")
     return {
         "policy": policy,
         "state": state,
@@ -514,6 +556,7 @@ def validate_predecessor(
         "predecessor_candidate": candidate,
         "predecessor_stage": stage,
         "successor_preimages": preimages,
+        "successor_static_targets": static_targets,
         "successor_supporting_targets": supporting_targets,
     }
 

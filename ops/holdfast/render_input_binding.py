@@ -110,6 +110,17 @@ PREDECESSOR_FIELDS = {
     "permission_catalog_sha256",
     "package_catalog_sha256",
 }
+SUCCESSOR_POLICY_FIELDS = {
+    "generator",
+    "access_build_input_schema",
+    "source_access_build_input_sha256",
+    "access_build_input_sha256",
+    "preimages_manifest",
+    "absent_manifest",
+    "static_targets_manifest",
+    "supporting_targets_manifest",
+    "frozen_targets_manifest",
+}
 FROZEN_ROOT_FIELDS = {
     "schema_version",
     "generator",
@@ -360,6 +371,7 @@ def verify_apply_binding(
     release_evidence_path: Path,
     expected_mode: str,
     require_root_owner: bool = False,
+    source_estate_root: Path | None = None,
 ) -> None:
     root = require_directory(ops_root.absolute(), require_root_owner)
     stage = require_directory(stage_root.absolute(), require_root_owner)
@@ -371,6 +383,8 @@ def verify_apply_binding(
         fail("expected release mode must be base, successor, or successor-catalog")
     successor = expected_mode in {"successor", "successor-catalog"}
     catalog_only = expected_mode == "successor-catalog"
+    if source_estate_root is not None and expected_mode != "successor":
+        fail("live source identity is valid only for a full successor apply")
     expected_evidence_fields = (
         SUCCESSOR_CATALOG_EVIDENCE_FIELDS
         if catalog_only
@@ -491,9 +505,17 @@ def verify_apply_binding(
             or set(predecessor) != PREDECESSOR_FIELDS
             or evidence.get("predecessor_binding") != predecessor
             or not isinstance(policy_successor, dict)
+            or set(policy_successor) != SUCCESSOR_POLICY_FIELDS
             or policy_successor.get("generator") != evidence.get("generator")
             or policy_successor.get("access_build_input_schema")
             != "access-build-input/2"
+            or not isinstance(
+                policy_successor.get("source_access_build_input_sha256"), str
+            )
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(policy_successor["source_access_build_input_sha256"]),
+            )
             or policy_successor.get("access_build_input_sha256")
             != frozen.get("access_governance_build_input_sha256")
             or predecessor.get("permission_catalog_sha256")
@@ -530,6 +552,17 @@ def verify_apply_binding(
             ):
                 fail("successor overlay entry is invalid")
             seen_overlay.add(relative)
+        if source_estate_root is not None:
+            source_estate = require_directory(
+                source_estate_root.absolute(), require_root_owner
+            )
+            observed_source_build_input = access_tree_build_input_sha_v2(
+                source_estate / "access-governance"
+            )
+            if observed_source_build_input != policy_successor.get(
+                "source_access_build_input_sha256"
+            ):
+                fail("live successor Access source build input differs")
         release = evidence.get("release")
         if catalog_only:
             if release != {}:
@@ -596,6 +629,7 @@ def main() -> int:
     verify_parser.add_argument(
         "--expected-mode", choices=("base", "successor", "successor-catalog")
     )
+    verify_parser.add_argument("--source-estate-root", type=Path)
     verify_parser.add_argument("--require-root-owner", action="store_true")
     args = parser.parse_args()
     try:
@@ -605,8 +639,10 @@ def main() -> int:
             if (args.stage_root is None) != (args.release_evidence is None):
                 fail("--stage-root and --release-evidence must be provided together")
             if args.stage_root is None:
-                if args.expected_mode is not None:
-                    fail("--expected-mode requires staged release evidence")
+                if args.expected_mode is not None or args.source_estate_root is not None:
+                    fail(
+                        "--expected-mode and --source-estate-root require staged release evidence"
+                    )
                 verify_binding(args.ops_root, args.manifest, args.require_root_owner)
             else:
                 if args.expected_mode is None:
@@ -618,6 +654,7 @@ def main() -> int:
                     args.release_evidence,
                     args.expected_mode,
                     args.require_root_owner,
+                    args.source_estate_root,
                 )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"render input binding: {error}", file=sys.stderr)

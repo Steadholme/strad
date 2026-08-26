@@ -18,7 +18,8 @@
   "successor": {
     "generator": "holdfast-rikune-estate/2.0.0",
     "access_build_input_schema": "access-build-input/2",
-    "access_build_input_sha256": "23509919a35c1377ab3953b0364843f99b62f4bd8f4f5b3e7d4e8d75277ba86f",
+    "source_access_build_input_sha256": "23509919a35c1377ab3953b0364843f99b62f4bd8f4f5b3e7d4e8d75277ba86f",
+    "access_build_input_sha256": "587b6792afa3b552e62c542de52c619290a836799c418b17d31a55b68d5f30b2",
     "preimages_manifest": "successor-preimages.sha256",
     "absent_manifest": "successor-absent.paths",
     "static_targets_manifest": "successor-static-targets.sha256",

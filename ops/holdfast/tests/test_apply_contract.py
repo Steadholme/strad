@@ -203,6 +203,7 @@ class ApplyContractTests(unittest.TestCase):
             "successor": {
                 "generator": "holdfast-rikune-estate/test-successor-catalog",
                 "access_build_input_schema": "access-build-input/2",
+                "source_access_build_input_sha256": "d" * 64,
                 "access_build_input_sha256": semantic[
                     "access_governance_build_input_sha256"
                 ],
@@ -808,6 +809,47 @@ class ApplyContractTests(unittest.TestCase):
             persisted_receipt,
         )
         self.assertLess(persisted_receipt, pinned_receipt)
+
+    def test_successor_apply_rechecks_full_live_source_at_every_mutation_boundary(
+        self,
+    ) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        render_rebind = script[
+            script.index("verify_render_bindings() {") : script.index(
+                "bound_dry_receipt_sha="
+            )
+        ]
+        self.assertIn('"${source_estate_args[@]}"', render_rebind)
+        self.assertIn(
+            'source_estate_args=(--source-estate-root "$estate_root")', script
+        )
+
+        persisted = script[
+            script.index("verify_persisted_render_bindings() {") : script.index(
+                '(cd "$stage" && sha256sum --check "$backup/TARGETS.sha256")'
+            )
+        ]
+        self.assertIn('--ops-root "$persisted_render_ops_root"', persisted)
+        self.assertIn('"${source_estate_args[@]}"', persisted)
+        self.assertIn(
+            'persisted_render_ops_root="$backup/successor-authority"', script
+        )
+        self.assertEqual(script.count("\nverify_persisted_render_bindings\n"), 2)
+
+        final_preflight = script.rindex(
+            'python3 "$script_dir/estate_transaction.py" preflight'
+        )
+        quiesced = script.index("verify_products_quiesced", final_preflight)
+        final_source_rebind = script.index(
+            "\nverify_persisted_render_bindings\n", quiesced
+        )
+        apply = script.index(
+            'python3 "$script_dir/estate_transaction.py" apply',
+            final_source_rebind,
+        )
+        self.assertLess(final_preflight, quiesced)
+        self.assertLess(quiesced, final_source_rebind)
+        self.assertLess(final_source_rebind, apply)
 
     def test_post_backup_render_binding_uses_canonical_staged_evidence(self) -> None:
         script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")

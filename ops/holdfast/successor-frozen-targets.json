@@ -5,8 +5,8 @@
   "permission_catalog_sha256": "92e7ed1dd9aa2369b18c2aae7d05b3f829a8d1750f5569c9ff9536f7ace0ebc9",
   "package_catalog_sha256": "6a2343c04c0d2cf7c1cbb40414d0be3f91bcb4637499fbc78037f3cb0543d340",
   "access_governance_build_input_schema": "access-build-input/2",
-  "access_governance_build_input_sha256": "23509919a35c1377ab3953b0364843f99b62f4bd8f4f5b3e7d4e8d75277ba86f",
-  "authz_manifest_sha256": "0d05ea44fabb751fa3599445125ee78cf91837cbb81eabb7e7ad01812c0842eb",
+  "access_governance_build_input_sha256": "587b6792afa3b552e62c542de52c619290a836799c418b17d31a55b68d5f30b2",
+  "authz_manifest_sha256": "71d114b4aeb3d469920057e4df399bfd302e532914e8741390ff16789909c450",
   "route_up_sha256": "b311effdce00a91e31b22679494fb017a0db5323a95e2cb7a9839b385a8161c2",
   "route_down_sha256": "f8c3a928008a7672ebd8c4da9fe792625ed30ebfb89268dee4623b4551d52edb",
   "tokenizer": {

@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 async-stream = "0.3"
 axum = { version = "0.8", features = ["form", "json", "multipart"] }
+base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"
 hex = "0.4"

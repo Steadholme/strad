@@ -1587,6 +1587,57 @@ async fn postgres_ssr_projection_and_server_operation_claims_are_owner_scoped() 
 }
 
 #[tokio::test]
+async fn postgres_artifact_lookup_binds_owner_analysis_and_artifact() {
+    let database_url = std::env::var("STRAD_TEST_DATABASE_URL")
+        .expect("STRAD_TEST_DATABASE_URL is required; PostgreSQL contract tests never skip");
+    migrations::run(&database_url).await.unwrap();
+    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let mut _test_lock = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(823202613)")
+        .execute(&mut *_test_lock)
+        .await
+        .unwrap();
+    let store = Store::from_pool(pool.clone());
+    let owner = format!("user:artifact-{}", Uuid::new_v4());
+    let created = store
+        .create_upload(&owner, "artifact.bin", 1, Uuid::new_v4(), &"d".repeat(64))
+        .await
+        .unwrap();
+    let artifact_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO artifacts(id,analysis_id,owner_sub,upstream_artifact_id,artifact_type,\
+         artifact_ref,path,sha256,mime,metadata) VALUES($1,$2,$3,'upstream-owned',\
+         'summary','ref:owned','owned.json',$4,'application/json','{}'::jsonb)",
+    )
+    .bind(artifact_id)
+    .bind(created.analysis.id)
+    .bind(&owner)
+    .bind("e".repeat(64))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let artifact = store
+        .get_artifact(&owner, created.analysis.id, artifact_id)
+        .await
+        .unwrap();
+    assert_eq!(artifact.upstream_artifact_id, "upstream-owned");
+    for (candidate_owner, candidate_analysis) in [
+        (
+            format!("user:other-{}", Uuid::new_v4()),
+            created.analysis.id,
+        ),
+        (owner.clone(), Uuid::new_v4()),
+    ] {
+        let error = store
+            .get_artifact(&candidate_owner, candidate_analysis, artifact_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "not_found");
+    }
+}
+
+#[tokio::test]
 async fn postgres_schema_v1_turn_models_upgrade_and_ledger_are_fail_closed() {
     let database_url = std::env::var("STRAD_TEST_DATABASE_URL")
         .expect("STRAD_TEST_DATABASE_URL is required; PostgreSQL contract tests never skip");

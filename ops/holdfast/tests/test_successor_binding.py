@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import stat
 import sys
 import tempfile
@@ -137,11 +138,198 @@ class SuccessorBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "single-link"):
             render.read_private_env_snapshot(source, "release")
 
-    def make_apply_fixture(self) -> tuple[Path, Path, Path, Path]:
+    def make_successor_copy_fixture(
+        self,
+    ) -> tuple[
+        Path,
+        Path,
+        Path,
+        dict[str, object],
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+    ]:
+        authority = self.root / "authority"
+        asset = authority / "assets/rikune-authz-v1.json"
+        asset.parent.mkdir(parents=True)
+        asset.write_text('{"schema_version":1,"permissions":["new"]}\n')
+
+        predecessor = self.root / "predecessor"
+        predecessor_access = predecessor / "access-governance"
+        predecessor_access.mkdir(parents=True)
+        estate = self.root / "estate"
+        estate_access = estate / "access-governance"
+        estate_access.mkdir(parents=True)
+        static_relative = "access-governance/catalog/rikune-authz-v1.json"
+        old_static = predecessor / static_relative
+        old_static.parent.mkdir(parents=True)
+        old_static.write_text('{"schema_version":1,"permissions":["old"]}\n')
+
+        overlay: list[dict[str, object]] = []
+        for index in range(7):
+            relative = f"access-governance/src/overlay_{index}.rs"
+            before = predecessor / relative
+            after = estate / relative
+            before.parent.mkdir(parents=True, exist_ok=True)
+            after.parent.mkdir(parents=True, exist_ok=True)
+            before.write_text(f"before {index}\n")
+            after.write_text(f"after {index}\n")
+            overlay.append(
+                {
+                    "path": relative,
+                    "before_sha256": render.sha256_file(before),
+                    "after_sha256": render.sha256_file(after),
+                }
+            )
+
+        verdict = predecessor / "verdict/fixture.txt"
+        verdict.parent.mkdir(parents=True)
+        verdict.write_text("frozen verdict\n")
+        relay_files = (
+            predecessor
+            / "relay/upstream/new-api/router/enterprise_permissions.json",
+            predecessor / "relay/upstream/new-api/router/newapi-authz-v1.json",
+        )
+        for index, target in enumerate(relay_files):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f'{{"fixture":{index}}}\n')
+        route = predecessor / "deploy/routes.seed.json"
+        route.parent.mkdir(parents=True)
+        route.write_text('{"routes":[]}\n')
+
+        preimages = {relative: "a" * 64 for relative in render.FROZEN_STATIC_PATHS}
+        static_targets = dict(preimages)
+        preimages[static_relative] = render.sha256_file(old_static)
+        static_targets[static_relative] = render.sha256_file(asset)
+        route_relative = "deploy/routes.seed.json"
+        preimages[route_relative] = render.sha256_file(route)
+        static_targets[route_relative] = preimages[route_relative]
+        for item in overlay:
+            preimages[str(item["path"])] = str(item["after_sha256"])
+        preimages["deploy/.env"] = "b" * 64
+
+        expected = self.root / "expected"
+        shutil.copytree(predecessor_access, expected / "access-governance")
+        for item in overlay:
+            relative = str(item["path"])
+            shutil.copy2(estate / relative, expected / relative)
+        shutil.copy2(asset, expected / static_relative)
+        policy: dict[str, object] = {
+            "overlay": overlay,
+            "successor": {
+                "access_build_input_sha256": (
+                    render_input_binding.access_build_input_sha_v2(expected)
+                )
+            },
+        }
+        supporting_targets = {
+            target.relative_to(predecessor).as_posix(): render.sha256_file(target)
+            for target in (verdict, *relay_files)
+        }
+        return (
+            authority,
+            estate,
+            predecessor,
+            policy,
+            preimages,
+            static_targets,
+            supporting_targets,
+        )
+
+    def test_successor_stage_promotes_bound_static_asset_to_final_identity(
+        self,
+    ) -> None:
+        (
+            authority,
+            estate,
+            predecessor,
+            policy,
+            preimages,
+            static_targets,
+            supporting_targets,
+        ) = self.make_successor_copy_fixture()
+        stage = self.root / "stage"
+        render.copy_successor_stage(
+            estate,
+            predecessor,
+            stage,
+            True,
+            policy,
+            preimages,
+            static_targets,
+            authority,
+        )
+        render.validate_successor_snapshot(
+            stage, policy, preimages, supporting_targets, True
+        )
+        static_relative = "access-governance/catalog/rikune-authz-v1.json"
+        self.assertEqual(
+            render.sha256_file(stage / static_relative),
+            static_targets[static_relative],
+        )
+
+    def test_successor_static_asset_transition_rejects_every_drift(self) -> None:
+        (
+            authority,
+            estate,
+            predecessor,
+            policy,
+            preimages,
+            static_targets,
+            _,
+        ) = self.make_successor_copy_fixture()
+        asset = authority / "assets/rikune-authz-v1.json"
+        asset.write_text("tampered target source\n")
+        with self.assertRaisesRegex(ValueError, "static asset source differs"):
+            render.copy_successor_stage(
+                estate,
+                predecessor,
+                self.root / "source-drift-stage",
+                True,
+                policy,
+                preimages,
+                static_targets,
+                authority,
+            )
+
+        asset.write_text('{"schema_version":1,"permissions":["new"]}\n')
+        drifted_targets = dict(static_targets)
+        static_relative = "access-governance/catalog/rikune-authz-v1.json"
+        drifted_targets[static_relative] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "static asset source differs"):
+            render.copy_successor_stage(
+                estate,
+                predecessor,
+                self.root / "target-drift-stage",
+                True,
+                policy,
+                preimages,
+                drifted_targets,
+                authority,
+            )
+
+        (predecessor / static_relative).write_text("tampered old snapshot\n")
+        with self.assertRaisesRegex(SystemExit, "static asset preimage differs"):
+            render.copy_successor_stage(
+                estate,
+                predecessor,
+                self.root / "preimage-drift-stage",
+                True,
+                policy,
+                preimages,
+                static_targets,
+                authority,
+            )
+
+    def make_apply_fixture(self) -> tuple[Path, Path, Path, Path, Path]:
         ops = self.root / "ops"
         stage = self.root / "apply-stage"
+        source_estate = self.root / "source-estate"
+        source_access = source_estate / "access-governance"
         ops.mkdir()
         stage.mkdir(mode=0o700)
+        source_access.mkdir(parents=True)
+        (source_access / "Cargo.toml").write_text("[package]\nname='source'\n")
         for relative in render_input_binding.FROZEN_STATIC_PATHS:
             target = stage / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -209,6 +397,11 @@ class SuccessorBindingTests(unittest.TestCase):
             "successor": {
                 "generator": "holdfast-rikune-estate/test-successor",
                 "access_build_input_schema": "access-build-input/2",
+                "source_access_build_input_sha256": (
+                    render_input_binding.access_tree_build_input_sha_v2(
+                        source_access
+                    )
+                ),
                 "access_build_input_sha256": semantic[
                     "access_governance_build_input_sha256"
                 ],
@@ -290,15 +483,34 @@ class SuccessorBindingTests(unittest.TestCase):
         evidence.write_text(json.dumps(evidence_value) + "\n")
         binding = self.root / "SUCCESSOR-RENDER-INPUTS.sha256"
         render_input_binding.write_binding(ops, binding, successor=True)
-        return ops, stage, evidence, binding
+        return ops, stage, evidence, binding, source_estate
 
     def test_apply_binding_requires_explicit_successor_and_rejects_downgrade(
         self,
     ) -> None:
-        ops, stage, evidence, binding = self.make_apply_fixture()
+        ops, stage, evidence, binding, source_estate = self.make_apply_fixture()
         render_input_binding.verify_apply_binding(
-            ops, binding, stage, evidence, "successor"
+            ops,
+            binding,
+            stage,
+            evidence,
+            "successor",
+            source_estate_root=source_estate,
         )
+        (source_estate / "access-governance/Cargo.toml").write_text(
+            "[package]\nname='drifted-source'\n"
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "live successor Access source build input differs"
+        ):
+            render_input_binding.verify_apply_binding(
+                ops,
+                binding,
+                stage,
+                evidence,
+                "successor",
+                source_estate_root=source_estate,
+            )
         with self.assertRaisesRegex(RuntimeError, "field set|mode"):
             render_input_binding.verify_apply_binding(
                 ops, binding, stage, evidence, "base"
@@ -310,6 +522,32 @@ class SuccessorBindingTests(unittest.TestCase):
             render_input_binding.verify_apply_binding(
                 ops, binding, stage, evidence, "successor"
             )
+
+    def test_successor_policy_requires_a_separate_source_build_identity(self) -> None:
+        policy = json.loads((OPS_ROOT / "successor-policy.json").read_text())
+        source = policy["successor"]["source_access_build_input_sha256"]
+        final = policy["successor"]["access_build_input_sha256"]
+        self.assertRegex(source, r"^[0-9a-f]{64}$")
+        self.assertRegex(final, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(source, final)
+        preimages = successor_binding.parse_checksum_manifest(
+            OPS_ROOT / policy["successor"]["preimages_manifest"]
+        )
+        static_targets = successor_binding.parse_checksum_manifest(
+            OPS_ROOT / policy["successor"]["static_targets_manifest"]
+        )
+        self.assertEqual(
+            successor_binding.validate_static_asset_transition(
+                preimages, static_targets, OPS_ROOT
+            ),
+            dict(successor_binding.SUCCESSOR_STATIC_ASSET_SOURCES),
+        )
+
+        del policy["successor"]["source_access_build_input_sha256"]
+        invalid = self.root / "missing-source-build-input.json"
+        invalid.write_text(json.dumps(policy) + "\n")
+        with self.assertRaisesRegex(ValueError, "successor policy"):
+            successor_binding.validate_policy(invalid)
 
 if __name__ == "__main__":
     unittest.main()

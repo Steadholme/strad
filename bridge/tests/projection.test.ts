@@ -1,10 +1,25 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { validateAndProjectBusinessResult } from '../src/schemas.js'
+import { parseRouteBody, validateAndProjectBusinessResult } from '../src/schemas.js'
 
 
 const sampleId = `sha256:${'a'.repeat(64)}`
+
+test('artifact read request fixes the content prefix bound at 256 KiB', () => {
+  const request = {
+    sample_id: sampleId,
+    artifact_id: 'artifact_1',
+    read_mode: 'content',
+  }
+  const parsed = parseRouteBody('/internal/v1/artifacts/read', request)
+
+  assert.equal(parsed.max_bytes, 256 * 1024)
+  assert.equal(parsed.encoding, 'auto')
+  assert.throws(() =>
+    parseRouteBody('/internal/v1/artifacts/read', { ...request, max_bytes: 1 })
+  )
+})
 
 test('workflow result is validated and projected to the exact unified bridge shape', () => {
   const result = validateAndProjectBusinessResult(

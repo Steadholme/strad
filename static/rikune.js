@@ -317,12 +317,67 @@
     if (rec) rec.hidden = analysis.state !== 'start_uncertain';
 
     renderSummary(analysis, artifacts);
-    renderEvidence(artifacts);
+    renderEvidence(analysis, artifacts);
     renderStages(analysis);
   }
   function setField(name, value) {
     var el = q('[data-wb-field="' + name + '"]');
     if (el) el.textContent = value;
+  }
+  // Fetch one artifact's server-verified content by its own server-issued id. The URL is
+  // keyed only by {analysisId, artifactId}: never a client-supplied path and never the
+  // upstream analyzer selector, so the browser cannot reach outside the owner scope.
+  function fetchArtifactContent(analysisId, artifactId) {
+    return api('GET', '/api/analyses/' + encodeURIComponent(analysisId) +
+      '/artifacts/' + encodeURIComponent(artifactId) + '/content');
+  }
+  var ARTIFACT_CONTENT_KEYS = [
+    'artifact', 'bytes_read', 'content', 'content_encoding', 'content_state',
+    'total_size', 'truncated'
+  ];
+  var BINARY_ARTIFACT_COPY = 'Verified binary artifact. Inline Markdown preview is unavailable.';
+  var LARGE_ARTIFACT_COPY = 'Artifact exceeds the inline preview limit; content was not rendered because a complete hash check was not possible.';
+  function exactArtifactContent(payload, artifactId) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('artifact content contract');
+    var keys = Object.keys(payload).sort();
+    if (keys.length !== ARTIFACT_CONTENT_KEYS.length || keys.some(function (key, i) {
+      return key !== ARTIFACT_CONTENT_KEYS[i];
+    })) throw new Error('artifact content contract');
+    if (!payload.artifact || typeof payload.artifact !== 'object' || Array.isArray(payload.artifact) ||
+      payload.artifact.id !== artifactId) throw new Error('artifact content contract');
+    if (typeof payload.truncated !== 'boolean' ||
+      !Number.isSafeInteger(payload.bytes_read) || payload.bytes_read < 0 ||
+      !Number.isSafeInteger(payload.total_size) || payload.total_size < 0 ||
+      payload.bytes_read > payload.total_size) throw new Error('artifact content contract');
+
+    if (payload.content_state === 'inline_text' && payload.content_encoding === 'utf8' &&
+      typeof payload.content === 'string' && payload.truncated === false &&
+      payload.bytes_read === payload.total_size) {
+      return { kind: 'markdown', content: payload.content };
+    }
+    if (payload.content_state === 'binary' && payload.content_encoding === 'base64' &&
+      payload.content === null && payload.truncated === false &&
+      payload.bytes_read === payload.total_size) {
+      return { kind: 'plain', content: BINARY_ARTIFACT_COPY };
+    }
+    if (payload.content_state === 'too_large' &&
+      (payload.content_encoding === 'utf8' || payload.content_encoding === 'base64') &&
+      payload.content === null && payload.truncated === true &&
+      payload.bytes_read < payload.total_size) {
+      return { kind: 'plain', content: LARGE_ARTIFACT_COPY + ' Size: ' + fmtBytes(payload.total_size) + '.' };
+    }
+    throw new Error('artifact content contract');
+  }
+  function renderVerifiedArtifactContent(node, payload, artifactId, analysisId) {
+    var view = exactArtifactContent(payload, artifactId);
+    if (view.kind === 'markdown') {
+      node.innerHTML = renderMarkdown(view.content, analysisId);
+      return;
+    }
+    // Binary and over-limit states use fixed plain text. No provider-controlled value
+    // enters innerHTML; only a bounded, non-negative safe-integer size is formatted.
+    node.innerHTML = '';
+    node.textContent = view.content;
   }
   function renderSummary(analysis, artifacts) {
     var mount = q('[data-wb-summary]');
@@ -331,23 +386,41 @@
     var summary = (artifacts || []).filter(function (a) { return /summ/i.test(a.artifact_type || ''); });
     if (!summary.length) {
       mount.hidden = true;
-      if (empty) empty.hidden = analysis.state === 'analyzed' || analysis.state === 'degraded' ? false : false;
       if (empty) empty.hidden = false;
       return;
     }
     var frag = document.createElement('div');
-    summary.forEach(function (a) {
-      var md = (a.metadata && (a.metadata.summary || a.metadata.text || a.metadata.overview)) || '';
+    var pending = summary.map(function (a) {
       var block = document.createElement('div');
       block.className = 'wb-summary-block';
-      block.innerHTML = renderMarkdown(md, analysis.id);
+      block.setAttribute('aria-busy', 'true');
+      block.innerHTML = renderMarkdown('_Loading summary…_', analysis.id);
       frag.appendChild(block);
+      return { artifact: a, block: block };
     });
     mount.replaceChildren(frag);
     mount.hidden = false;
     if (empty) empty.hidden = true;
+    // The summary is the server-verified artifact content, fetched automatically by the
+    // artifact's own id and rendered through the same safe markdown pipeline.
+    pending.forEach(function (item) {
+      if (!item.artifact.id) {
+        item.block.innerHTML = renderMarkdown('_The summary could not be loaded. Refresh to try again._', analysis.id);
+        item.block.removeAttribute('aria-busy');
+        return;
+      }
+      fetchArtifactContent(analysis.id, item.artifact.id)
+        .then(function (payload) {
+          renderVerifiedArtifactContent(item.block, payload, item.artifact.id, analysis.id);
+          item.block.removeAttribute('aria-busy');
+        })
+        .catch(function () {
+          item.block.innerHTML = renderMarkdown('_The summary could not be loaded. Refresh to try again._', analysis.id);
+          item.block.removeAttribute('aria-busy');
+        });
+    });
   }
-  function renderEvidence(artifacts) {
+  function renderEvidence(analysis, artifacts) {
     var mount = q('[data-wb-evidence]');
     var empty = q('[data-wb-evidence-empty]');
     var raw = mount ? mount.parentNode.querySelector('.wb-rawdata') : null;
@@ -357,6 +430,7 @@
       if (empty) empty.hidden = false;
       return;
     }
+    var analysisId = analysis && analysis.id;
     var groups = {};
     artifacts.forEach(function (a) { var t = a.artifact_type || 'other'; (groups[t] = groups[t] || []).push(a); });
     var wrap = document.createElement('div');
@@ -375,6 +449,7 @@
         var meta = document.createElement('div'); meta.className = 'wb-evi__meta';
         meta.textContent = (a.metadata && (a.metadata.description || a.metadata.summary)) || (a.mime || '');
         li.appendChild(ref); li.appendChild(title); if (meta.textContent) li.appendChild(meta);
+        if (analysisId && a.id) li.appendChild(evidenceReveal(analysisId, a.id));
         if (highlight && refId === highlight) { li.classList.add('is-highlight'); }
         ul.appendChild(li);
       });
@@ -388,6 +463,30 @@
       var target = q('#ev-' + (window.CSS && CSS.escape ? CSS.escape(highlight) : highlight));
       if (target) { target.scrollIntoView({ block: 'center' }); }
     }
+  }
+  // Lazily-loaded evidence content: a native disclosure that fetches the artifact's
+  // server-verified content only when first expanded, and only once. Keyed by the
+  // artifact's own id — never a client-supplied path or the upstream selector.
+  function evidenceReveal(analysisId, artifactId) {
+    var det = document.createElement('details'); det.className = 'wb-evi__reveal';
+    var sum = document.createElement('summary'); sum.textContent = 'View content'; det.appendChild(sum);
+    var body = document.createElement('div'); body.className = 'wb-evi__body'; det.appendChild(body);
+    det.addEventListener('toggle', function () {
+      if (!det.open || det.getAttribute('data-wb-loaded')) return;
+      det.setAttribute('data-wb-loaded', '1');
+      body.setAttribute('aria-busy', 'true');
+      fetchArtifactContent(analysisId, artifactId)
+        .then(function (payload) {
+          renderVerifiedArtifactContent(body, payload, artifactId, analysisId);
+          body.removeAttribute('aria-busy');
+        })
+        .catch(function () {
+          det.removeAttribute('data-wb-loaded');   // allow a retry on the next expand
+          body.innerHTML = renderMarkdown('_The evidence content could not be loaded. Try again._', analysisId);
+          body.removeAttribute('aria-busy');
+        });
+    });
+    return det;
   }
   var STAGE_STEPS = ['fast_profile', 'enrich_static', 'function_map'];
   function renderStages(analysis) {
@@ -569,6 +668,9 @@
   function messageEl(m, analysisId) {
     var el = document.createElement('div');
     el.className = 'wb-msg wb-msg--' + (m.role === 'user' ? 'user' : 'assistant');
+    // Tag an in-flight (SSR-projected) assistant turn so a refresh can find and reuse
+    // this exact node instead of appending a duplicate pending bubble.
+    if (m.role === 'assistant' && m.status === 'streaming' && m.turn_id) el.setAttribute('data-wb-streaming-turn', m.turn_id);
     if (m.role === 'assistant') el.innerHTML = renderMarkdown(m.content, analysisId);
     else { var p = document.createElement('p'); p.textContent = m.content; el.appendChild(p); }
     if (m.status && m.status !== 'complete' && m.status !== 'committed') {
@@ -704,7 +806,8 @@
           toast(err.message, 'error');
         });
     });
-    // Recovery: if the last user turn has no assistant reply yet, resume polling.
+    // Recovery: resume every SSR-projected streaming assistant and a trailing user turn
+    // that still has no assistant reply.
     resumePending(analysisId, selectedCid, messages);
   }
   // Pull a fresh server-issued turn operation id from the conversation's SSR render
@@ -752,12 +855,38 @@
   function resumePending(analysisId, selectedCid, messages) {
     if (!messages.length) return;
     var last = messages[messages.length - 1];
-    if (last && last.role === 'user' && last.turn_id) {
-      var url = '/api/analyses/' + analysisId + '/conversations/' + selectedCid + '/turns/' + last.turn_id;
+    if (!last) return;
+    var turnUrl = '/api/analyses/' + encodeURIComponent(analysisId) + '/conversations/' +
+      encodeURIComponent(selectedCid) + '/turns/';
+    var streamingNodes = qa('[data-wb-streaming-turn]');
+    var polledTurns = Object.create(null);
+    var assistantTurns = Object.create(null);
+
+    messages.forEach(function (message) {
+      if (!message || message.role !== 'assistant' || !message.turn_id) return;
+      var turnId = String(message.turn_id);
+      assistantTurns[turnId] = true;
+      if (message.status !== 'streaming' || polledTurns[turnId]) return;
+      // Compare attributes while traversing known marker nodes. Never interpolate a
+      // server value into a CSS selector, so a malformed id cannot inject a selector.
+      var node = streamingNodes.find(function (candidate) {
+        return candidate.getAttribute('data-wb-streaming-turn') === turnId;
+      });
+      if (!node) return;
+      polledTurns[turnId] = true;
+      pollTurn(turnUrl + encodeURIComponent(turnId), node, analysisId, null);
+    });
+
+    // Legacy fallback: a trailing user turn whose assistant reply never arrived — append
+    // one fresh pending bubble and poll it even when older assistants are still streaming.
+    if (last.role === 'user' && last.turn_id) {
+      var trailingTurnId = String(last.turn_id);
+      if (assistantTurns[trailingTurnId] || polledTurns[trailingTurnId]) return;
       var thread = q('[data-wb-thread]');
       var pending = messageEl({ role: 'assistant', content: '_Resuming…_', status: 'generating' }, analysisId);
       if (thread) thread.appendChild(pending);
-      pollTurn(url, pending, analysisId, null);
+      polledTurns[trailingTurnId] = true;
+      pollTurn(turnUrl + encodeURIComponent(trailingTurnId), pending, analysisId, null);
     }
   }
 

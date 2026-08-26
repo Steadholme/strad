@@ -57,10 +57,12 @@ routes_database_url=${ROUTES_DATABASE_URL:-}
 render_expected_mode="base"
 supply_chain_policy_args=()
 release_validator_policy_args=()
+source_estate_args=()
 if [[ "$successor" == "true" ]]; then
   render_expected_mode="successor"
   supply_chain_policy_args=(--successor-policy "$script_dir/successor-policy.json")
   release_validator_policy_args=(--successor-policy "$script_dir/successor-policy.json")
+  source_estate_args=(--source-estate-root "$estate_root")
 fi
 require_root_control_file() {
   local file=$1
@@ -119,7 +121,8 @@ verify_render_bindings() {
     --ops-root "$script_dir" --manifest "$render_inputs" \
     --stage-root "$stage" --release-evidence "$stage/RELEASE-EVIDENCE.json" \
     --expected-mode "$render_expected_mode" \
-    --require-root-owner
+    --require-root-owner \
+    "${source_estate_args[@]}"
 }
 
 bound_dry_receipt_sha=""
@@ -1310,11 +1313,20 @@ python3 "$script_dir/supply_chain_evidence.py" \
   --bridge-lock "$persisted_bridge_lock" \
   --release-evidence "$backup/RELEASE-EVIDENCE.json" \
   "${persisted_supply_chain_policy_args[@]}"
-python3 "$script_dir/render_input_binding.py" verify \
-  --ops-root "$script_dir" --manifest "$backup/RENDER-INPUTS.sha256" \
-  --stage-root "$stage" --release-evidence "$stage/RELEASE-EVIDENCE.json" \
-  --expected-mode "$render_expected_mode" \
-  --require-root-owner
+persisted_render_ops_root="$script_dir"
+if [[ "$successor" == "true" ]]; then
+  persisted_render_ops_root="$backup/successor-authority"
+fi
+verify_persisted_render_bindings() {
+  python3 "$script_dir/render_input_binding.py" verify \
+    --ops-root "$persisted_render_ops_root" \
+    --manifest "$backup/RENDER-INPUTS.sha256" \
+    --stage-root "$stage" --release-evidence "$stage/RELEASE-EVIDENCE.json" \
+    --expected-mode "$render_expected_mode" \
+    --require-root-owner \
+    "${source_estate_args[@]}"
+}
+verify_persisted_render_bindings
 (cd "$stage" && sha256sum --check "$backup/TARGETS.sha256")
 
 # Persist the exact recovery intent before estate_transaction.py can replace a
@@ -1417,6 +1429,7 @@ python3 "$script_dir/estate_transaction.py" preflight \
   --preimages "$backup/APPLY-PREIMAGES.sha256" \
   --absent "$backup/APPLY-ABSENT.paths"
 verify_products_quiesced
+verify_persisted_render_bindings
 
 set +e
 python3 "$script_dir/estate_transaction.py" apply \
