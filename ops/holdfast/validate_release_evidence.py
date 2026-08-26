@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
 from pathlib import Path
 from typing import Any, NoReturn
+
+from successor_binding import validate_policy as validate_successor_policy
 
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -16,6 +19,71 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_DIGEST = re.compile(r"^[^\s:@]+(?:/[^\s:@]+)+@sha256:[0-9a-f]{64}$")
 UPSTREAM_PREFIX = "ghcr.io/last-emo-boy/rikune-analyzer-static@sha256:"
 RELATION = "strad-bridge-overlay-built-from-rikune-static-base"
+SUCCESSOR_POLICY = Path(__file__).with_name("successor-policy.json")
+SUCCESSOR_GENERATOR = "holdfast-rikune-estate/2.0.0"
+SUCCESSOR_BUILD_INPUT_SCHEMA = "access-build-input/2"
+SUCCESSOR_ROOT_FIELDS = {
+    "schema_version",
+    "generator",
+    "catalog_only",
+    "permission_catalog_sha256",
+    "package_catalog_sha256",
+    "access_governance_build_input_sha256",
+    "route_up_sha256",
+    "route_down_sha256",
+    "authz_manifest_sha256",
+    "secret_references",
+    "release",
+    "release_mode",
+    "access_governance_build_input_schema",
+    "predecessor_binding",
+    "successor_delta_sha256",
+    "holdfast_release_tool_revision",
+}
+SUCCESSOR_FULL_FIELDS = {
+    "release_env_sha256",
+    "supply_chain_binding",
+    "analyzer_image_binding",
+}
+BASE_RELEASE_KEYS = {
+    "ACCESS_GOVERNANCE_IMAGE",
+    "ACCESS_GOVERNANCE_ROLLBACK_IMAGE",
+    "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256",
+    "PERMISSION_CATALOG_SHA256",
+    "PACKAGE_CATALOG_SHA256",
+    "RIKUNE_ACCEPTANCE_SUBJECT",
+    "RIKUNE_ANALYZER_IMAGE",
+    "STRAD_ANALYZER_IMAGE",
+    "STRAD_IMAGE",
+    "STRAD_VOLUME_INIT_IMAGE",
+    "STRAD_REVISION",
+    "STRAD_NEWAPI_MODEL",
+    "STRAD_RUST_BUILDER_IMAGE",
+    "STRAD_RUNTIME_IMAGE",
+    "STRAD_NODE_BUILDER_IMAGE",
+    "VERDICT_IMAGE",
+    "NEWAPI_IMAGE",
+    "SLUICE_IMAGE",
+    "AUTHORITY_PUBLIC_KEY_SHA256",
+    "SUPPLY_CHAIN_PUBLIC_KEY_SHA256",
+    "SUPPLY_CHAIN_EVIDENCE_SHA256",
+    "SUPPLY_CHAIN_SIGNATURE_SHA256",
+}
+SUCCESSOR_RELEASE_KEYS = BASE_RELEASE_KEYS | {"HOLDFAST_RELEASE_TOOL_REVISION"}
+SUCCESSOR_SEMANTIC_HASH_FIELDS = {
+    "permission_catalog_sha256",
+    "package_catalog_sha256",
+    "access_governance_build_input_sha256",
+    "route_up_sha256",
+    "route_down_sha256",
+    "authz_manifest_sha256",
+}
+SECRET_REFERENCES = [
+    "STRAD_DATABASE_URL",
+    "STRAD_BRIDGE_TOKEN",
+    "RIKUNE_FILE_SERVER_API_KEY",
+    "STRAD_NEWAPI_KEY",
+]
 
 
 def fail(message: str) -> NoReturn:
@@ -43,8 +111,89 @@ def read_evidence(path: Path) -> dict[str, Any]:
     return value
 
 
-def validate_evidence(value: dict[str, Any]) -> None:
-    if value.get("schema_version") != 1:
+def validate_successor_evidence(
+    value: dict[str, Any],
+    catalog_only: bool,
+    release: dict[str, Any],
+    successor_policy_path: Path,
+) -> None:
+    expected_root = set(SUCCESSOR_ROOT_FIELDS)
+    if not catalog_only:
+        expected_root.update(SUCCESSOR_FULL_FIELDS)
+    if set(value) != expected_root:
+        fail("successor release evidence field set is not exact")
+    if (
+        value.get("generator") != SUCCESSOR_GENERATOR
+        or value.get("release_mode") != "successor"
+        or value.get("access_governance_build_input_schema")
+        != SUCCESSOR_BUILD_INPUT_SCHEMA
+    ):
+        fail("successor release mode, generator, or build-input schema differs")
+    for field in SUCCESSOR_SEMANTIC_HASH_FIELDS | {"successor_delta_sha256"}:
+        if not isinstance(value.get(field), str) or not HEX64.fullmatch(value[field]):
+            fail(f"invalid successor release checksum: {field}")
+    tool_revision = value.get("holdfast_release_tool_revision")
+    if not isinstance(tool_revision, str) or not HEX40.fullmatch(tool_revision):
+        fail("invalid Holdfast release-tool revision")
+    if value.get("secret_references") != SECRET_REFERENCES:
+        fail("successor secret reference set or order differs")
+
+    policy = validate_successor_policy(successor_policy_path)
+    predecessor_policy = policy["predecessor"]
+    successor_policy = policy["successor"]
+    predecessor = value.get("predecessor_binding")
+    if not isinstance(predecessor, dict) or predecessor != predecessor_policy:
+        fail("successor predecessor binding differs from the frozen policy")
+    policy_bindings = {
+        "generator": successor_policy["generator"],
+        "access_governance_build_input_schema": successor_policy[
+            "access_build_input_schema"
+        ],
+        "access_governance_build_input_sha256": successor_policy[
+            "access_build_input_sha256"
+        ],
+        "permission_catalog_sha256": predecessor_policy[
+            "permission_catalog_sha256"
+        ],
+        "package_catalog_sha256": predecessor_policy["package_catalog_sha256"],
+    }
+    for field, expected in policy_bindings.items():
+        if value.get(field) != expected:
+            fail(f"successor evidence differs from frozen policy: {field}")
+    expected_delta = "".join(
+        f"{item['before_sha256'] or '0' * 64}  {item['after_sha256']}  {item['path']}\n"
+        for item in policy["overlay"]
+    )
+    if value.get("successor_delta_sha256") != hashlib.sha256(
+        expected_delta.encode("utf-8")
+    ).hexdigest():
+        fail("successor delta checksum differs from the frozen policy")
+
+    if catalog_only:
+        if release:
+            fail("catalog-only successor evidence must not contain release pins")
+        return
+    if set(release) != SUCCESSOR_RELEASE_KEYS:
+        fail("successor release pin field set is not exact")
+    if release.get("HOLDFAST_RELEASE_TOOL_REVISION") != tool_revision:
+        fail("successor release-tool revision differs from the release pin")
+    if release.get("ACCESS_GOVERNANCE_ROLLBACK_IMAGE") != predecessor["access_image"]:
+        fail("successor rollback image is not the immediate predecessor candidate")
+    semantic_release_fields = {
+        "access_governance_build_input_sha256": "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256",
+        "permission_catalog_sha256": "PERMISSION_CATALOG_SHA256",
+        "package_catalog_sha256": "PACKAGE_CATALOG_SHA256",
+    }
+    for evidence_field, release_field in semantic_release_fields.items():
+        if value[evidence_field] != release.get(release_field):
+            fail(f"successor release semantic binding differs: {evidence_field}")
+
+
+def validate_evidence(
+    value: dict[str, Any], successor_policy_path: Path = SUCCESSOR_POLICY
+) -> None:
+    schema_version = value.get("schema_version")
+    if type(schema_version) is not int or schema_version not in (1, 2):
         fail("unsupported evidence schema")
     catalog_only = value.get("catalog_only")
     if not isinstance(catalog_only, bool):
@@ -52,6 +201,10 @@ def validate_evidence(value: dict[str, Any]) -> None:
     release = value.get("release")
     if not isinstance(release, dict):
         fail("release must be an object")
+    if schema_version == 2:
+        validate_successor_evidence(
+            value, catalog_only, release, successor_policy_path.absolute()
+        )
     if catalog_only:
         if release or "analyzer_image_binding" in value or "supply_chain_binding" in value:
             fail("catalog-only evidence must not claim an analyzer image binding")
@@ -126,10 +279,16 @@ def validate_evidence(value: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--evidence", required=True, type=Path)
+    parser.add_argument("--successor-policy", type=Path)
     args = parser.parse_args()
     try:
-        validate_evidence(read_evidence(args.evidence.absolute()))
-    except ValueError as error:
+        policy_path = (
+            args.successor_policy.absolute()
+            if args.successor_policy is not None
+            else SUCCESSOR_POLICY
+        )
+        validate_evidence(read_evidence(args.evidence.absolute()), policy_path)
+    except (OSError, ValueError) as error:
         print(f"holdfast evidence: {error}", file=sys.stderr)
         return 1
     print("Holdfast release evidence is structurally valid")

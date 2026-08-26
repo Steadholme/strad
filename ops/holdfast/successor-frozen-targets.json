@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "generator": "holdfast-rikune-estate/2.0.0",
+  "release_epoch": 1787702400,
+  "permission_catalog_sha256": "92e7ed1dd9aa2369b18c2aae7d05b3f829a8d1750f5569c9ff9536f7ace0ebc9",
+  "package_catalog_sha256": "6a2343c04c0d2cf7c1cbb40414d0be3f91bcb4637499fbc78037f3cb0543d340",
+  "access_governance_build_input_schema": "access-build-input/2",
+  "access_governance_build_input_sha256": "23509919a35c1377ab3953b0364843f99b62f4bd8f4f5b3e7d4e8d75277ba86f",
+  "authz_manifest_sha256": "0d05ea44fabb751fa3599445125ee78cf91837cbb81eabb7e7ad01812c0842eb",
+  "route_up_sha256": "b311effdce00a91e31b22679494fb017a0db5323a95e2cb7a9839b385a8161c2",
+  "route_down_sha256": "f8c3a928008a7672ebd8c4da9fe792625ed30ebfb89268dee4623b4551d52edb",
+  "tokenizer": {
+    "name": "cl100k_base",
+    "package": "tiktoken-rs@0.7",
+    "vocabulary_sha256": "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+    "minimum_context_tokens": 32768
+  },
+  "required_unresolved_inputs": [
+    "ACCESS_GOVERNANCE_IMAGE",
+    "ACCESS_GOVERNANCE_ROLLBACK_IMAGE",
+    "RIKUNE_ANALYZER_IMAGE",
+    "STRAD_ANALYZER_IMAGE",
+    "STRAD_IMAGE",
+    "STRAD_VOLUME_INIT_IMAGE",
+    "STRAD_REVISION",
+    "HOLDFAST_RELEASE_TOOL_REVISION",
+    "STRAD_NEWAPI_MODEL",
+    "STRAD_RUST_BUILDER_IMAGE",
+    "STRAD_RUNTIME_IMAGE",
+    "STRAD_NODE_BUILDER_IMAGE",
+    "VERDICT_IMAGE",
+    "NEWAPI_IMAGE",
+    "SLUICE_IMAGE",
+    "AUTHORITY_PUBLIC_KEY_SHA256",
+    "SUPPLY_CHAIN_PUBLIC_KEY_SHA256",
+    "SUPPLY_CHAIN_EVIDENCE_SHA256",
+    "SUPPLY_CHAIN_SIGNATURE_SHA256",
+    "STRAD_DATABASE_URL",
+    "STRAD_BRIDGE_TOKEN",
+    "RIKUNE_FILE_SERVER_API_KEY",
+    "STRAD_NEWAPI_KEY"
+  ]
+}

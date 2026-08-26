@@ -113,6 +113,367 @@ atomic_copy_authority() {
     holdfast_die "frozen rollback authority differs from its source"
 }
 
+derive_backup_successor_mode() {
+  local line relative schema release_mode digest authority_dir authority_count=0
+  local -A expected_authorities=()
+  require_root_file "$backup/CONTROL.sha256"
+  require_root_file "$backup/RELEASE-EVIDENCE.json"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[0-9a-f]{64}[[:space:]][[:space:]]([A-Za-z0-9._/-]+)$ ]] || \
+      holdfast_die "CONTROL contains an invalid checksum line"
+    relative=${BASH_REMATCH[1]}
+    [[ "$relative" != /* && "$relative" != ".." && "$relative" != *"../"* ]] || \
+      holdfast_die "CONTROL contains an unsafe path"
+  done <"$backup/CONTROL.sha256"
+  (cd "$backup" && sha256sum --check CONTROL.sha256) >/dev/null
+  grep -Fqx "$(holdfast_sha256 "$backup/RELEASE-EVIDENCE.json")  RELEASE-EVIDENCE.json" \
+    "$backup/CONTROL.sha256" || holdfast_die "CONTROL omits RELEASE-EVIDENCE"
+  schema=$(jq -er '.schema_version' "$backup/RELEASE-EVIDENCE.json")
+  release_mode=$(jq -er '.release_mode // "base"' "$backup/RELEASE-EVIDENCE.json")
+  if [[ "$schema" == "1" && "$release_mode" == "base" ]]; then
+    for relative in PREDECESSOR-CURRENT.json SUCCESSOR-ARMED.receipt \
+      SUCCESSOR-DELTA.sha256 successor-authority; do
+      [[ ! -e "$backup/$relative" && ! -L "$backup/$relative" ]] || \
+        holdfast_die "base backup contains mixed successor authority: $relative"
+    done
+    grep -Eq '[[:space:]][[:space:]](PREDECESSOR-CURRENT.json|SUCCESSOR-ARMED.receipt|SUCCESSOR-DELTA.sha256|successor-authority/)' \
+      "$backup/CONTROL.sha256" && holdfast_die "base CONTROL contains successor authority"
+    printf 'false\n'
+    return
+  fi
+  [[ "$schema" == "2" && "$release_mode" == "successor" ]] || \
+    holdfast_die "backup release mode is unsupported or mixed"
+  for relative in PREDECESSOR-CURRENT.json SUCCESSOR-ARMED.receipt \
+    SUCCESSOR-DELTA.sha256 RENDER-INPUTS.sha256; do
+    require_root_file "$backup/$relative"
+    grep -Fqx "$(holdfast_sha256 "$backup/$relative")  $relative" \
+      "$backup/CONTROL.sha256" || holdfast_die "successor CONTROL omits $relative"
+  done
+  authority_dir="$backup/successor-authority"
+  require_canonical_root_dir "$authority_dir"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([0-9a-f]{64})[[:space:]][[:space:]]([A-Za-z0-9._-]+)$ ]] || \
+      holdfast_die "successor render-input authority contains an invalid line"
+    digest=${BASH_REMATCH[1]}
+    relative=${BASH_REMATCH[2]}
+    [[ -z "${expected_authorities[$relative]+x}" ]] || \
+      holdfast_die "successor render-input authority repeats a path"
+    expected_authorities[$relative]=1
+    require_root_file "$authority_dir/$relative"
+    [[ "$(holdfast_sha256 "$authority_dir/$relative")" == "$digest" ]] || \
+      holdfast_die "successor generation authority differs: $relative"
+    grep -Fqx "$digest  successor-authority/$relative" "$backup/CONTROL.sha256" || \
+      holdfast_die "successor CONTROL omits generation authority: $relative"
+    authority_count=$((authority_count + 1))
+  done <"$backup/RENDER-INPUTS.sha256"
+  ((authority_count == 6)) || holdfast_die "successor generation authority set is not exact"
+  for relative in Dockerfile.analyzer bridge-package-lock.json; do
+    expected_authorities[$relative]=1
+    require_root_file "$authority_dir/$relative"
+    grep -Fqx "$(holdfast_sha256 "$authority_dir/$relative")  successor-authority/$relative" \
+      "$backup/CONTROL.sha256" || holdfast_die "successor CONTROL omits generation authority: $relative"
+  done
+  require_canonical_root_dir "$authority_dir/assets"
+  for relative in 20260823_rikune_root_up.sql 20260823_rikune_root_down.sql; do
+    require_root_file "$authority_dir/assets/$relative"
+    grep -Fqx "$(holdfast_sha256 "$authority_dir/assets/$relative")  successor-authority/assets/$relative" \
+      "$backup/CONTROL.sha256" || holdfast_die "successor CONTROL omits route authority: $relative"
+  done
+  [[ "$(find "$authority_dir/assets" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" == "2" ]] || \
+    holdfast_die "successor route authority file set is not exact"
+  while IFS= read -r relative; do
+    [[ -n "${expected_authorities[$relative]+x}" ]] || \
+      holdfast_die "successor authority directory contains an unbound generation file: $relative"
+  done < <(find "$authority_dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+  [[ "$(find "$authority_dir" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" == "8" ]] || \
+    holdfast_die "successor authority directory file set is not exact"
+  printf 'true\n'
+}
+
+successor_rollback="false"
+backup_expected_successor=""
+predecessor_current_file=""
+predecessor_current_sha=""
+predecessor_backup=""
+predecessor_control_sha=""
+predecessor_apply_sha=""
+predecessor_release_sha=""
+predecessor_runtime_receipt_sha=""
+predecessor_runtime_manifest_sha=""
+predecessor_generation=""
+release_generation=""
+successor_armed_receipt=""
+successor_armed_sha=""
+
+load_successor_authority() {
+  local pointer=$1 expected key value predecessor_apply predecessor_file pointer_successor
+  local successor_delta_sha authority_dir relative line digest authority_count=0
+  local -A seen_authorities=()
+  pointer_successor=$(jq -er 'if has("successor") then (.successor | tostring) else "absent" end' "$pointer")
+  if [[ "$backup_expected_successor" == "false" ]]; then
+    [[ "$pointer_successor" == "false" || "$pointer_successor" == "absent" ]] || \
+      holdfast_die "base backup CURRENT successor mode differs"
+    successor_rollback="false"
+    return 0
+  fi
+  [[ "$backup_expected_successor" == "true" && "$pointer_successor" == "true" ]] || \
+    holdfast_die "successor backup CURRENT mode is missing or downgraded"
+  successor_rollback="true"
+  predecessor_current_file="$backup/PREDECESSOR-CURRENT.json"
+  successor_armed_receipt="$backup/SUCCESSOR-ARMED.receipt"
+  require_root_file "$predecessor_current_file"
+  require_root_file "$successor_armed_receipt"
+  predecessor_current_sha=$(holdfast_sha256 "$predecessor_current_file")
+  successor_armed_sha=$(holdfast_sha256 "$successor_armed_receipt")
+  jq -e \
+    --arg estate "$estate_root" \
+    '.schema_version == 2 and .state == "applied_ingress_closed" and
+     .estate_root == $estate and .route_database_state == "absent" and
+     .public_ipv4_ipv6_closed_status == 404 and .runtime_verified == true and
+     .services_activated == true and .ingress_opened == false' \
+    "$predecessor_current_file" >/dev/null || \
+    holdfast_die "successor rollback predecessor CURRENT is not eligible"
+  predecessor_backup=$(jq -er '.backup_dir' "$predecessor_current_file")
+  holdfast_require_absolute "$predecessor_backup"
+  require_canonical_root_dir "$predecessor_backup"
+  [[ "$predecessor_backup" != "$backup" ]] || \
+    holdfast_die "successor rollback cannot point to its own backup as predecessor"
+  [[ -z "$(find "$predecessor_backup" -maxdepth 0 -perm /077 -print -quit)" ]] || \
+    holdfast_die "successor rollback predecessor backup is not private"
+  [[ -z "$(find "$predecessor_backup" -xdev -type l -print -quit)" ]] || \
+    holdfast_die "successor rollback predecessor backup contains a symlink"
+  [[ -z "$(find "$predecessor_backup" -xdev ! -user root -print -quit)" ]] || \
+    holdfast_die "successor rollback predecessor backup contains a non-root-owned entry"
+  for predecessor_file in \
+    "$predecessor_backup/CONTROL.sha256" "$predecessor_backup/APPLY.receipt" \
+    "$predecessor_backup/RELEASE-EVIDENCE.json" \
+    "$predecessor_backup/runtime/BACKUP.receipt" \
+    "$predecessor_backup/runtime/SHA256SUMS"; do
+    require_root_file "$predecessor_file"
+  done
+  (cd "$predecessor_backup" && sha256sum --check CONTROL.sha256)
+  (cd "$predecessor_backup/runtime" && sha256sum --check SHA256SUMS)
+  predecessor_control_sha=$(holdfast_sha256 "$predecessor_backup/CONTROL.sha256")
+  predecessor_apply_sha=$(holdfast_sha256 "$predecessor_backup/APPLY.receipt")
+  predecessor_release_sha=$(holdfast_sha256 "$predecessor_backup/RELEASE-EVIDENCE.json")
+  predecessor_runtime_receipt_sha=$(holdfast_sha256 "$predecessor_backup/runtime/BACKUP.receipt")
+  predecessor_runtime_manifest_sha=$(holdfast_sha256 "$predecessor_backup/runtime/SHA256SUMS")
+  [[ "$(jq -er '.control_sha256' "$predecessor_current_file")" == "$predecessor_control_sha" && \
+    "$(jq -er '.apply_receipt_sha256' "$predecessor_current_file")" == "$predecessor_apply_sha" && \
+    "$(jq -er '.release_evidence_sha256' "$predecessor_current_file")" == "$predecessor_release_sha" ]] || \
+    holdfast_die "successor rollback predecessor CURRENT authority differs"
+  if jq -e 'has("runtime_backup_receipt_sha256")' "$predecessor_current_file" >/dev/null; then
+    [[ "$(jq -er '.runtime_backup_receipt_sha256' "$predecessor_current_file")" == \
+      "$predecessor_runtime_receipt_sha" ]] || \
+      holdfast_die "successor rollback predecessor runtime receipt differs"
+  fi
+  if jq -e 'has("runtime_backup_manifest_sha256")' "$predecessor_current_file" >/dev/null; then
+    [[ "$(jq -er '.runtime_backup_manifest_sha256' "$predecessor_current_file")" == \
+      "$predecessor_runtime_manifest_sha" ]] || \
+      holdfast_die "successor rollback predecessor runtime manifest differs"
+  fi
+  predecessor_apply="$predecessor_backup/APPLY.receipt"
+  for expected in \
+    "schema_version=2" "completion_state=applied_ingress_closed" \
+    "estate_root=$estate_root" "backup_dir=$predecessor_backup" \
+    "control_sha256=$predecessor_control_sha" \
+    "release_evidence_sha256=$predecessor_release_sha" \
+    "runtime_backup=passed" "closed_bracket=passed" \
+    "route_database_state=absent" "public_ipv4_ipv6_closed_status=404" \
+    "services_activated=true" "runtime_verified=true" "ingress_opened=false"; do
+    key=${expected%%=*}
+    value=${expected#*=}
+    [[ "$(holdfast_receipt_value "$predecessor_apply" "$key")" == "$value" ]] || \
+      holdfast_die "successor rollback predecessor APPLY differs: $key"
+  done
+  [[ "$(holdfast_receipt_value "$predecessor_backup/runtime/BACKUP.receipt" schema_version)" == "2" && \
+    "$(holdfast_receipt_value "$predecessor_backup/runtime/BACKUP.receipt" isolated_restore_probe)" == "passed" ]] || \
+    holdfast_die "successor rollback predecessor runtime authority differs"
+  predecessor_generation=$(jq -er '.release_generation // 1' "$predecessor_current_file")
+  release_generation=$(holdfast_receipt_value "$successor_armed_receipt" release_generation)
+  [[ "$predecessor_generation" =~ ^[1-9][0-9]*$ && \
+    "$release_generation" =~ ^[1-9][0-9]*$ && \
+    "$release_generation" -eq $((predecessor_generation + 1)) ]] || \
+    holdfast_die "successor rollback generation linkage is invalid"
+  for expected in \
+    "schema_version=1" "successor_backup_dir=$backup" \
+    "predecessor_current_file=PREDECESSOR-CURRENT.json" \
+    "predecessor_current_sha256=$predecessor_current_sha" \
+    "predecessor_backup_dir=$predecessor_backup" \
+    "predecessor_control_sha256=$predecessor_control_sha" \
+    "predecessor_apply_receipt_sha256=$predecessor_apply_sha" \
+    "predecessor_release_evidence_sha256=$predecessor_release_sha" \
+    "predecessor_runtime_backup_receipt_sha256=$predecessor_runtime_receipt_sha" \
+    "predecessor_runtime_backup_manifest_sha256=$predecessor_runtime_manifest_sha" \
+    "predecessor_release_generation=$predecessor_generation" \
+    "release_generation=$release_generation" "route_database_state=absent" \
+    "public_ipv4_ipv6_closed_status=404" "predecessor_runtime_verified=true" \
+    "ingress_opened=false"; do
+    key=${expected%%=*}
+    value=${expected#*=}
+    [[ "$(holdfast_receipt_value "$successor_armed_receipt" "$key")" == "$value" ]] || \
+      holdfast_die "successor rollback arm differs: $key"
+  done
+  jq -e \
+    --arg successor_sha "$successor_armed_sha" \
+    --arg predecessor_sha "$predecessor_current_sha" \
+    --arg predecessor_backup "$predecessor_backup" \
+    --arg predecessor_control "$predecessor_control_sha" \
+    --arg predecessor_apply "$predecessor_apply_sha" \
+    --arg predecessor_release "$predecessor_release_sha" \
+    --arg predecessor_runtime_receipt "$predecessor_runtime_receipt_sha" \
+    --arg predecessor_runtime_manifest "$predecessor_runtime_manifest_sha" \
+    --argjson predecessor_generation "$predecessor_generation" \
+    --argjson generation "$release_generation" \
+    '.successor == true and .successor_armed_receipt == "SUCCESSOR-ARMED.receipt" and
+     .successor_armed_receipt_sha256 == $successor_sha and
+     .predecessor_current_file == "PREDECESSOR-CURRENT.json" and
+     .predecessor_current_sha256 == $predecessor_sha and
+     .predecessor_backup_dir == $predecessor_backup and
+     .predecessor_control_sha256 == $predecessor_control and
+     .predecessor_apply_receipt_sha256 == $predecessor_apply and
+     .predecessor_release_evidence_sha256 == $predecessor_release and
+     .predecessor_runtime_backup_receipt_sha256 == $predecessor_runtime_receipt and
+     .predecessor_runtime_backup_manifest_sha256 == $predecessor_runtime_manifest and
+     .predecessor_release_generation == $predecessor_generation and
+     .release_generation == $generation' "$pointer" >/dev/null || \
+    holdfast_die "successor rollback CURRENT linkage differs"
+  jq -e \
+    --arg current "$predecessor_current_sha" \
+    --arg control "$predecessor_control_sha" \
+    --arg apply "$predecessor_apply_sha" \
+    --arg release "$predecessor_release_sha" \
+    --arg runtime "$predecessor_runtime_manifest_sha" \
+    '.schema_version == 2 and .release_mode == "successor" and
+     .predecessor_binding.current_state_sha256 == $current and
+     .predecessor_binding.control_sha256 == $control and
+     .predecessor_binding.apply_receipt_sha256 == $apply and
+     .predecessor_binding.release_evidence_sha256 == $release and
+     .predecessor_binding.runtime_manifest_sha256 == $runtime' \
+    "$backup/RELEASE-EVIDENCE.json" >/dev/null || \
+    holdfast_die "successor rollback RELEASE-EVIDENCE points to another predecessor"
+  require_root_file "$backup/SUCCESSOR-DELTA.sha256"
+  successor_delta_sha=$(holdfast_sha256 "$backup/SUCCESSOR-DELTA.sha256")
+  [[ "$(holdfast_receipt_value "$backup/DRY-RUN.receipt" successor_delta_sha256)" == \
+    "$successor_delta_sha" && \
+    "$(jq -er '.successor_delta_sha256' "$backup/RELEASE-EVIDENCE.json")" == \
+    "$successor_delta_sha" ]] || \
+    holdfast_die "successor rollback delta authority differs"
+  grep -Fqx "$successor_delta_sha  SUCCESSOR-DELTA.sha256" \
+    "$backup/CONTROL.sha256" || holdfast_die "successor CONTROL omits the successor delta"
+  grep -Fqx "$predecessor_current_sha  PREDECESSOR-CURRENT.json" \
+    "$backup/CONTROL.sha256" || holdfast_die "successor CONTROL omits predecessor CURRENT"
+  grep -Fqx "$successor_armed_sha  SUCCESSOR-ARMED.receipt" \
+    "$backup/CONTROL.sha256" || holdfast_die "successor CONTROL omits successor arm"
+  for relative in SUPPLY-CHAIN.json SUPPLY-CHAIN.sig SUPPLY-CHAIN.pub; do
+    require_root_file "$backup/$relative"
+    grep -Fqx "$(holdfast_sha256 "$backup/$relative")  $relative" \
+      "$backup/CONTROL.sha256" || \
+      holdfast_die "successor CONTROL omits supply-chain authority: $relative"
+  done
+  authority_dir="$backup/successor-authority"
+  require_canonical_root_dir "$authority_dir"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([0-9a-f]{64})[[:space:]][[:space:]]([A-Za-z0-9._-]+)$ ]] || \
+      holdfast_die "successor render-input authority contains an invalid line"
+    digest=${BASH_REMATCH[1]}
+    relative=${BASH_REMATCH[2]}
+    [[ -z "${seen_authorities[$relative]+x}" ]] || \
+      holdfast_die "successor render-input authority repeats a path"
+    seen_authorities[$relative]=1
+    require_root_file "$authority_dir/$relative"
+    [[ "$(holdfast_sha256 "$authority_dir/$relative")" == "$digest" ]] || \
+      holdfast_die "successor generation authority differs from render inputs: $relative"
+    grep -Fqx "$digest  successor-authority/$relative" \
+      "$backup/CONTROL.sha256" || \
+      holdfast_die "successor CONTROL omits generation authority: $relative"
+    authority_count=$((authority_count + 1))
+  done <"$backup/RENDER-INPUTS.sha256"
+  ((authority_count == 6)) || \
+    holdfast_die "successor generation authority set is not exactly six files"
+  for relative in Dockerfile.analyzer bridge-package-lock.json; do
+    require_root_file "$authority_dir/$relative"
+    grep -Fqx "$(holdfast_sha256 "$authority_dir/$relative")  successor-authority/$relative" \
+      "$backup/CONTROL.sha256" || \
+      holdfast_die "successor CONTROL omits generation authority: $relative"
+  done
+  require_canonical_root_dir "$authority_dir/assets"
+  for relative in 20260823_rikune_root_up.sql 20260823_rikune_root_down.sql; do
+    require_root_file "$authority_dir/assets/$relative"
+    grep -Fqx "$(holdfast_sha256 "$authority_dir/assets/$relative")  successor-authority/assets/$relative" \
+      "$backup/CONTROL.sha256" || \
+      holdfast_die "successor CONTROL omits route authority: $relative"
+  done
+  run_python_tool "$supply_validator" "$script_dir/supply_chain_evidence.py" \
+    --release-env "$backup/release.env" \
+    --evidence "$backup/SUPPLY-CHAIN.json" \
+    --signature "$backup/SUPPLY-CHAIN.sig" \
+    --public-key "$backup/SUPPLY-CHAIN.pub" \
+    --dockerfile "$authority_dir/Dockerfile.analyzer" \
+    --bridge-lock "$authority_dir/bridge-package-lock.json" \
+    --release-evidence "$backup/RELEASE-EVIDENCE.json" \
+    --successor-policy "$authority_dir/successor-policy.json"
+}
+
+append_successor_lineage_receipt_fields() {
+  [[ "$successor_rollback" == "true" ]] || return 0
+  printf 'successor=true\n'
+  printf 'successor_armed_receipt_sha256=%s\n' "$successor_armed_sha"
+  printf 'predecessor_current_sha256=%s\n' "$predecessor_current_sha"
+  printf 'predecessor_backup_dir=%s\n' "$predecessor_backup"
+  printf 'predecessor_control_sha256=%s\n' "$predecessor_control_sha"
+  printf 'predecessor_apply_receipt_sha256=%s\n' "$predecessor_apply_sha"
+  printf 'predecessor_release_evidence_sha256=%s\n' "$predecessor_release_sha"
+  printf 'predecessor_runtime_backup_receipt_sha256=%s\n' "$predecessor_runtime_receipt_sha"
+  printf 'predecessor_runtime_backup_manifest_sha256=%s\n' "$predecessor_runtime_manifest_sha"
+  printf 'predecessor_release_generation=%s\n' "$predecessor_generation"
+  printf 'release_generation=%s\n' "$release_generation"
+}
+
+validate_successor_lineage_receipt() {
+  local receipt=$1 expected key value
+  [[ "$successor_rollback" == "true" ]] || return 0
+  require_root_file "$receipt"
+  for expected in \
+    "successor=true" "successor_armed_receipt_sha256=$successor_armed_sha" \
+    "predecessor_current_sha256=$predecessor_current_sha" \
+    "predecessor_backup_dir=$predecessor_backup" \
+    "predecessor_control_sha256=$predecessor_control_sha" \
+    "predecessor_apply_receipt_sha256=$predecessor_apply_sha" \
+    "predecessor_release_evidence_sha256=$predecessor_release_sha" \
+    "predecessor_runtime_backup_receipt_sha256=$predecessor_runtime_receipt_sha" \
+    "predecessor_runtime_backup_manifest_sha256=$predecessor_runtime_manifest_sha" \
+    "predecessor_release_generation=$predecessor_generation" \
+    "release_generation=$release_generation"; do
+    key=${expected%%=*}
+    value=${expected#*=}
+    [[ "$(holdfast_receipt_value "$receipt" "$key")" == "$value" ]] || \
+      holdfast_die "successor rollback receipt lineage differs: $key"
+  done
+}
+
+restore_immediate_predecessor_current() {
+  local temporary
+  [[ "$successor_rollback" == "true" ]] || return 0
+  if [[ -e "$state_file" || -L "$state_file" ]]; then
+    require_root_file "$state_file"
+    jq -e \
+      --arg backup "$backup" \
+      --arg predecessor_sha "$predecessor_current_sha" \
+      '.state == "rolled_back" and .backup_dir == $backup and
+       .successor == true and .predecessor_current_sha256 == $predecessor_sha' \
+      "$state_file" >/dev/null || \
+      holdfast_die "successor rollback refuses to replace a non-completed CURRENT"
+  fi
+  temporary="$state_dir/.PREDECESSOR-CURRENT.$$"
+  [[ ! -e "$temporary" && ! -L "$temporary" ]] || \
+    holdfast_die "successor rollback predecessor CURRENT temporary path exists"
+  install -o 0 -g 0 -m 0600 -- "$predecessor_current_file" "$temporary"
+  commit_atomic_file "$temporary" "$state_file"
+  [[ "$(holdfast_sha256 "$state_file")" == "$predecessor_current_sha" ]] || \
+    holdfast_die "successor rollback did not restore the immediate predecessor CURRENT"
+}
+
 load_frozen_rollback_authorities() {
   local attempt armed_name armed_receipt armed_sha expected key value file_name
   attempt=$(jq -er '.rollback_attempt_id' "$state_file")
@@ -187,6 +548,7 @@ load_frozen_rollback_authorities() {
 psql_bin=$(test_override HOLDFAST_PSQL_BIN psql)
 public_verify=$(test_override HOLDFAST_PUBLIC_VERIFY_BIN "$script_dir/public-origin-verify.sh")
 release_validator=$(test_override HOLDFAST_RELEASE_VALIDATOR_BIN "$script_dir/validate_release_evidence.py")
+supply_validator=$(test_override HOLDFAST_SUPPLY_CHAIN_EVIDENCE_BIN "$script_dir/supply_chain_evidence.py")
 authority_tool=$(test_override HOLDFAST_AUTHORITY_EVIDENCE_BIN "$script_dir/authority_evidence.py")
 edge_tool=$(test_override HOLDFAST_EDGE_EVIDENCE_BIN "$script_dir/edge_evidence.py")
 docker_bin=$(test_override HOLDFAST_DOCKER_BIN docker)
@@ -194,12 +556,20 @@ runtime_restore=$(test_override HOLDFAST_RUNTIME_RESTORE_BIN "$script_dir/runtim
 estate_transaction=$(test_override HOLDFAST_ESTATE_TRANSACTION_BIN "$script_dir/estate_transaction.py")
 
 state_file="$state_dir/CURRENT.json"
-route_receipt="$state_dir/ROUTE-CLOSE.receipt"
-route_preimage="$state_dir/ROUTE-CLOSE-PREIMAGE.jsonl"
 require_canonical_root_dir "$state_dir"
 require_canonical_root_dir "$backup"
 require_canonical_root_dir "$estate_root"
 require_root_file "$state_file"
+backup_expected_successor=$(derive_backup_successor_mode)
+route_generation_identity=$(holdfast_sha256 "$backup/CONTROL.sha256")
+route_receipt_name="ROUTE-CLOSE-${route_generation_identity}.receipt"
+route_preimage_name="ROUTE-CLOSE-PREIMAGE-${route_generation_identity}.jsonl"
+route_receipt="$state_dir/$route_receipt_name"
+route_preimage="$state_dir/$route_preimage_name"
+route_down_authority="$script_dir/assets/20260823_rikune_root_down.sql"
+if [[ "$backup_expected_successor" == "true" ]]; then
+  route_down_authority="$backup/successor-authority/assets/20260823_rikune_root_down.sql"
+fi
 
 verify_database_absent() {
   local observed
@@ -222,12 +592,12 @@ execute_frozen_route_down() {
   temporary="$state_dir/.ROUTE-CLOSE-DOWN.$$"
   if [[ -e "$route_preimage" || -L "$route_preimage" ]]; then
     [[ -f "$route_preimage" && ! -L "$route_preimage" ]] || holdfast_die "unsafe route-close preimage evidence"
-    target="$state_dir/ROUTE-CLOSE-RETRY-$(date -u +%Y%m%dT%H%M%SZ)-$$.jsonl"
+    target="$state_dir/ROUTE-CLOSE-RETRY-${route_generation_identity}-$(date -u +%Y%m%dT%H%M%SZ)-$$.jsonl"
   else
     target="$route_preimage"
   fi
   if PGAPPNAME=holdfast-rikune-close "$psql_bin" "$ROUTES_DATABASE_URL" -XAtq \
-    -f "$script_dir/assets/20260823_rikune_root_down.sql" >"$temporary" 2>&1; then
+    -f "$route_down_authority" >"$temporary" 2>&1; then
     status=0
   else
     status=$?
@@ -236,7 +606,7 @@ execute_frozen_route_down() {
   if [[ $status -eq 0 ]]; then
     mv -- "$temporary" "$target"
   else
-    target="$state_dir/ROUTE-CLOSE-DOWN-FAILED-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+    target="$state_dir/ROUTE-CLOSE-DOWN-FAILED-${route_generation_identity}-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
     mv -- "$temporary" "$target"
     echo "frozen route-down failed; exact output preserved at $target" >&2
     return "$status"
@@ -255,7 +625,7 @@ validate_route_close_receipt_for_adoption() {
   [[ "$(jq -er '.backup_dir' "$state_file")" == "$backup" ]] || \
     holdfast_die "route-close source state points to another backup"
   expected_route_down=$(jq -er '.route_down_sha256' "$backup/RELEASE-EVIDENCE.json")
-  [[ "$expected_route_down" == "$(holdfast_sha256 "$script_dir/assets/20260823_rikune_root_down.sql")" ]] || \
+  [[ "$expected_route_down" == "$(holdfast_sha256 "$route_down_authority")" ]] || \
     holdfast_die "route-down SQL differs from release evidence"
   if [[ "$source_state" == "ingress_open" ]]; then
     expected_public="true"
@@ -285,17 +655,26 @@ validate_route_close_receipt_for_adoption() {
   done
   [[ "$(holdfast_receipt_value "$route_receipt" route_down_execution_evidence_sha256)" \
     =~ ^[0-9a-f]{64}$ ]] || holdfast_die "route-close execution evidence identity is invalid"
+  load_successor_authority "$state_file"
 }
 
 commit_route_closed_state() {
   local state_tmp="$state_dir/.CURRENT.json.$$"
-  jq --arg close_sha "$(holdfast_sha256 "$route_receipt")" \
-    '.state="route_closed_awaiting_revocation" | .route_close_receipt_sha256=$close_sha | .ingress_opened=false' \
+  jq --arg close "$route_receipt_name" \
+    --arg close_sha "$(holdfast_sha256 "$route_receipt")" \
+    --arg preimage "$route_preimage_name" \
+    --arg preimage_sha "$(holdfast_sha256 "$route_preimage")" \
+    '.state="route_closed_awaiting_revocation" |
+     .route_close_receipt=$close | .route_close_receipt_sha256=$close_sha |
+     .route_close_preimage=$preimage | .route_close_preimage_sha256=$preimage_sha |
+     .ingress_opened=false' \
     "$state_file" >"$state_tmp"
   commit_atomic_file "$state_tmp" "$state_file"
 }
 
 validate_backup_and_open_authority() {
+  local release_validator_args=(--evidence "$backup/RELEASE-EVIDENCE.json")
+  local rollback_successor_policy
   [[ "$(jq -er '.backup_dir' "$state_file")" == "$backup" ]] || holdfast_die "state points to another backup"
   require_canonical_root_dir "$backup/estate"
   require_canonical_root_dir "$backup/estate/tree"
@@ -312,15 +691,25 @@ validate_backup_and_open_authority() {
   [[ -z "$(find "$backup" -xdev -type l -print -quit)" ]] || holdfast_die "backup contains a symlink"
   [[ -z "$(find "$backup" -xdev ! -user root -print -quit)" ]] || holdfast_die "backup contains a non-root-owned entry"
   (cd "$backup" && sha256sum --check CONTROL.sha256)
+  if jq -e '.schema_version == 2 and .release_mode == "successor"' \
+    "$backup/RELEASE-EVIDENCE.json" >/dev/null; then
+    rollback_successor_policy="$backup/successor-authority/successor-policy.json"
+    require_root_file "$rollback_successor_policy"
+    grep -Fqx "$(holdfast_sha256 "$rollback_successor_policy")  successor-authority/successor-policy.json" \
+      "$backup/CONTROL.sha256" || \
+      holdfast_die "successor CONTROL omits its frozen release policy"
+    release_validator_args+=(--successor-policy "$rollback_successor_policy")
+  fi
   run_python_tool "$release_validator" "$script_dir/validate_release_evidence.py" \
-    --evidence "$backup/RELEASE-EVIDENCE.json"
+    "${release_validator_args[@]}"
   expected_route_down=$(jq -er '.route_down_sha256' "$backup/RELEASE-EVIDENCE.json")
-  [[ "$expected_route_down" == "$(holdfast_sha256 "$script_dir/assets/20260823_rikune_root_down.sql")" ]] || \
+  [[ "$expected_route_down" == "$(holdfast_sha256 "$route_down_authority")" ]] || \
     holdfast_die "route-down SQL differs from release evidence"
   run_python_tool "$authority_tool" "$script_dir/authority_evidence.py" --mode open \
     --evidence "$open_evidence" --signature "$open_signature" --public-key "$authority_public_key" \
     --release-env "$backup/release.env" --release-evidence "$backup/RELEASE-EVIDENCE.json" \
     --dry-run-receipt "$backup/DRY-RUN.receipt"
+  load_successor_authority "$state_file"
 }
 
 release_services=(
@@ -706,7 +1095,10 @@ validate_rollback_arm() {
     "targets_sha256=$(holdfast_sha256 "$backup/TARGETS.sha256")" \
     "apply_preimages_sha256=$(holdfast_sha256 "$backup/APPLY-PREIMAGES.sha256")" \
     "apply_absent_sha256=$(holdfast_sha256 "$backup/APPLY-ABSENT.paths")" \
+    "route_close_receipt=$route_receipt_name" \
     "route_close_receipt_sha256=$(holdfast_sha256 "$route_receipt")" \
+    "route_close_preimage=$route_preimage_name" \
+    "route_close_preimage_sha256=$(holdfast_sha256 "$route_preimage")" \
     "open_evidence_file=$frozen_open_evidence_name" \
     "open_evidence_sha256=$(holdfast_sha256 "$open_evidence")" \
     "open_signature_file=$frozen_open_signature_name" \
@@ -735,6 +1127,7 @@ validate_rollback_arm() {
     [[ "$(holdfast_receipt_value "$rollback_armed_receipt" "$key")" == "$value" ]] || \
       holdfast_die "rollback armed authority differs: $key"
   done
+  validate_successor_lineage_receipt "$rollback_armed_receipt"
 }
 
 validate_runtime_restore_phase_receipt() {
@@ -948,7 +1341,10 @@ validate_completed_rollback_receipt() {
     "runtime_restore_phase_receipt_sha256=$runtime_phase_sha" \
     "estate_restore_phase_receipt_sha256=$estate_phase_sha" \
     "services_reactivated_phase_receipt_sha256=$services_phase_sha" \
+    "route_close_receipt=$route_receipt_name" \
     "route_close_receipt_sha256=$(holdfast_sha256 "$route_receipt")" \
+    "route_close_preimage=$route_preimage_name" \
+    "route_close_preimage_sha256=$(holdfast_sha256 "$route_preimage")" \
     "revocation_evidence_sha256=$(holdfast_sha256 "$revocation_evidence")" \
     "open_evidence_sha256=$(holdfast_sha256 "$open_evidence")" \
     "runtime_restore_receipt_sha256=$(holdfast_sha256 "$backup/runtime/RESTORE.receipt")" \
@@ -966,12 +1362,12 @@ validate_completed_rollback_receipt() {
   reactivated=$(holdfast_receipt_value "$receipt" reactivated_services)
   [[ "$reactivated" == "$expected_reactivated_services" ]] || \
     holdfast_die "rollback receipt reactivated-services set differs from frozen recovery authority"
+  validate_successor_lineage_receipt "$receipt"
 }
 
 finalize_rollback_state() {
-  local receipt=$1 completed state_tmp current
+  local receipt=$1 completed state_tmp current completed_sha
   completed="$state_dir/ROLLBACK-COMPLETE-${attempt_id}.json"
-  [[ ! -e "$completed" && ! -L "$completed" ]] || holdfast_die "rollback completion state already exists"
   current=$(jq -er '.state' "$state_file")
   if [[ "$current" != "rolled_back" ]]; then
     state_tmp="$state_dir/.ROLLBACK-COMPLETE.$$"
@@ -983,10 +1379,143 @@ finalize_rollback_state() {
     [[ "$(jq -er '.rollback_receipt_sha256' "$state_file")" == "$(holdfast_sha256 "$receipt")" ]] || \
       holdfast_die "rolled-back state receipt was replaced"
   fi
-  mv -- "$state_file" "$completed"
-  sync -f "$completed"
-  sync -f "$state_dir"
+  if [[ "$successor_rollback" == "true" ]]; then
+    if [[ -e "$completed" || -L "$completed" ]]; then
+      require_root_file "$completed"
+      completed_sha=$(holdfast_sha256 "$completed")
+      [[ "$completed_sha" == "$(holdfast_sha256 "$state_file")" ]] || \
+        holdfast_die "successor rollback completion archive differs from CURRENT"
+    else
+      atomic_copy_authority "$state_file" "$completed"
+    fi
+    restore_immediate_predecessor_current
+    if [[ "${HOLDFAST_TEST_MODE:-0}" == "1" && \
+      "${HOLDFAST_TEST_SIGKILL_AFTER_PREDECESSOR_CURRENT_RESTORE:-0}" == "1" ]]; then
+      kill -KILL "$$"
+    fi
+  else
+    [[ ! -e "$completed" && ! -L "$completed" ]] || \
+      holdfast_die "rollback completion state already exists"
+    mv -- "$state_file" "$completed"
+    sync -f "$completed"
+    sync -f "$state_dir"
+  fi
 }
+
+validate_successor_completed_terminal() {
+  local live_state_file=$state_file rollback_receipt="$backup/ROLLBACK.receipt"
+  local rollback_receipt_sha candidate candidate_name completed="" completed_count=0
+  local completed_sha current_sha state_control_sha activation_requested
+
+  require_root_file "$live_state_file"
+  require_root_file "$rollback_receipt"
+  current_sha=$(holdfast_sha256 "$live_state_file")
+  rollback_receipt_sha=$(holdfast_sha256 "$rollback_receipt")
+  while IFS= read -r candidate; do
+    candidate_name=$(basename -- "$candidate")
+    [[ "$candidate_name" =~ ^ROLLBACK-COMPLETE-[0-9]{8}T[0-9]{6}Z-[0-9]+\.json$ ]] || \
+      holdfast_die "successor rollback completion archive name is unsafe"
+    require_root_file "$candidate"
+    if jq -e --arg backup "$backup" --arg receipt_sha "$rollback_receipt_sha" \
+      '.schema_version == 2 and .state == "rolled_back" and
+       .backup_dir == $backup and .successor == true and
+       .rollback_receipt_sha256 == $receipt_sha' "$candidate" >/dev/null; then
+      completed_count=$((completed_count + 1))
+      completed=$candidate
+    fi
+  done < <(find "$state_dir" -mindepth 1 -maxdepth 1 \
+    \( -type f -o -type l \) -name 'ROLLBACK-COMPLETE-*.json' -print | sort)
+  ((completed_count == 1)) || \
+    holdfast_die "successor rollback completed terminal requires one exact completion archive"
+  completed_sha=$(holdfast_sha256 "$completed")
+
+  # Validate from the archived successor state.  The live CURRENT is already
+  # the predecessor and therefore cannot provide completion authority.
+  local state_file=$completed
+  attempt_id=$(jq -er '.rollback_attempt_id' "$state_file")
+  [[ "$attempt_id" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+    "$completed" == "$state_dir/ROLLBACK-COMPLETE-${attempt_id}.json" ]] || \
+    holdfast_die "successor rollback completion archive identity differs"
+  require_root_file "$route_receipt"
+  [[ "$(jq -er '.route_close_receipt' "$state_file")" == "$route_receipt_name" ]] || \
+    holdfast_die "successor rollback completion archive route receipt identity differs"
+  [[ "$(jq -er '.route_close_receipt_sha256' "$state_file")" == \
+    "$(holdfast_sha256 "$route_receipt")" ]] || \
+    holdfast_die "successor rollback completion archive route receipt differs"
+  require_root_file "$route_preimage"
+  [[ "$(jq -er '.route_close_preimage' "$state_file")" == "$route_preimage_name" && \
+    "$(jq -er '.route_close_preimage_sha256' "$state_file")" == \
+    "$(holdfast_sha256 "$route_preimage")" ]] || \
+    holdfast_die "successor rollback completion archive route preimage differs"
+
+  load_frozen_rollback_authorities
+  validate_backup_and_open_authority
+  [[ "$current_sha" == "$predecessor_current_sha" ]] || \
+    holdfast_die "successor rollback terminal CURRENT is not the immediate predecessor"
+  for path in "$revocation_evidence" "$revocation_signature"; do
+    holdfast_require_absolute "$path"
+  done
+  run_python_tool "$authority_tool" "$script_dir/authority_evidence.py" --mode rollback \
+    --evidence "$revocation_evidence" --signature "$revocation_signature" \
+    --public-key "$authority_public_key" --release-env "$backup/release.env" \
+    --release-evidence "$backup/RELEASE-EVIDENCE.json" --open-evidence "$open_evidence" \
+    --route-close-receipt "$route_receipt"
+  verify_closed_bracket
+
+  edge_rollback_sha="none"
+  edge_rollback_signature_sha="none"
+  open_edge_sha="none"
+  if [[ "$(holdfast_receipt_value "$route_receipt" was_public_open)" == "true" ]]; then
+    run_python_tool "$edge_tool" "$script_dir/edge_evidence.py" --mode rollback \
+      --evidence "$edge_rollback_evidence" --signature "$edge_rollback_signature" \
+      --public-key "$authority_public_key" --release-env "$backup/release.env" \
+      --release-evidence "$backup/RELEASE-EVIDENCE.json" \
+      --open-edge-evidence "$open_edge_evidence" --route-close-receipt "$route_receipt" \
+      --revocation-evidence "$revocation_evidence"
+    edge_rollback_sha=$(holdfast_sha256 "$edge_rollback_evidence")
+    edge_rollback_signature_sha=$(holdfast_sha256 "$edge_rollback_signature")
+    open_edge_sha=$(holdfast_sha256 "$open_edge_evidence")
+  fi
+  verify_closed_bracket
+
+  validate_runtime_prior_services
+  validate_estate_restore_manifests
+  control_sha=$(holdfast_sha256 "$backup/CONTROL.sha256")
+  state_control_sha=$(jq -er '.control_sha256' "$state_file")
+  [[ "$state_control_sha" == "$control_sha" ]] || \
+    holdfast_die "successor rollback completion archive CONTROL differs"
+  compose_project=$(jq -er '.name' "$backup/runtime/compose-config.json")
+  [[ "$compose_project" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]+$ ]] || \
+    holdfast_die "runtime backup has an unsafe Compose project name"
+  validate_rollback_arm
+  runtime_phase_name="ROLLBACK-RUNTIME-RESTORE-DONE-${attempt_id}.receipt"
+  estate_phase_name="ROLLBACK-ESTATE-RESTORE-DONE-${attempt_id}.receipt"
+  services_phase_name="ROLLBACK-SERVICES-REACTIVATED-DONE-${attempt_id}.receipt"
+  validate_completed_rollback_receipt "$rollback_receipt"
+  activation_requested=$(holdfast_receipt_value "$rollback_armed_receipt" activate_services_requested)
+  [[ "$(holdfast_receipt_value "$rollback_receipt" activate_services_requested)" == \
+    "$activation_requested" ]] || \
+    holdfast_die "successor rollback completion activation authority differs"
+  [[ "$(jq -er '.rollback_estate_transaction_sha256' "$state_file")" == \
+    "$(holdfast_sha256 "$backup/estate/TRANSACTION.json")" ]] || \
+    holdfast_die "successor rollback completion transaction authority differs"
+  verify_estate_disposition preimage
+
+  require_root_file "$completed"
+  require_root_file "$rollback_receipt"
+  require_root_file "$live_state_file"
+  [[ "$(holdfast_sha256 "$completed")" == "$completed_sha" && \
+    "$(holdfast_sha256 "$rollback_receipt")" == "$rollback_receipt_sha" && \
+    "$(holdfast_sha256 "$live_state_file")" == "$predecessor_current_sha" ]] || \
+    holdfast_die "successor rollback completed terminal authority changed during validation"
+}
+
+if [[ "$phase" == "execute" && "$backup_expected_successor" == "true" && \
+  "$(holdfast_sha256 "$state_file")" == "$(holdfast_sha256 "$backup/PREDECESSOR-CURRENT.json")" ]]; then
+  validate_successor_completed_terminal
+  echo "previously completed successor rollback was verified; ingress remains closed"
+  exit 0
+fi
 
 if [[ "$phase" == "close-route" ]]; then
   # Safety ordering is intentional: the frozen, transactionally self-snapshotting down asset and
@@ -1065,8 +1594,13 @@ current_state=$(jq -er '.state' "$state_file")
   "$current_state" == "rolled_back" ]] || \
   holdfast_die "rollback execute refuses state $current_state"
 require_root_file "$route_receipt"
-[[ "$(jq -er '.route_close_receipt_sha256' "$state_file")" == "$(holdfast_sha256 "$route_receipt")" ]] || \
+require_root_file "$route_preimage"
+[[ "$(jq -er '.route_close_receipt' "$state_file")" == "$route_receipt_name" && \
+  "$(jq -er '.route_close_receipt_sha256' "$state_file")" == "$(holdfast_sha256 "$route_receipt")" ]] || \
   holdfast_die "route-close receipt was replaced"
+[[ "$(jq -er '.route_close_preimage' "$state_file")" == "$route_preimage_name" && \
+  "$(jq -er '.route_close_preimage_sha256' "$state_file")" == "$(holdfast_sha256 "$route_preimage")" ]] || \
+  holdfast_die "route-close preimage was replaced"
 if [[ "$current_state" != "route_closed_awaiting_revocation" ]]; then
   load_frozen_rollback_authorities
 fi
@@ -1202,7 +1736,10 @@ if [[ "$current_state" == "route_closed_awaiting_revocation" ]]; then
     printf 'targets_sha256=%s\n' "$(holdfast_sha256 "$backup/TARGETS.sha256")"
     printf 'apply_preimages_sha256=%s\n' "$(holdfast_sha256 "$backup/APPLY-PREIMAGES.sha256")"
     printf 'apply_absent_sha256=%s\n' "$(holdfast_sha256 "$backup/APPLY-ABSENT.paths")"
+    printf 'route_close_receipt=%s\n' "$route_receipt_name"
     printf 'route_close_receipt_sha256=%s\n' "$(holdfast_sha256 "$route_receipt")"
+    printf 'route_close_preimage=%s\n' "$route_preimage_name"
+    printf 'route_close_preimage_sha256=%s\n' "$(holdfast_sha256 "$route_preimage")"
     printf 'open_evidence_file=%s\n' "$frozen_open_evidence_name"
     printf 'open_evidence_sha256=%s\n' "$(holdfast_sha256 "$open_evidence")"
     printf 'open_signature_file=%s\n' "$frozen_open_signature_name"
@@ -1228,6 +1765,7 @@ if [[ "$current_state" == "route_closed_awaiting_revocation" ]]; then
     printf 'activate_services_requested=%s\n' "$activate"
     printf 'activation_policy=restore-exact-prior-running\n'
     printf 'ingress_opened=false\n'
+    append_successor_lineage_receipt_fields
   } >"$rollback_armed_tmp"
   commit_atomic_file "$rollback_armed_tmp" "$rollback_armed_receipt"
   rollback_armed_sha=$(holdfast_sha256 "$rollback_armed_receipt")
@@ -1368,7 +1906,10 @@ rollback_receipt_tmp="$backup/.ROLLBACK.receipt.$$"
   printf 'runtime_restore_phase_receipt_sha256=%s\n' "$runtime_phase_sha"
   printf 'estate_restore_phase_receipt_sha256=%s\n' "$estate_phase_sha"
   printf 'services_reactivated_phase_receipt_sha256=%s\n' "$services_phase_sha"
+  printf 'route_close_receipt=%s\n' "$route_receipt_name"
   printf 'route_close_receipt_sha256=%s\n' "$(holdfast_sha256 "$route_receipt")"
+  printf 'route_close_preimage=%s\n' "$route_preimage_name"
+  printf 'route_close_preimage_sha256=%s\n' "$(holdfast_sha256 "$route_preimage")"
   printf 'revocation_evidence_sha256=%s\n' "$(holdfast_sha256 "$revocation_evidence")"
   printf 'open_evidence_sha256=%s\n' "$(holdfast_sha256 "$open_evidence")"
   printf 'runtime_restore_receipt_sha256=%s\n' "$(holdfast_sha256 "$backup/runtime/RESTORE.receipt")"
@@ -1383,6 +1924,7 @@ rollback_receipt_tmp="$backup/.ROLLBACK.receipt.$$"
   printf 'activate_services_requested=%s\n' "$activation_requested"
   printf 'public_route_state=dual-stack-404\n'
   printf 'ingress_opened=false\n'
+  append_successor_lineage_receipt_fields
 } >"$rollback_receipt_tmp"
 commit_atomic_file "$rollback_receipt_tmp" "$rollback_receipt"
 if [[ "${HOLDFAST_TEST_MODE:-0}" == "1" && \

@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "ceremony": "holdfast-rikune-successor-v1",
+  "predecessor": {
+    "current_state_sha256": "6daf142643aa7cc41553c0e807bde47e4b14dcfcd3fca9047d3b5a6c6a25f632",
+    "control_sha256": "bec6e7d96023f3627086fcc96841032e788a9982eba5f7c0392935cf53be8969",
+    "apply_receipt_sha256": "7037005133ecdeda2e00fc7ef98d2124a9ac0e5c6bf938594a0498cf517b9206",
+    "release_evidence_sha256": "534c0425f17ffca87d5999438fcc737f70584edbd0ac0970fc2d4e8aa66a0976",
+    "runtime_manifest_sha256": "912403e3e420cf2bc5db22910e8ca6c7d532428fc440e108282104c13f82f1ac",
+    "candidate_evidence_sha256": "b10cb79972b683784d79a7a38cfc39eaa0197e65f28b551a6f7fc53a55b2c146",
+    "candidate_targets_sha256": "66452d5a653c2aeb15815b1ed150db5e03ff8308b490ed705a4625bba0de7ccf",
+    "access_image": "registry.w33d.xyz/steadholme/access-governance@sha256:289d2026f9a3374587b53c50e120727cfc26deeba0ef2997f3f3b0b3307d6d24",
+    "access_build_input_schema": "access-build-input/1",
+    "access_build_input_sha256": "9edf8971562795455e6eb38405bf17b327d1a8cb983f0f0514f98e177efbfed1",
+    "permission_catalog_sha256": "92e7ed1dd9aa2369b18c2aae7d05b3f829a8d1750f5569c9ff9536f7ace0ebc9",
+    "package_catalog_sha256": "6a2343c04c0d2cf7c1cbb40414d0be3f91bcb4637499fbc78037f3cb0543d340"
+  },
+  "successor": {
+    "generator": "holdfast-rikune-estate/2.0.0",
+    "access_build_input_schema": "access-build-input/2",
+    "access_build_input_sha256": "23509919a35c1377ab3953b0364843f99b62f4bd8f4f5b3e7d4e8d75277ba86f",
+    "preimages_manifest": "successor-preimages.sha256",
+    "absent_manifest": "successor-absent.paths",
+    "static_targets_manifest": "successor-static-targets.sha256",
+    "supporting_targets_manifest": "successor-supporting-targets.sha256",
+    "frozen_targets_manifest": "successor-frozen-targets.json"
+  },
+  "overlay": [
+    {
+      "path": "access-governance/src/main.rs",
+      "before_sha256": "123a2e431414fb63789ca6be647b59a323f25cf0d2f48645cc89dfff5e70ce39",
+      "after_sha256": "2a228c46296b96f86eedde0806218b94734a0e02dd06e61697228b6c21a255c2"
+    },
+    {
+      "path": "access-governance/src/repository/mod.rs",
+      "before_sha256": "fbbcd3e08143702da8c50dc12cbc547c52b44f25b86c04836fd053e545527d44",
+      "after_sha256": "b61a1a4206d2c86a86300762f2ea56afa3364b35fe4e564b5ab8a330cd4414e8"
+    },
+    {
+      "path": "access-governance/src/repository/postgres.rs",
+      "before_sha256": "25a776e2b1ac871891861e1b4745b700199254b8d6e1b49f7e80f47737969c77",
+      "after_sha256": "ebe944167bdf34f1bd106f134af02ee8569a58326a77302508f85f4be7864130"
+    },
+    {
+      "path": "access-governance/tests/package_catalog_revision_assets.rs",
+      "before_sha256": "f2963a9a71ce4d85ec26382fdbd02efa6a8200456e6789015f12b89c43123e21",
+      "after_sha256": "99d69baa99b2a4af690fd83cea175c05e550c0877a38655309b13c9805de75b1"
+    },
+    {
+      "path": "access-governance/tests/postgres_operator_package_grant.rs",
+      "before_sha256": null,
+      "after_sha256": "9ade2be1222f158b7b996f116b78bb735b5103f48415b5e62630fdb452d89c7b"
+    },
+    {
+      "path": "access-governance/tests/postgres_package_catalog.rs",
+      "before_sha256": "35d32b9cc6024fdbfc85fce9e194de86701f98a6ddb6619bb8f76b1e4f2daaf6",
+      "after_sha256": "c3a41f62428211cb0c1745e286a5c86c6aa56dadddaf8eb0ab63bfbc46533c16"
+    },
+    {
+      "path": "access-governance/tests/postgres_package_submit_v14.rs",
+      "before_sha256": "0c8839a7223a0b40cf7175c3b20e1c01c842ea4dfd1527ce5fac8adb51a51f61",
+      "after_sha256": "67b204b01ecd7d67950ba8f2ffb8861132e128a947138d6326191c93647d5560"
+    }
+  ]
+}

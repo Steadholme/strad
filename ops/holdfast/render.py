@@ -17,7 +17,13 @@ from pathlib import Path
 from render_input_binding import (
     FROZEN_STATIC_PATHS,
     access_build_input_sha,
+    access_build_input_sha_v2,
     write_binding,
+)
+from successor_binding import (
+    validate_predecessor,
+    validate_supporting_snapshot,
+    write_delta_manifest,
 )
 
 
@@ -25,6 +31,9 @@ OPS_ROOT = Path(__file__).resolve().parent
 STRAD_ROOT = OPS_ROOT.parent.parent
 ASSETS = OPS_ROOT / "assets"
 GENERATOR_VERSION = "holdfast-rikune-estate/1.0.0"
+SUCCESSOR_GENERATOR_VERSION = "holdfast-rikune-estate/2.0.0"
+BUILD_INPUT_SCHEMA_V1 = "access-build-input/1"
+BUILD_INPUT_SCHEMA_V2 = "access-build-input/2"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST = re.compile(r"^[^\s:@]+(?:/[^\s:@]+)+@sha256:[0-9a-f]{64}$")
@@ -84,6 +93,7 @@ RELEASE_KEYS = (
     "SUPPLY_CHAIN_EVIDENCE_SHA256",
     "SUPPLY_CHAIN_SIGNATURE_SHA256",
 )
+SUCCESSOR_RELEASE_KEYS = RELEASE_KEYS + ("HOLDFAST_RELEASE_TOOL_REVISION",)
 
 
 def fail(message: str) -> "NoReturn":
@@ -143,9 +153,14 @@ def parse_path_manifest(path: Path) -> set[str]:
     return result
 
 
-def write_apply_manifests(stage_root: Path, paths: list[str]) -> None:
-    source_preimages = parse_checksum_manifest(OPS_ROOT / "preimages.sha256")
-    source_absent = parse_path_manifest(OPS_ROOT / "absent.paths")
+def write_apply_manifests(
+    stage_root: Path, paths: list[str], successor: bool = False
+) -> None:
+    prefix = "successor-" if successor else ""
+    source_preimages = parse_checksum_manifest(
+        OPS_ROOT / f"{prefix}preimages.sha256"
+    )
+    source_absent = parse_path_manifest(OPS_ROOT / f"{prefix}absent.paths")
     target_set = set(paths)
     if len(target_set) != len(paths):
         fail("apply target paths contain duplicates")
@@ -174,15 +189,18 @@ def write_apply_manifests(stage_root: Path, paths: list[str]) -> None:
     os.chmod(absent_path, 0o600)
 
 
-def verify_preimages(estate_root: Path) -> None:
-    expected = parse_checksum_manifest(OPS_ROOT / "preimages.sha256")
+def verify_preimages(estate_root: Path, successor: bool = False) -> None:
+    prefix = "successor-" if successor else ""
+    expected = parse_checksum_manifest(OPS_ROOT / f"{prefix}preimages.sha256")
     for relative, digest in expected.items():
         path = estate_root / relative
         require_regular(path)
         observed = sha256_file(path)
         if observed != digest:
             fail(f"preimage drift for {relative}: expected {digest}, got {observed}")
-    for relative in (OPS_ROOT / "absent.paths").read_text(encoding="utf-8").splitlines():
+    for relative in (OPS_ROOT / f"{prefix}absent.paths").read_text(
+        encoding="utf-8"
+    ).splitlines():
         if not relative:
             continue
         if (estate_root / relative).exists() or (estate_root / relative).is_symlink():
@@ -195,8 +213,12 @@ def parse_env(
     require_regular(path)
     if require_mode_0600 and stat.S_IMODE(path.stat().st_mode) != 0o600:
         fail(f"secret env file must have mode 0600: {path}")
+    return parse_env_text(path.read_text(encoding="utf-8"), path, allow_empty)
+
+
+def parse_env_text(text: str, path: Path, allow_empty: bool = False) -> dict[str, str]:
     values: dict[str, str] = {}
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(text.splitlines(), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -211,10 +233,57 @@ def parse_env(
     return values
 
 
-def validate_release(values: dict[str, str], catalog_only: bool) -> None:
+def read_private_env_snapshot(
+    path: Path, label: str, allow_empty: bool = False
+) -> tuple[dict[str, str], str]:
+    source = path.absolute()
+    parent = source.parent
+    try:
+        parent_metadata = parent.lstat()
+    except FileNotFoundError:
+        fail(f"{label} env parent is absent: {parent}")
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent.is_symlink()
+        or parent.resolve() != parent
+        or parent_metadata.st_uid != 0
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+    ):
+        fail(f"{label} env parent must be canonical, root-owned and private")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            fail(f"{label} env must be a root-owned single-link mode-0600 file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"{label} env is not UTF-8: {error}")
+    return parse_env_text(text, source, allow_empty), hashlib.sha256(raw).hexdigest()
+
+
+def validate_release(
+    values: dict[str, str], catalog_only: bool, successor: bool = False
+) -> None:
     if catalog_only:
         return
-    missing = [key for key in RELEASE_KEYS if key not in values]
+    release_keys = SUCCESSOR_RELEASE_KEYS if successor else RELEASE_KEYS
+    missing = [key for key in release_keys if key not in values]
     if missing:
         fail(f"release env is missing keys: {', '.join(missing)}")
     for key in (
@@ -259,6 +328,8 @@ def validate_release(values: dict[str, str], catalog_only: bool) -> None:
         )
     if not HEX40.fullmatch(values["STRAD_REVISION"]):
         fail("STRAD_REVISION must be a 40-character lowercase commit id")
+    if successor and not HEX40.fullmatch(values["HOLDFAST_RELEASE_TOOL_REVISION"]):
+        fail("HOLDFAST_RELEASE_TOOL_REVISION must be a 40-character lowercase commit id")
     model = values["STRAD_NEWAPI_MODEL"]
     if not MODEL_ALIAS.fullmatch(model) or model.startswith("REQUIRED"):
         fail("STRAD_NEWAPI_MODEL must be a pinned existing alias")
@@ -327,6 +398,157 @@ def copy_stage(estate_root: Path, stage_root: Path, catalog_only: bool) -> None:
         shutil.copy2(
             estate_root / f"relay/upstream/new-api/router/{name}", relay_dir / name
         )
+
+
+def copy_successor_tree(source: Path, destination: Path) -> None:
+    check_source_tree_for_symlinks(source)
+    shutil.copytree(
+        source,
+        destination,
+        symlinks=False,
+        ignore=shutil.ignore_patterns(
+            ".git", ".workflow", "target", "__pycache__", "*.pyc", "*.log"
+        ),
+    )
+
+
+def copy_successor_stage(
+    estate_root: Path,
+    predecessor_candidate: Path,
+    stage_root: Path,
+    catalog_only: bool,
+    policy: dict[str, object],
+) -> None:
+    if stage_root.exists() or stage_root.is_symlink():
+        fail(f"stage root must not already exist: {stage_root}")
+    stage_root.mkdir(mode=0o700, parents=True)
+    copy_successor_tree(
+        predecessor_candidate / "access-governance",
+        stage_root / "access-governance",
+    )
+    overlay = policy.get("overlay")
+    if not isinstance(overlay, list) or len(overlay) != 7:
+        fail("successor overlay contract is absent")
+    for raw in overlay:
+        if not isinstance(raw, dict) or not isinstance(raw.get("path"), str):
+            fail("successor overlay entry is malformed")
+        relative = raw["path"]
+        source = estate_root / relative
+        destination = stage_root / relative
+        require_regular(source)
+        if destination.exists() and destination.is_symlink():
+            fail(f"successor overlay destination is a symlink: {relative}")
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        if sha256_file(destination) != raw.get("after_sha256"):
+            fail(f"successor overlay copy differs: {relative}")
+
+    copy_successor_tree(
+        predecessor_candidate / "verdict", stage_root / "verdict"
+    )
+    relay_source = predecessor_candidate / "relay/upstream/new-api/router"
+    relay_destination = stage_root / "relay/upstream/new-api/router"
+    relay_destination.mkdir(mode=0o700, parents=True)
+    for name in ("enterprise_permissions.json", "newapi-authz-v1.json"):
+        require_regular(relay_source / name)
+        shutil.copy2(relay_source / name, relay_destination / name)
+
+    deploy = stage_root / "deploy"
+    deploy.mkdir(mode=0o700)
+    deploy_source = predecessor_candidate if catalog_only else estate_root
+    deploy_names = ["routes.seed.json"]
+    if not catalog_only:
+        deploy_names.extend(
+            ("docker-compose.yml", ".env", "access-governance.env.example")
+        )
+    for name in deploy_names:
+        source = deploy_source / f"deploy/{name}"
+        require_regular(source)
+        shutil.copy2(source, deploy / name)
+    if not catalog_only:
+        os.chmod(deploy / ".env", 0o600)
+
+
+def validate_tool_revision(revision: str) -> None:
+    if not HEX40.fullmatch(revision):
+        fail("successor release tool revision must be a 40-character commit id")
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=STRAD_ROOT,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if completed.returncode != 0 or completed.stdout.strip() != revision:
+        fail("successor release tool revision differs from the checked-out Strad HEAD")
+    status = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            "ops/holdfast",
+        ],
+        cwd=STRAD_ROOT,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if status.returncode != 0 or status.stdout:
+        fail("successor release tooling checkout is not clean")
+
+
+def validate_successor_snapshot(
+    stage_root: Path,
+    policy: dict[str, object],
+    preimages: dict[str, str],
+    supporting_targets: dict[str, str],
+    catalog_only: bool,
+) -> None:
+    metadata = stage_root.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stage_root.is_symlink()
+        or stage_root.resolve() != stage_root
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        fail("successor snapshot must be a canonical root-owned private directory")
+    successor = policy.get("successor")
+    overlay = policy.get("overlay")
+    if not isinstance(successor, dict) or not isinstance(overlay, list):
+        fail("successor snapshot policy is malformed")
+    if access_build_input_sha_v2(stage_root, require_root_owner=True) != successor.get(
+        "access_build_input_sha256"
+    ):
+        fail("successor private snapshot build input differs from policy")
+    for item in overlay:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            fail("successor private snapshot overlay is malformed")
+        relative = item["path"]
+        require_regular(stage_root / relative)
+        if sha256_file(stage_root / relative) != item.get("after_sha256"):
+            fail(f"successor private snapshot overlay differs: {relative}")
+    deploy_paths = ["deploy/routes.seed.json"]
+    if not catalog_only:
+        deploy_paths.extend(
+            (
+                "deploy/docker-compose.yml",
+                "deploy/.env",
+                "deploy/access-governance.env.example",
+            )
+        )
+    for relative in deploy_paths:
+        expected = preimages.get(relative)
+        if expected is None or sha256_file(stage_root / relative) != expected:
+            fail(f"successor private deploy snapshot differs: {relative}")
+    try:
+        validate_supporting_snapshot(stage_root, supporting_targets)
+    except ValueError as error:
+        fail(str(error))
 
 
 def write_json(path: Path, value: object) -> None:
@@ -1077,15 +1299,18 @@ def render_full_env(stage_root: Path, release: dict[str, str], secrets: dict[str
     os.chmod(env_path, 0o600)
     example = stage_root / "deploy/access-governance.env.example"
     example_text = example.read_text(encoding="utf-8")
-    example.write_text(
-        replace_once(
+    bootstrap_v1 = "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=1"
+    bootstrap_v7 = "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=7"
+    if example_text.count(bootstrap_v7) == 1 and bootstrap_v1 not in example_text:
+        rendered_example = example_text
+    else:
+        rendered_example = replace_once(
             example_text,
-            "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=1",
-            "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION=7",
+            bootstrap_v1,
+            bootstrap_v7,
             "bootstrap example",
-        ),
-        encoding="utf-8",
-    )
+        )
+    example.write_text(rendered_example, encoding="utf-8")
 
 
 def run_checked(args: list[str], cwd: Path) -> None:
@@ -1095,8 +1320,13 @@ def run_checked(args: list[str], cwd: Path) -> None:
         fail(f"command failed ({completed.returncode}): {' '.join(args)}")
 
 
-def validate_static_targets(stage_root: Path, catalog_only: bool) -> None:
-    frozen = parse_checksum_manifest(OPS_ROOT / "static-targets.sha256")
+def validate_static_targets(
+    stage_root: Path, catalog_only: bool, successor: bool = False
+) -> None:
+    manifest = (
+        "successor-static-targets.sha256" if successor else "static-targets.sha256"
+    )
+    frozen = parse_checksum_manifest(OPS_ROOT / manifest)
     if set(frozen) != set(FROZEN_STATIC_PATHS):
         fail("static target manifest field set differs from the renderer contract")
     paths = MUTATED_PATHS if catalog_only else FROZEN_STATIC_PATHS
@@ -1109,18 +1339,30 @@ def validate_static_targets(stage_root: Path, catalog_only: bool) -> None:
             )
 
 
-def validate_render(stage_root: Path, catalog_only: bool) -> None:
+def validate_render(
+    stage_root: Path, catalog_only: bool, successor: bool = False
+) -> None:
     access = stage_root / "access-governance"
     run_checked([sys.executable, "scripts/validate_authz_manifests.py"], access)
     run_checked(["scripts/generate_permission_catalog.sh", "--check"], access)
     for relative in MUTATED_PATHS:
         require_regular(stage_root / relative)
-    validate_static_targets(stage_root, catalog_only)
+    validate_static_targets(stage_root, catalog_only, successor)
 
 
-def validate_frozen_evidence(evidence: dict[str, object]) -> None:
-    frozen = load_object(OPS_ROOT / "frozen-targets.json")
-    if frozen.get("schema_version") != 1 or frozen.get("generator") != GENERATOR_VERSION:
+def validate_frozen_evidence(
+    evidence: dict[str, object], successor: bool = False
+) -> None:
+    frozen_name = (
+        "successor-frozen-targets.json" if successor else "frozen-targets.json"
+    )
+    frozen = load_object(OPS_ROOT / frozen_name)
+    expected_schema = 2 if successor else 1
+    expected_generator = SUCCESSOR_GENERATOR_VERSION if successor else GENERATOR_VERSION
+    if (
+        frozen.get("schema_version") != expected_schema
+        or frozen.get("generator") != expected_generator
+    ):
         fail("frozen target contract version differs from the renderer")
     for key in (
         "permission_catalog_sha256",
@@ -1132,6 +1374,12 @@ def validate_frozen_evidence(evidence: dict[str, object]) -> None:
     ):
         if evidence.get(key) != frozen.get(key):
             fail(f"release evidence differs from frozen target: {key}")
+    if successor and (
+        frozen.get("access_governance_build_input_schema") != BUILD_INPUT_SCHEMA_V2
+        or evidence.get("access_governance_build_input_schema")
+        != BUILD_INPUT_SCHEMA_V2
+    ):
+        fail("successor build-input schema differs from the frozen target")
 
 
 def write_evidence(
@@ -1139,19 +1387,44 @@ def write_evidence(
     release: dict[str, str],
     catalog_only: bool,
     release_env_sha256: str | None,
+    successor_context: dict[str, object] | None = None,
+    release_tool_revision: str | None = None,
 ) -> None:
-    paths = list(MUTATED_PATHS) + ([] if catalog_only else list(FULL_ONLY_PATHS))
+    successor = successor_context is not None
+    if successor:
+        policy = successor_context.get("policy")
+        if not isinstance(policy, dict) or not isinstance(policy.get("overlay"), list):
+            fail("successor evidence lacks its validated policy")
+        paths = [item["path"] for item in policy["overlay"]]
+        supporting_paths = MUTATED_PATHS if catalog_only else FROZEN_STATIC_PATHS
+        paths.extend(relative for relative in supporting_paths if relative not in paths)
+        if not catalog_only and "deploy/.env" not in paths:
+            paths.append("deploy/.env")
+        delta_path = write_delta_manifest(stage_root, policy)
+    else:
+        policy = None
+        paths = list(MUTATED_PATHS) + ([] if catalog_only else list(FULL_ONLY_PATHS))
+        delta_path = None
     targets = stage_root / "TARGETS.sha256"
     lines = [f"{sha256_file(stage_root / relative)}  {relative}" for relative in paths]
     targets.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    write_apply_manifests(stage_root, paths)
-    write_binding(OPS_ROOT, stage_root / "RENDER-INPUTS.sha256")
+    write_apply_manifests(stage_root, paths, successor)
+    write_binding(
+        OPS_ROOT, stage_root / "RENDER-INPUTS.sha256", successor=successor
+    )
     permission_digest = sha256_file(stage_root / "access-governance/catalog/permissions.snapshot.json")
     package_digest = sha256_file(stage_root / "access-governance/catalog/packages.snapshot.json")
-    build_input = access_build_input_sha(stage_root)
+    build_input = (
+        access_build_input_sha_v2(stage_root)
+        if successor
+        else access_build_input_sha(stage_root)
+    )
+    schema_version = 2 if successor else 1
+    generator = SUCCESSOR_GENERATOR_VERSION if successor else GENERATOR_VERSION
+    release_keys = SUCCESSOR_RELEASE_KEYS if successor else RELEASE_KEYS
     evidence = {
-        "schema_version": 1,
-        "generator": GENERATOR_VERSION,
+        "schema_version": schema_version,
+        "generator": generator,
         "catalog_only": catalog_only,
         "permission_catalog_sha256": permission_digest,
         "package_catalog_sha256": package_digest,
@@ -1160,8 +1433,23 @@ def write_evidence(
         "route_down_sha256": sha256_file(ASSETS / "20260823_rikune_root_down.sql"),
         "authz_manifest_sha256": sha256_file(stage_root / "access-governance/catalog/rikune-authz-v1.json"),
         "secret_references": list(SECRET_KEYS),
-        "release": {} if catalog_only else {key: release[key] for key in RELEASE_KEYS},
+        "release": {} if catalog_only else {key: release[key] for key in release_keys},
     }
+    if successor:
+        if release_tool_revision is None or not HEX40.fullmatch(release_tool_revision):
+            fail("successor evidence lacks the release tool revision")
+        predecessor = policy.get("predecessor") if policy is not None else None
+        if not isinstance(predecessor, dict):
+            fail("successor evidence lacks the predecessor binding")
+        evidence.update(
+            {
+                "release_mode": "successor",
+                "access_governance_build_input_schema": BUILD_INPUT_SCHEMA_V2,
+                "holdfast_release_tool_revision": release_tool_revision,
+                "predecessor_binding": dict(predecessor),
+                "successor_delta_sha256": sha256_file(delta_path),
+            }
+        )
     if not catalog_only:
         if release_env_sha256 is None or not HEX64.fullmatch(release_env_sha256):
             fail("full release evidence lacks the release env identity")
@@ -1194,8 +1482,30 @@ def write_evidence(
             fail("rendered package catalog digest differs from the frozen release pin")
         if build_input != release["ACCESS_GOVERNANCE_BUILD_INPUT_SHA256"]:
             fail("Access Governance build-input digest differs from the frozen release pin")
-    validate_frozen_evidence(evidence)
+    validate_frozen_evidence(evidence, successor)
     write_json(stage_root / "RELEASE-EVIDENCE.json", evidence)
+
+
+def validate_successor_release(
+    release: dict[str, str], policy: dict[str, object]
+) -> None:
+    predecessor = policy.get("predecessor")
+    successor = policy.get("successor")
+    if not isinstance(predecessor, dict) or not isinstance(successor, dict):
+        fail("successor policy release binding is malformed")
+    expected = {
+        "ACCESS_GOVERNANCE_ROLLBACK_IMAGE": predecessor.get("access_image"),
+        "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256": successor.get(
+            "access_build_input_sha256"
+        ),
+        "PERMISSION_CATALOG_SHA256": predecessor.get(
+            "permission_catalog_sha256"
+        ),
+        "PACKAGE_CATALOG_SHA256": predecessor.get("package_catalog_sha256"),
+    }
+    for key, value in expected.items():
+        if release.get(key) != value:
+            fail(f"successor release pin differs from its policy: {key}")
 
 
 def main() -> int:
@@ -1205,6 +1515,11 @@ def main() -> int:
     parser.add_argument("--release-env", type=Path)
     parser.add_argument("--secret-env", type=Path)
     parser.add_argument("--catalog-only", action="store_true")
+    parser.add_argument("--successor", action="store_true")
+    parser.add_argument("--current-state", type=Path)
+    parser.add_argument("--predecessor-candidate", type=Path)
+    parser.add_argument("--predecessor-stage", type=Path)
+    parser.add_argument("--release-tool-revision")
     args = parser.parse_args()
 
     estate_root = args.estate_root.absolute()
@@ -1226,31 +1541,134 @@ def main() -> int:
         or stage_parent.resolve() != stage_parent
     ):
         fail("stage parent is invalid")
-    verify_preimages(estate_root)
-    release = {} if args.release_env is None else parse_env(args.release_env.absolute())
-    validate_release(release, args.catalog_only)
+    successor_args = (
+        args.current_state,
+        args.predecessor_candidate,
+        args.predecessor_stage,
+    )
+    if args.successor and any(value is None for value in successor_args):
+        fail(
+            "--successor requires --current-state, --predecessor-candidate "
+            "and --predecessor-stage"
+        )
+    if not args.successor and (
+        any(value is not None for value in successor_args)
+        or args.release_tool_revision is not None
+    ):
+        fail("successor-only arguments require --successor")
+
+    successor_context: dict[str, object] | None = None
+    if args.successor:
+        successor_context = validate_predecessor(
+            policy_path=OPS_ROOT / "successor-policy.json",
+            current_state_path=args.current_state.absolute(),
+            estate_root=estate_root,
+            predecessor_candidate=args.predecessor_candidate.absolute(),
+            predecessor_stage=args.predecessor_stage.absolute(),
+            successor_preimages=OPS_ROOT / "successor-preimages.sha256",
+        )
+    else:
+        verify_preimages(estate_root)
+    release_env_sha256: str | None = None
+    if args.release_env is None:
+        release = {}
+    elif args.successor and not args.catalog_only:
+        release, release_env_sha256 = read_private_env_snapshot(
+            args.release_env, "release"
+        )
+    else:
+        release = parse_env(args.release_env.absolute())
+        release_env_sha256 = sha256_file(args.release_env.absolute())
+    validate_release(release, args.catalog_only, args.successor)
     if not args.catalog_only and args.secret_env is None:
         fail("--secret-env is required for a full render")
-    secrets = {} if args.catalog_only else parse_env(args.secret_env.absolute(), require_mode_0600=True)
+    if args.catalog_only:
+        secrets = {}
+    elif args.successor:
+        secrets, _ = read_private_env_snapshot(args.secret_env, "secret")
+    else:
+        secrets = parse_env(args.secret_env.absolute(), require_mode_0600=True)
 
-    copy_stage(estate_root, stage_root, args.catalog_only)
-    for manifest in ("cistern-authz-v1.json", "rikune-authz-v1.json"):
-        shutil.copy2(ASSETS / manifest, stage_root / f"access-governance/catalog/{manifest}")
-    render_registry(stage_root)
-    render_generator(stage_root)
-    render_validator(stage_root)
-    render_catalog_rs(stage_root)
-    generator = stage_root / "access-governance/scripts/generate_permission_catalog.sh"
-    run_checked([str(generator)], stage_root / "access-governance")
-    render_packages(stage_root)
-    if not args.catalog_only:
-        render_compose(stage_root)
-        render_full_env(stage_root, release, secrets)
-    validate_render(stage_root, args.catalog_only)
-    release_env_sha256 = (
-        None if args.release_env is None else sha256_file(args.release_env.absolute())
+    release_tool_revision: str | None = None
+    if args.successor:
+        release_tool_revision = (
+            args.release_tool_revision
+            if args.catalog_only
+            else release["HOLDFAST_RELEASE_TOOL_REVISION"]
+        )
+        if release_tool_revision is None:
+            fail("successor catalog render requires --release-tool-revision")
+        if (
+            args.release_tool_revision is not None
+            and args.release_tool_revision != release_tool_revision
+        ):
+            fail("successor tool revision arguments differ")
+        validate_tool_revision(release_tool_revision)
+        assert successor_context is not None
+        policy = successor_context["policy"]
+        if not isinstance(policy, dict):
+            fail("successor policy validation returned an invalid value")
+        if not args.catalog_only:
+            validate_successor_release(release, policy)
+        copy_successor_stage(
+            estate_root,
+            successor_context["predecessor_candidate"],
+            stage_root,
+            args.catalog_only,
+            policy,
+        )
+        successor_preimages = successor_context.get("successor_preimages")
+        if not isinstance(successor_preimages, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in successor_preimages.items()
+        ):
+            fail("successor validation returned invalid preimage authority")
+        supporting_targets = successor_context.get("successor_supporting_targets")
+        if not isinstance(supporting_targets, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in supporting_targets.items()
+        ):
+            fail("successor validation returned invalid supporting authority")
+        validate_successor_snapshot(
+            stage_root,
+            policy,
+            successor_preimages,
+            supporting_targets,
+            args.catalog_only,
+        )
+        validate_predecessor(
+            policy_path=OPS_ROOT / "successor-policy.json",
+            current_state_path=args.current_state.absolute(),
+            estate_root=estate_root,
+            predecessor_candidate=args.predecessor_candidate.absolute(),
+            predecessor_stage=args.predecessor_stage.absolute(),
+            successor_preimages=OPS_ROOT / "successor-preimages.sha256",
+        )
+        if not args.catalog_only:
+            render_full_env(stage_root, release, secrets)
+    else:
+        copy_stage(estate_root, stage_root, args.catalog_only)
+        for manifest in ("cistern-authz-v1.json", "rikune-authz-v1.json"):
+            shutil.copy2(ASSETS / manifest, stage_root / f"access-governance/catalog/{manifest}")
+        render_registry(stage_root)
+        render_generator(stage_root)
+        render_validator(stage_root)
+        render_catalog_rs(stage_root)
+        generator = stage_root / "access-governance/scripts/generate_permission_catalog.sh"
+        run_checked([str(generator)], stage_root / "access-governance")
+        render_packages(stage_root)
+        if not args.catalog_only:
+            render_compose(stage_root)
+            render_full_env(stage_root, release, secrets)
+    validate_render(stage_root, args.catalog_only, args.successor)
+    write_evidence(
+        stage_root,
+        release,
+        args.catalog_only,
+        release_env_sha256,
+        successor_context,
+        release_tool_revision,
     )
-    write_evidence(stage_root, release, args.catalog_only, release_env_sha256)
     run_checked(
         [
             sys.executable,

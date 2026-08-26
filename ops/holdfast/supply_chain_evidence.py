@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import stat
 import subprocess
@@ -13,6 +14,9 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
+
+from successor_binding import validate_policy as validate_successor_policy
+from validate_release_evidence import BASE_RELEASE_KEYS, SUCCESSOR_RELEASE_KEYS
 
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -33,6 +37,7 @@ IMAGE_KEYS = (
     "SLUICE_IMAGE",
 )
 STATIC_LOCK_SHA256 = "32e3ea5103ff73c413062b17ad3bb4e7270fbcd6fd1325f6a7f3dc831bee83ef"
+SUCCESSOR_BUILD_INPUT_SCHEMA = "access-build-input/2"
 MAX_WAIVER_LIFETIME = timedelta(days=30)
 MAX_WAIVER_CLOCK_SKEW = timedelta(minutes=5)
 WAIVER_POLICY = {
@@ -78,9 +83,55 @@ def load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def release_env(path: Path) -> dict[str, str]:
+def open_canonical_readonly(path: Path) -> int:
+    source = path.absolute()
+    components = source.parts[1:]
+    if (
+        not source.is_absolute()
+        or source == Path("/")
+        or not components
+        or any(component in {"", ".", ".."} for component in components)
+    ):
+        fail("release env path must be canonical and absolute")
+    directory = os.open(
+        "/",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY,
+    )
+    try:
+        for component in components[:-1]:
+            next_directory = os.open(
+                component,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = next_directory
+        return os.open(
+            components[-1],
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory,
+        )
+    finally:
+        os.close(directory)
+
+
+def release_env(path: Path) -> tuple[dict[str, str], str]:
+    descriptor = open_canonical_readonly(path)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+        ):
+            fail("release env must be a root-owned single-link regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read()
+    finally:
+        os.close(descriptor)
+    text_value = raw.decode("utf-8")
     result: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text_value.splitlines():
         if not line or line.lstrip().startswith("#"):
             continue
         if "=" not in line:
@@ -89,7 +140,7 @@ def release_env(path: Path) -> dict[str, str]:
         if key in result:
             fail(f"duplicate release key: {key}")
         result[key] = value
-    return result
+    return result, hashlib.sha256(raw).hexdigest()
 
 
 def release_pins_sha256(values: dict[str, str]) -> str:
@@ -221,7 +272,12 @@ def validate_waivers(
     return result
 
 
-def validate_document(value: dict[str, Any], release: dict[str, str], release_sha: str) -> None:
+def validate_document(
+    value: dict[str, Any],
+    release: dict[str, str],
+    release_sha: str,
+    successor_policy: dict[str, Any] | None = None,
+) -> None:
     schema_version = value.get("schema_version")
     expected_root = {
         "schema_version",
@@ -232,10 +288,16 @@ def validate_document(value: dict[str, Any], release: dict[str, str], release_sh
         "analyzer_overlay",
         "access_candidate",
     }
-    if schema_version == 2:
+    if schema_version in (2, 3):
         expected_root.add("waivers")
+    if schema_version == 3:
+        expected_root.add("successor_binding")
     exact_keys(value, expected_root, "evidence")
-    if schema_version not in (1, 2) or value["platform"] != "linux/amd64":
+    if (
+        type(schema_version) is not int
+        or schema_version not in (1, 2, 3)
+        or value["platform"] != "linux/amd64"
+    ):
         fail("unsupported supply-chain schema or platform")
     if value["release_pins_sha256"] != release_pins_sha256(release):
         fail("supply-chain evidence is not bound to the canonical release pins")
@@ -243,10 +305,44 @@ def validate_document(value: dict[str, Any], release: dict[str, str], release_sh
         fail("issued_at must be an immutable UTC timestamp")
     waivers = (
         validate_waivers(value["waivers"], release, datetime.now(timezone.utc))
-        if schema_version == 2
+        if schema_version in (2, 3)
         else {}
     )
     consumed_waivers: set[tuple[str, str]] = set()
+
+    if schema_version == 3:
+        if successor_policy is None:
+            fail("schema 3 supply-chain evidence requires the successor policy")
+        predecessor_policy = successor_policy["predecessor"]
+        successor_policy_value = successor_policy["successor"]
+        successor_binding = exact_keys(
+            value["successor_binding"],
+            set(predecessor_policy),
+            "successor binding",
+        )
+        if successor_binding != predecessor_policy:
+            fail("successor binding differs from the frozen immediate predecessor")
+        tool_revision = release.get("HOLDFAST_RELEASE_TOOL_REVISION")
+        if not isinstance(tool_revision, str) or not HEX40.fullmatch(tool_revision):
+            fail("Holdfast release-tool revision is absent or invalid")
+        if (
+            release.get("ACCESS_GOVERNANCE_ROLLBACK_IMAGE")
+            != predecessor_policy["access_image"]
+        ):
+            fail("Access rollback image is not the immediate predecessor candidate")
+        if release.get("ACCESS_GOVERNANCE_IMAGE") == predecessor_policy["access_image"]:
+            fail("Access successor image does not advance the predecessor candidate")
+        if (
+            release.get("ACCESS_GOVERNANCE_BUILD_INPUT_SHA256")
+            != successor_policy_value["access_build_input_sha256"]
+        ):
+            fail("Access successor build input differs from the frozen policy")
+        for release_key, predecessor_key in (
+            ("PERMISSION_CATALOG_SHA256", "permission_catalog_sha256"),
+            ("PACKAGE_CATALOG_SHA256", "package_catalog_sha256"),
+        ):
+            if release.get(release_key) != predecessor_policy[predecessor_key]:
+                fail(f"Access successor catalog differs from the predecessor: {release_key}")
 
     registry = exact_keys(
         value["registry_verification"], {"verified_at", "verifier", "images"}, "registry"
@@ -343,30 +439,59 @@ def validate_document(value: dict[str, Any], release: dict[str, str], release_sh
     ):
         fail("analyzer overlay revision differs from release")
 
-    access = exact_keys(
-        value["access_candidate"],
-        {
-            "image",
-            "build_input_sha256",
-            "permission_catalog_sha256",
-            "package_catalog_sha256",
-            "source_revision",
-        },
-        "Access candidate",
-    )
-    expected_access = {
-        "image": release["ACCESS_GOVERNANCE_IMAGE"],
-        "build_input_sha256": release["ACCESS_GOVERNANCE_BUILD_INPUT_SHA256"],
-        "permission_catalog_sha256": release["PERMISSION_CATALOG_SHA256"],
-        "package_catalog_sha256": release["PACKAGE_CATALOG_SHA256"],
-        "source_revision": release["STRAD_REVISION"],
-    }
+    if schema_version == 3:
+        access = exact_keys(
+            value["access_candidate"],
+            {
+                "image",
+                "build_input_schema",
+                "build_input_sha256",
+                "permission_catalog_sha256",
+                "package_catalog_sha256",
+                "tool_revision",
+            },
+            "Access candidate",
+        )
+        expected_access = {
+            "image": release["ACCESS_GOVERNANCE_IMAGE"],
+            "build_input_schema": SUCCESSOR_BUILD_INPUT_SCHEMA,
+            "build_input_sha256": release["ACCESS_GOVERNANCE_BUILD_INPUT_SHA256"],
+            "permission_catalog_sha256": release["PERMISSION_CATALOG_SHA256"],
+            "package_catalog_sha256": release["PACKAGE_CATALOG_SHA256"],
+            "tool_revision": release["HOLDFAST_RELEASE_TOOL_REVISION"],
+        }
+        if not HEX40.fullmatch(str(access["tool_revision"])):
+            fail("Access candidate tool revision is invalid")
+    else:
+        access = exact_keys(
+            value["access_candidate"],
+            {
+                "image",
+                "build_input_sha256",
+                "permission_catalog_sha256",
+                "package_catalog_sha256",
+                "source_revision",
+            },
+            "Access candidate",
+        )
+        expected_access = {
+            "image": release["ACCESS_GOVERNANCE_IMAGE"],
+            "build_input_sha256": release["ACCESS_GOVERNANCE_BUILD_INPUT_SHA256"],
+            "permission_catalog_sha256": release["PERMISSION_CATALOG_SHA256"],
+            "package_catalog_sha256": release["PACKAGE_CATALOG_SHA256"],
+            "source_revision": release["STRAD_REVISION"],
+        }
     for key, expected in expected_access.items():
         if access[key] != expected:
             fail(f"Access candidate build input differs: {key}")
 
 
-def validate_local_binding(value: dict[str, Any], args: argparse.Namespace) -> None:
+def validate_local_binding(
+    value: dict[str, Any],
+    args: argparse.Namespace,
+    release: dict[str, str],
+    release_sha: str,
+) -> None:
     overlay = value["analyzer_overlay"]
     if overlay["dockerfile_sha256"] != sha256(args.dockerfile):
         fail("analyzer provenance differs from the local Dockerfile.analyzer")
@@ -376,6 +501,27 @@ def validate_local_binding(value: dict[str, Any], args: argparse.Namespace) -> N
         fail("analyzer provenance differs from the frozen Rikune static lock")
     if args.release_evidence is not None:
         release_evidence = load_json(args.release_evidence)
+        selected_keys = (
+            SUCCESSOR_RELEASE_KEYS
+            if value.get("schema_version") == 3
+            else BASE_RELEASE_KEYS
+        )
+        missing = sorted(selected_keys - set(release))
+        if missing:
+            fail(
+                "canonical release env lacks selected pins: "
+                + ", ".join(missing)
+            )
+        canonical_pins = {key: release[key] for key in selected_keys}
+        evidence_pins = exact_keys(
+            release_evidence.get("release"),
+            set(selected_keys),
+            "RELEASE-EVIDENCE selected release pins",
+        )
+        if evidence_pins != canonical_pins:
+            fail("RELEASE-EVIDENCE selected release pins differ from release env")
+        if release_evidence.get("release_env_sha256") != release_sha:
+            fail("RELEASE-EVIDENCE release env identity differs from release env")
         binding = release_evidence.get("analyzer_image_binding")
         if not isinstance(binding, dict):
             fail("RELEASE-EVIDENCE lacks the analyzer build binding")
@@ -389,6 +535,28 @@ def validate_local_binding(value: dict[str, Any], args: argparse.Namespace) -> N
         for field, wanted in expected.items():
             if binding.get(field) != wanted:
                 fail(f"supply chain and RELEASE-EVIDENCE differ: {field}")
+        if value.get("schema_version") == 3:
+            if (
+                release_evidence.get("schema_version") != 2
+                or release_evidence.get("release_mode") != "successor"
+                or release_evidence.get("access_governance_build_input_schema")
+                != SUCCESSOR_BUILD_INPUT_SCHEMA
+            ):
+                fail("schema 3 supply chain requires successor RELEASE-EVIDENCE")
+            if release_evidence.get("predecessor_binding") != value.get(
+                "successor_binding"
+            ):
+                fail("supply chain and RELEASE-EVIDENCE differ: predecessor_binding")
+            access = value["access_candidate"]
+            release_binding = {
+                "access_governance_build_input_sha256": access["build_input_sha256"],
+                "permission_catalog_sha256": access["permission_catalog_sha256"],
+                "package_catalog_sha256": access["package_catalog_sha256"],
+                "holdfast_release_tool_revision": access["tool_revision"],
+            }
+            for field, wanted in release_binding.items():
+                if release_evidence.get(field) != wanted:
+                    fail(f"supply chain and RELEASE-EVIDENCE differ: {field}")
 
 
 def verify_signature(evidence: Path, signature: Path, public_key: Path) -> None:
@@ -423,9 +591,10 @@ def main() -> int:
     parser.add_argument("--dockerfile", required=True, type=Path)
     parser.add_argument("--bridge-lock", required=True, type=Path)
     parser.add_argument("--release-evidence", type=Path)
+    parser.add_argument("--successor-policy", type=Path)
     args = parser.parse_args()
     try:
-        release = release_env(args.release_env)
+        release, release_sha = release_env(args.release_env)
         pins = {
             "SUPPLY_CHAIN_EVIDENCE_SHA256": sha256(args.evidence),
             "SUPPLY_CHAIN_SIGNATURE_SHA256": sha256(args.signature),
@@ -436,8 +605,22 @@ def main() -> int:
                 fail(f"{key} differs from the release pin")
         verify_signature(args.evidence, args.signature, args.public_key)
         document = load_json(args.evidence)
-        validate_document(document, release, sha256(args.release_env))
-        validate_local_binding(document, args)
+        successor_policy = None
+        if document.get("schema_version") == 3:
+            if args.successor_policy is None:
+                fail("schema 3 supply-chain evidence requires --successor-policy")
+            successor_policy = validate_successor_policy(
+                args.successor_policy.absolute()
+            )
+        elif args.successor_policy is not None:
+            fail("--successor-policy is only valid for schema 3 evidence")
+        validate_document(
+            document,
+            release,
+            release_sha,
+            successor_policy,
+        )
+        validate_local_binding(document, args, release, release_sha)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"supply-chain evidence: {error}", file=sys.stderr)
         return 1

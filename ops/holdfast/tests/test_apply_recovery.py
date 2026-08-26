@@ -197,6 +197,28 @@ class ApplyRecoveryTests(unittest.TestCase):
             names.append("APPLY-ARMED.receipt")
         if (self.backup / "RUNTIME-BACKUP-CALLER-ARMED.receipt").exists():
             names.append("RUNTIME-BACKUP-CALLER-ARMED.receipt")
+        if (self.backup / "PREDECESSOR-CURRENT.json").exists():
+            names.append("PREDECESSOR-CURRENT.json")
+        if (self.backup / "SUCCESSOR-ARMED.receipt").exists():
+            names.append("SUCCESSOR-ARMED.receipt")
+        if (self.backup / "SUCCESSOR-DELTA.sha256").exists():
+            names.append("SUCCESSOR-DELTA.sha256")
+        successor_authority = self.backup / "successor-authority"
+        if successor_authority.exists():
+            names.extend(
+                f"successor-authority/{line.split('  ', 1)[1]}"
+                for line in (self.backup / "RENDER-INPUTS.sha256")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
+            names.extend(
+                (
+                    "successor-authority/Dockerfile.analyzer",
+                    "successor-authority/bridge-package-lock.json",
+                    "successor-authority/assets/20260823_rikune_root_up.sql",
+                    "successor-authority/assets/20260823_rikune_root_down.sql",
+                )
+            )
         (self.backup / "CONTROL.sha256").write_text(
             "".join(f"{sha256(self.backup / name)}  {name}\n" for name in names),
             encoding="utf-8",
@@ -502,6 +524,292 @@ class ApplyRecoveryTests(unittest.TestCase):
         )
         return failure
 
+    def install_successor_activation_failed_state(self) -> bytes:
+        failure = self.install_activation_failed_state()
+        dry = self.root / "dry-run-modern"
+        predecessor = self.root / "predecessor-backup"
+        predecessor_runtime = predecessor / "runtime"
+        predecessor_runtime.mkdir(parents=True, mode=0o700)
+        predecessor.chmod(0o700)
+        for name in (
+            "strad.dump",
+            "RUNNING-SERVICES.before",
+            "VOLUMES.tsv",
+            "compose-config.json",
+            "RUNTIME-BACKUP-ARMED.receipt",
+            "SHA256SUMS",
+            "BACKUP.receipt",
+        ):
+            shutil.copyfile(self.backup / "runtime" / name, predecessor_runtime / name)
+        shutil.copyfile(
+            self.backup / "RELEASE-EVIDENCE.json",
+            predecessor / "RELEASE-EVIDENCE.json",
+        )
+        shutil.copyfile(self.backup / "release.env", predecessor / "release.env")
+        predecessor_control_names = (
+            "RELEASE-EVIDENCE.json",
+            "release.env",
+            "runtime/SHA256SUMS",
+            "runtime/BACKUP.receipt",
+        )
+        (predecessor / "CONTROL.sha256").write_text(
+            "".join(
+                f"{sha256(predecessor / name)}  {name}\n"
+                for name in predecessor_control_names
+            ),
+            encoding="utf-8",
+        )
+        predecessor_control_sha = sha256(predecessor / "CONTROL.sha256")
+        predecessor_release_sha = sha256(predecessor / "RELEASE-EVIDENCE.json")
+        predecessor_runtime_receipt_sha = sha256(predecessor_runtime / "BACKUP.receipt")
+        predecessor_runtime_manifest_sha = sha256(predecessor_runtime / "SHA256SUMS")
+        predecessor_apply = predecessor / "APPLY.receipt"
+        predecessor_apply.write_text(
+            "".join(
+                [
+                    "schema_version=2\n",
+                    "completion_state=applied_ingress_closed\n",
+                    f"estate_root={self.estate}\n",
+                    f"backup_dir={predecessor}\n",
+                    f"control_sha256={predecessor_control_sha}\n",
+                    f"release_evidence_sha256={predecessor_release_sha}\n",
+                    "runtime_backup=passed\n",
+                    "closed_bracket=passed\n",
+                    "route_database_state=absent\n",
+                    "public_ipv4_ipv6_closed_status=404\n",
+                    "services_activated=true\n",
+                    "runtime_verified=true\n",
+                    "ingress_opened=false\n",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        predecessor_apply_sha = sha256(predecessor_apply)
+        predecessor_current = {
+            "schema_version": 2,
+            "state": "applied_ingress_closed",
+            "estate_root": str(self.estate),
+            "backup_dir": str(predecessor),
+            "control_sha256": predecessor_control_sha,
+            "apply_receipt_sha256": predecessor_apply_sha,
+            "release_evidence_sha256": predecessor_release_sha,
+            "runtime_backup_receipt_sha256": predecessor_runtime_receipt_sha,
+            "runtime_backup_manifest_sha256": predecessor_runtime_manifest_sha,
+            "release_generation": 1,
+            "route_database_state": "absent",
+            "public_ipv4_ipv6_closed_status": 404,
+            "services_activated": True,
+            "runtime_verified": True,
+            "ingress_opened": False,
+        }
+        predecessor_bytes = (json.dumps(predecessor_current) + "\n").encode()
+        (self.backup / "PREDECESSOR-CURRENT.json").write_bytes(predecessor_bytes)
+        predecessor_current_sha = sha256(self.backup / "PREDECESSOR-CURRENT.json")
+
+        successor_evidence = {
+            "schema_version": 2,
+            "release_mode": "successor",
+            "release_env_sha256": sha256(self.backup / "release.env"),
+            "predecessor_binding": {
+                "current_state_sha256": predecessor_current_sha,
+                "control_sha256": predecessor_control_sha,
+                "apply_receipt_sha256": predecessor_apply_sha,
+                "release_evidence_sha256": predecessor_release_sha,
+                "runtime_manifest_sha256": predecessor_runtime_manifest_sha,
+            },
+        }
+        successor_delta = self.backup / "SUCCESSOR-DELTA.sha256"
+        successor_delta.write_text(f"{'d' * 64}  successor-overlay\n", encoding="utf-8")
+        shutil.copyfile(successor_delta, dry / "stage/SUCCESSOR-DELTA.sha256")
+        successor_authority = self.backup / "successor-authority"
+        successor_authority.mkdir(mode=0o700)
+        generation_authorities = (
+            "successor-static-targets.sha256",
+            "successor-frozen-targets.json",
+            "successor-preimages.sha256",
+            "successor-absent.paths",
+            "successor-supporting-targets.sha256",
+            "successor-policy.json",
+        )
+        for name in generation_authorities:
+            shutil.copyfile(OPS_ROOT / name, successor_authority / name)
+        (self.backup / "RENDER-INPUTS.sha256").write_text(
+            "".join(
+                f"{sha256(successor_authority / name)}  {name}\n"
+                for name in generation_authorities
+            ),
+            encoding="utf-8",
+        )
+        (successor_authority / "assets").mkdir(mode=0o700)
+        for name in (
+            "20260823_rikune_root_up.sql",
+            "20260823_rikune_root_down.sql",
+        ):
+            shutil.copyfile(
+                OPS_ROOT / "assets" / name,
+                successor_authority / "assets" / name,
+            )
+        render_inputs_sha = sha256(self.backup / "RENDER-INPUTS.sha256")
+        self.replace_receipt_value(
+            self.backup / "DRY-RUN.receipt",
+            "render_inputs_sha256",
+            render_inputs_sha,
+        )
+        shutil.copyfile(
+            OPS_ROOT.parents[1] / "Dockerfile.analyzer",
+            successor_authority / "Dockerfile.analyzer",
+        )
+        shutil.copyfile(
+            OPS_ROOT.parents[1] / "bridge/package-lock.json",
+            successor_authority / "bridge-package-lock.json",
+        )
+        successor_evidence["successor_delta_sha256"] = sha256(successor_delta)
+        (self.backup / "RELEASE-EVIDENCE.json").write_text(
+            json.dumps(successor_evidence) + "\n", encoding="utf-8"
+        )
+        shutil.copyfile(
+            self.backup / "RELEASE-EVIDENCE.json",
+            dry / "stage/RELEASE-EVIDENCE.json",
+        )
+        self.replace_receipt_value(
+            self.backup / "DRY-RUN.receipt",
+            "release_evidence_sha256",
+            sha256(self.backup / "RELEASE-EVIDENCE.json"),
+        )
+        with (self.backup / "DRY-RUN.receipt").open("a", encoding="utf-8") as handle:
+            handle.write(f"successor_delta_sha256={sha256(successor_delta)}\n")
+        shutil.copyfile(self.backup / "DRY-RUN.receipt", dry / "DRY-RUN.receipt")
+
+        successor_arm = self.backup / "SUCCESSOR-ARMED.receipt"
+        successor_arm.write_text(
+            "".join(
+                [
+                    "schema_version=1\n",
+                    f"successor_backup_dir={self.backup}\n",
+                    "predecessor_current_file=PREDECESSOR-CURRENT.json\n",
+                    f"predecessor_current_sha256={predecessor_current_sha}\n",
+                    f"predecessor_backup_dir={predecessor}\n",
+                    f"predecessor_control_sha256={predecessor_control_sha}\n",
+                    f"predecessor_apply_receipt_sha256={predecessor_apply_sha}\n",
+                    f"predecessor_release_evidence_sha256={predecessor_release_sha}\n",
+                    f"predecessor_runtime_backup_receipt_sha256={predecessor_runtime_receipt_sha}\n",
+                    f"predecessor_runtime_backup_manifest_sha256={predecessor_runtime_manifest_sha}\n",
+                    "predecessor_release_generation=1\n",
+                    "release_generation=2\n",
+                    "route_database_state=absent\n",
+                    "public_ipv4_ipv6_closed_status=404\n",
+                    "predecessor_runtime_verified=true\n",
+                    "ingress_opened=false\n",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        successor_arm_sha = sha256(successor_arm)
+        lineage = {
+            "successor": True,
+            "successor_armed_receipt": successor_arm.name,
+            "successor_armed_receipt_sha256": successor_arm_sha,
+            "predecessor_current_file": "PREDECESSOR-CURRENT.json",
+            "predecessor_current_sha256": predecessor_current_sha,
+            "predecessor_backup_dir": str(predecessor),
+            "predecessor_control_sha256": predecessor_control_sha,
+            "predecessor_apply_receipt_sha256": predecessor_apply_sha,
+            "predecessor_release_evidence_sha256": predecessor_release_sha,
+            "predecessor_runtime_backup_receipt_sha256": predecessor_runtime_receipt_sha,
+            "predecessor_runtime_backup_manifest_sha256": predecessor_runtime_manifest_sha,
+            "predecessor_release_generation": 1,
+            "release_generation": 2,
+        }
+        lineage_receipt = [
+            "successor=true\n",
+            f"successor_armed_receipt=SUCCESSOR-ARMED.receipt\n",
+            f"successor_armed_receipt_sha256={successor_arm_sha}\n",
+            "predecessor_current_file=PREDECESSOR-CURRENT.json\n",
+            f"predecessor_current_sha256={predecessor_current_sha}\n",
+            f"predecessor_backup_dir={predecessor}\n",
+            f"predecessor_control_sha256={predecessor_control_sha}\n",
+            f"predecessor_apply_receipt_sha256={predecessor_apply_sha}\n",
+            f"predecessor_release_evidence_sha256={predecessor_release_sha}\n",
+            f"predecessor_runtime_backup_receipt_sha256={predecessor_runtime_receipt_sha}\n",
+            f"predecessor_runtime_backup_manifest_sha256={predecessor_runtime_manifest_sha}\n",
+            "predecessor_release_generation=1\n",
+            "release_generation=2\n",
+        ]
+        caller = self.backup / "RUNTIME-BACKUP-CALLER-ARMED.receipt"
+        self.replace_receipt_value(
+            caller,
+            "release_evidence_sha256",
+            sha256(self.backup / "RELEASE-EVIDENCE.json"),
+        )
+        self.replace_receipt_value(
+            caller,
+            "dry_run_receipt_sha256",
+            sha256(self.backup / "DRY-RUN.receipt"),
+        )
+        self.replace_receipt_value(
+            caller, "render_inputs_sha256", render_inputs_sha
+        )
+        caller.write_text(
+            caller.read_text(encoding="utf-8") + "".join(lineage_receipt),
+            encoding="utf-8",
+        )
+        armed = self.backup / "APPLY-ARMED.receipt"
+        self.replace_receipt_value(
+            armed,
+            "release_evidence_sha256",
+            sha256(self.backup / "RELEASE-EVIDENCE.json"),
+        )
+        self.replace_receipt_value(
+            armed,
+            "dry_run_receipt_sha256",
+            sha256(self.backup / "DRY-RUN.receipt"),
+        )
+        self.replace_receipt_value(
+            armed, "render_inputs_sha256", render_inputs_sha
+        )
+        self.replace_receipt_value(
+            armed, "runtime_backup_caller_armed_sha256", sha256(caller)
+        )
+        armed.write_text(
+            armed.read_text(encoding="utf-8") + "".join(lineage_receipt),
+            encoding="utf-8",
+        )
+        self.write_control()
+
+        failure_values = failure.read_text(encoding="utf-8")
+        failure_values = failure_values.replace(
+            next(
+                line
+                for line in failure_values.splitlines()
+                if line.startswith("apply_armed_receipt_sha256=")
+            ),
+            f"apply_armed_receipt_sha256={sha256(armed)}",
+        ).replace(
+            next(
+                line
+                for line in failure_values.splitlines()
+                if line.startswith("control_sha256=")
+            ),
+            f"control_sha256={sha256(self.backup / 'CONTROL.sha256')}",
+        )
+        failure.write_text(failure_values, encoding="utf-8")
+        current_path = self.state / "CURRENT.json"
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        current.update(lineage)
+        current.update(
+            {
+                "apply_armed_receipt_sha256": sha256(armed),
+                "release_evidence_sha256": sha256(
+                    self.backup / "RELEASE-EVIDENCE.json"
+                ),
+                "dry_run_receipt_sha256": sha256(self.backup / "DRY-RUN.receipt"),
+                "control_sha256": sha256(self.backup / "CONTROL.sha256"),
+                "apply_failure_receipt_sha256": sha256(failure),
+            }
+        )
+        current_path.write_text(json.dumps(current) + "\n", encoding="utf-8")
+        return predecessor_bytes
+
     def install_estate_rollback_recovery_state(self) -> Path:
         (self.backup / "TARGETS.sha256").write_bytes(
             (self.backup / "estate/APPLIED-TARGETS.sha256").read_bytes()
@@ -637,6 +945,14 @@ class ApplyRecoveryTests(unittest.TestCase):
             "release-validator",
             'printf "validator %s\\n" "$*" >>"$HOLDFAST_TEST_LOG"\n',
         )
+        self.supply_validator = self.make_fake(
+            "supply-validator",
+            'printf "supply-validator %s\\n" "$*" >>"$HOLDFAST_TEST_LOG"\n',
+        )
+        self.render_validator = self.make_fake(
+            "render-validator",
+            'printf "render-validator %s\\n" "$*" >>"$HOLDFAST_TEST_LOG"\n',
+        )
         self.psql = self.make_fake(
             "psql",
             'printf "psql %s\\n" "$*" >>"$HOLDFAST_TEST_LOG"\nprintf "ok\\n"\n',
@@ -755,6 +1071,8 @@ class ApplyRecoveryTests(unittest.TestCase):
             "HOLDFAST_TEST_MODE": "1",
             "HOLDFAST_LOCK_PATH": str(self.root / "holdfast.lock"),
             "HOLDFAST_RELEASE_VALIDATOR_BIN": str(self.validator),
+            "HOLDFAST_SUPPLY_CHAIN_EVIDENCE_BIN": str(self.supply_validator),
+            "HOLDFAST_RENDER_INPUT_BINDING_BIN": str(self.render_validator),
             "HOLDFAST_PSQL_BIN": str(self.psql),
             "HOLDFAST_PUBLIC_VERIFY_BIN": str(self.public),
             "HOLDFAST_DOCKER_BIN": str(self.docker),
@@ -802,6 +1120,21 @@ class ApplyRecoveryTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             env=env or self.environment(),
         )
+
+    def recovery_mutations(self) -> list[str]:
+        if not self.log.exists():
+            return []
+        mutations = []
+        for line in self.log.read_text(encoding="utf-8").splitlines():
+            if line.startswith("runtime-restore "):
+                mutations.append(line)
+                continue
+            if line.startswith("docker ") and any(
+                marker in f" {line} "
+                for marker in (" stop ", " start ", " up ", " rm ")
+            ):
+                mutations.append(line)
+        return mutations
 
     def install_restore_failed_with_release_only_writer(self) -> dict[str, object]:
         running = "verdict rikune-analyzer sluice sluice-internal"
@@ -865,6 +1198,185 @@ class ApplyRecoveryTests(unittest.TestCase):
         repeated = self.recover("restore")
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertIn("previously completed runtime backup recovery", repeated.stdout)
+
+    def test_successor_restore_sigkill_recovers_exact_immediate_predecessor(self) -> None:
+        predecessor_bytes = self.install_successor_activation_failed_state()
+        interrupted = self.recover(
+            "restore", env=self.environment(HOLDFAST_TEST_SIGKILL_RECOVERY="1")
+        )
+        self.assertEqual(interrupted.returncode, -9, interrupted.stdout + interrupted.stderr)
+        armed_current = json.loads(
+            (self.state / "CURRENT.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(armed_current["state"], "apply_recovery_armed")
+        self.assertTrue(armed_current["successor"])
+        recovery_arm = self.state / armed_current["recovery_armed_receipt"]
+        self.assertIn(
+            f"predecessor_current_sha256={armed_current['predecessor_current_sha256']}",
+            recovery_arm.read_text(encoding="utf-8"),
+        )
+
+        resumed = self.recover("restore")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual((self.state / "CURRENT.json").read_bytes(), predecessor_bytes)
+        completion = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        self.assertIn("successor=true", completion.read_text(encoding="utf-8"))
+        calls = self.log.read_text(encoding="utf-8")
+        self.assertIn(
+            f"--successor-policy {self.backup}/successor-authority/successor-policy.json",
+            calls,
+        )
+        self.assertIn(
+            f"--dockerfile {self.backup}/successor-authority/Dockerfile.analyzer",
+            calls,
+        )
+        self.assertIn(
+            f"validator --evidence {self.backup}/RELEASE-EVIDENCE.json "
+            f"--successor-policy {self.backup}/successor-authority/successor-policy.json",
+            calls,
+        )
+        self.assertIn(
+            f"render-validator verify --ops-root {self.backup}/successor-authority",
+            calls,
+        )
+        self.assertIn("--expected-mode successor", calls)
+
+        mutations = self.recovery_mutations()
+        estate_bytes = (self.estate / "deploy/docker-compose.yml").read_bytes()
+        repeated = self.recover("restore")
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertIn("previously completed apply recovery", repeated.stdout)
+        self.assertEqual((self.state / "CURRENT.json").read_bytes(), predecessor_bytes)
+        self.assertEqual(
+            (self.estate / "deploy/docker-compose.yml").read_bytes(), estate_bytes
+        )
+        self.assertEqual(self.recovery_mutations(), mutations)
+
+    def test_successor_runtime_caller_restore_boundary_is_adopted(self) -> None:
+        predecessor_bytes = self.install_successor_activation_failed_state()
+        caller = self.backup / "RUNTIME-BACKUP-CALLER-ARMED.receipt"
+        caller_values = dict(
+            line.split("=", 1)
+            for line in caller.read_text(encoding="utf-8").splitlines()
+        )
+        current_path = self.state / "CURRENT.json"
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        current.update(
+            {
+                "state": "runtime_backup_armed",
+                "runtime_backup_armed_at": caller_values["armed_at"],
+                "dry_run_dir": caller_values["dry_run_dir"],
+                "runtime_backup_dir": caller_values["runtime_backup_dir"],
+                "runtime_backup_caller_armed_receipt": caller.name,
+                "runtime_backup_caller_armed_receipt_sha256": sha256(caller),
+                "runtime_backup_armed_receipt": caller_values[
+                    "runtime_backup_armed_receipt"
+                ],
+                "release_env_sha256": caller_values["release_env_sha256"],
+                "release_evidence_sha256": caller_values[
+                    "release_evidence_sha256"
+                ],
+                "dry_run_receipt_sha256": caller_values[
+                    "dry_run_receipt_sha256"
+                ],
+                "targets_sha256": caller_values["targets_sha256"],
+                "apply_preimages_sha256": caller_values[
+                    "apply_preimages_sha256"
+                ],
+                "apply_absent_sha256": caller_values["apply_absent_sha256"],
+                "render_inputs_sha256": caller_values["render_inputs_sha256"],
+                "stop_authority_contract": caller_values[
+                    "stop_authority_contract"
+                ],
+                "ingress_opened": False,
+            }
+        )
+        current_path.write_text(json.dumps(current) + "\n", encoding="utf-8")
+
+        interrupted = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_SIGKILL_AFTER_RUNTIME_PREDECESSOR_CURRENT_RESTORE="1"
+            ),
+        )
+        self.assertEqual(interrupted.returncode, -9, interrupted.stdout + interrupted.stderr)
+        self.assertEqual(current_path.read_bytes(), predecessor_bytes)
+        self.assertEqual(len(list(self.state.glob("RUNTIME-BACKUP-ABORTED-*.json"))), 1)
+        self.assertFalse(
+            list(self.state.glob("RUNTIME-BACKUP-RECOVERY-COMPLETE-*.receipt"))
+        )
+
+        mutations = self.recovery_mutations()
+        resumed = self.recover("restore")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn("previously completed runtime backup recovery", resumed.stdout)
+        self.assertEqual(current_path.read_bytes(), predecessor_bytes)
+        self.assertEqual(self.recovery_mutations(), mutations)
+        self.assertEqual(
+            len(list(self.state.glob("RUNTIME-BACKUP-RECOVERY-COMPLETE-*.receipt"))),
+            1,
+        )
+
+    def test_successor_lineage_tamper_fails_before_recovery_mutation(self) -> None:
+        self.install_successor_activation_failed_state()
+        current_path = self.state / "CURRENT.json"
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        current["predecessor_backup_dir"] = str(self.root / "unrelated-generation")
+        current_path.write_text(json.dumps(current) + "\n", encoding="utf-8")
+
+        rejected = self.recover("restore")
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn("CURRENT linkage differs", rejected.stderr)
+        calls = self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+        self.assertNotIn("runtime-restore ", calls)
+
+    def test_successor_pointer_cannot_downgrade_control_bound_backup(self) -> None:
+        self.install_successor_activation_failed_state()
+        current_path = self.state / "CURRENT.json"
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        current.pop("successor")
+        current_path.write_text(json.dumps(current) + "\n", encoding="utf-8")
+
+        rejected = self.recover("restore")
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertIn("mode is missing or downgraded", rejected.stderr)
+        calls = self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+        self.assertNotIn("runtime-restore ", calls)
+
+    def test_successor_current_archive_boundary_retries_without_pointer_gap(
+        self,
+    ) -> None:
+        predecessor_bytes = self.install_successor_activation_failed_state()
+        interrupted = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_SIGKILL_AFTER_SUCCESSOR_CURRENT_ARCHIVE="1"
+            ),
+        )
+        self.assertEqual(interrupted.returncode, -9, interrupted.stdout + interrupted.stderr)
+        self.assertTrue((self.state / "CURRENT.json").is_file())
+        self.assertEqual(
+            len(list(self.state.glob("APPLY-RECOVERY-ARMED-STATE-*.json"))), 1
+        )
+
+        resumed = self.recover("restore")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual((self.state / "CURRENT.json").read_bytes(), predecessor_bytes)
+
+    def test_successor_frozen_route_authority_tamper_fails_before_mutation(
+        self,
+    ) -> None:
+        self.install_successor_activation_failed_state()
+        route = (
+            self.backup
+            / "successor-authority/assets/20260823_rikune_root_down.sql"
+        )
+        route.write_text(route.read_text(encoding="utf-8") + "-- tampered\n")
+
+        rejected = self.recover("restore")
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        calls = self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+        self.assertNotIn("runtime-restore ", calls)
 
     def test_runtime_caller_arm_after_sigkill_restores_exact_prior_subset_only(self) -> None:
         self.install_runtime_caller_state(stop_started=True)

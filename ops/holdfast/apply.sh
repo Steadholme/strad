@@ -2,12 +2,13 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --execute --estate-root PATH --dry-run-dir PATH --release-env FILE --backup-root PATH [--state-dir PATH] [--activate-services]" >&2
+  echo "usage: $0 --execute --estate-root PATH --dry-run-dir PATH --release-env FILE --backup-root PATH [--state-dir PATH] [--activate-services] [--successor]" >&2
   exit 2
 }
 
 execute="false"
 activate="false"
+successor="false"
 estate_root=""
 dry_run_dir=""
 release_env=""
@@ -17,6 +18,7 @@ while (($#)); do
   case "$1" in
     --execute) execute="true"; shift ;;
     --activate-services) activate="true"; shift ;;
+    --successor) successor="true"; shift ;;
     --estate-root) [[ $# -ge 2 ]] || usage; estate_root=$2; shift 2 ;;
     --dry-run-dir) [[ $# -ge 2 ]] || usage; dry_run_dir=$2; shift 2 ;;
     --release-env) [[ $# -ge 2 ]] || usage; release_env=$2; shift 2 ;;
@@ -26,6 +28,10 @@ while (($#)); do
   esac
 done
 [[ "$execute" == "true" && -n "$estate_root" && -n "$dry_run_dir" && -n "$release_env" && -n "$backup_root" ]] || usage
+if [[ "$successor" == "true" && "$activate" != "true" ]]; then
+  echo "successor apply requires --activate-services" >&2
+  exit 2
+fi
 [[ $EUID -eq 0 ]] || { echo "apply requires root" >&2; exit 1; }
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=common.sh
@@ -43,10 +49,19 @@ targets="$stage/TARGETS.sha256"
 apply_preimages="$stage/APPLY-PREIMAGES.sha256"
 apply_absent="$stage/APPLY-ABSENT.paths"
 render_inputs="$stage/RENDER-INPUTS.sha256"
+successor_delta="$stage/SUCCESSOR-DELTA.sha256"
 supply_evidence="$stage/evidence/SUPPLY-CHAIN.json"
 supply_signature="$stage/evidence/SUPPLY-CHAIN.sig"
 supply_public_key="$stage/evidence/SUPPLY-CHAIN.pub"
 routes_database_url=${ROUTES_DATABASE_URL:-}
+render_expected_mode="base"
+supply_chain_policy_args=()
+release_validator_policy_args=()
+if [[ "$successor" == "true" ]]; then
+  render_expected_mode="successor"
+  supply_chain_policy_args=(--successor-policy "$script_dir/successor-policy.json")
+  release_validator_policy_args=(--successor-policy "$script_dir/successor-policy.json")
+fi
 require_root_control_file() {
   local file=$1
   [[ -f "$file" && ! -L "$file" && "$(stat -c '%u:%h' -- "$file")" == "0:1" ]] || \
@@ -89,6 +104,9 @@ release_control_files=(
   "$apply_absent"
   "$render_inputs"
 )
+if [[ "$successor" == "true" ]]; then
+  release_control_files+=("$successor_delta")
+fi
 
 verify_render_bindings() {
   [[ "$(holdfast_receipt_value "$receipt" apply_preimages_sha256)" == "$(holdfast_sha256 "$apply_preimages")" ]] || \
@@ -100,13 +118,14 @@ verify_render_bindings() {
   python3 "$script_dir/render_input_binding.py" verify \
     --ops-root "$script_dir" --manifest "$render_inputs" \
     --stage-root "$stage" --release-evidence "$stage/RELEASE-EVIDENCE.json" \
+    --expected-mode "$render_expected_mode" \
     --require-root-owner
 }
 
 bound_dry_receipt_sha=""
 release_env_sha=""
 verify_release_bindings() {
-  local current_receipt_sha key receipt_key file
+  local current_receipt_sha key receipt_key file successor_delta_sha tool_revision
   for file in "${release_control_files[@]}"; do
     require_root_control_file "$file"
   done
@@ -117,7 +136,9 @@ verify_release_bindings() {
   [[ "$(holdfast_receipt_value "$receipt" cargo_gate)" == "passed" ]] || \
     holdfast_die "production apply refuses a dry-run without the Rust gate"
   verify_render_bindings
-  python3 "$script_dir/validate_release_evidence.py" --evidence "$stage/RELEASE-EVIDENCE.json"
+  python3 "$script_dir/validate_release_evidence.py" \
+    --evidence "$stage/RELEASE-EVIDENCE.json" \
+    "${release_validator_policy_args[@]}"
   [[ "$(holdfast_receipt_value "$receipt" targets_sha256)" == "$(holdfast_sha256 "$targets")" ]] || \
     holdfast_die "dry-run target manifest changed"
   [[ "$(holdfast_receipt_value "$receipt" release_evidence_sha256)" == "$(holdfast_sha256 "$stage/RELEASE-EVIDENCE.json")" ]] || \
@@ -127,6 +148,30 @@ verify_release_bindings() {
     holdfast_die "release env differs from the dry-run identity"
   [[ "$(jq -er '.release_env_sha256' "$stage/RELEASE-EVIDENCE.json")" == "$release_env_sha" ]] || \
     holdfast_die "release env differs from RELEASE-EVIDENCE"
+  if [[ "$successor" == "true" ]]; then
+    successor_delta_sha=$(holdfast_sha256 "$successor_delta")
+    tool_revision=$(awk -F= '$1 == "HOLDFAST_RELEASE_TOOL_REVISION" {print $2}' "$release_env")
+    [[ "$tool_revision" =~ ^[0-9a-f]{40}$ ]] || \
+      holdfast_die "successor release env tool revision is invalid"
+    [[ "$(holdfast_receipt_value "$receipt" release_mode)" == "successor" && \
+      "$(jq -er '.release_mode' "$stage/RELEASE-EVIDENCE.json")" == "successor" ]] || \
+      holdfast_die "successor dry-run release mode differs"
+    [[ "$(holdfast_receipt_value "$receipt" predecessor_current_sha256)" == \
+      "$predecessor_current_sha" && \
+      "$(jq -er '.predecessor_binding.current_state_sha256' \
+        "$stage/RELEASE-EVIDENCE.json")" == "$predecessor_current_sha" ]] || \
+      holdfast_die "successor dry-run predecessor CURRENT differs"
+    [[ "$(holdfast_receipt_value "$receipt" successor_delta_sha256)" == \
+      "$successor_delta_sha" && \
+      "$(jq -er '.successor_delta_sha256' "$stage/RELEASE-EVIDENCE.json")" == \
+      "$successor_delta_sha" ]] || \
+      holdfast_die "successor dry-run delta differs"
+    [[ "$(holdfast_receipt_value "$receipt" holdfast_release_tool_revision)" == \
+      "$tool_revision" && \
+      "$(jq -er '.holdfast_release_tool_revision' "$stage/RELEASE-EVIDENCE.json")" == \
+      "$tool_revision" ]] || \
+      holdfast_die "successor dry-run release tool revision differs"
+  fi
   python3 "$script_dir/supply_chain_evidence.py" \
     --release-env "$release_env" \
     --evidence "$supply_evidence" \
@@ -134,7 +179,8 @@ verify_release_bindings() {
     --public-key "$supply_public_key" \
     --dockerfile "$script_dir/../../Dockerfile.analyzer" \
     --bridge-lock "$script_dir/../../bridge/package-lock.json" \
-    --release-evidence "$stage/RELEASE-EVIDENCE.json"
+    --release-evidence "$stage/RELEASE-EVIDENCE.json" \
+    "${supply_chain_policy_args[@]}"
   for key in evidence signature public_key; do
     receipt_key="supply_chain_${key}_sha256"
     case "$key" in
@@ -179,6 +225,154 @@ atomic_copy_authority() {
     holdfast_die "atomically persisted authority differs from source: $target"
 }
 
+archive_and_restore_predecessor_current() {
+  local archive=$1 temporary
+  require_root_control_file "$state_file"
+  if [[ -e "$archive" || -L "$archive" ]]; then
+    require_root_control_file "$archive"
+    [[ "$(holdfast_sha256 "$archive")" == "$(holdfast_sha256 "$state_file")" ]] || \
+      holdfast_die "successor CURRENT archive differs from the active pointer"
+  else
+    atomic_copy_authority "$state_file" "$archive"
+  fi
+  if [[ "${HOLDFAST_TEST_MODE:-0}" == "1" && \
+    "${HOLDFAST_TEST_SIGKILL_AFTER_SUCCESSOR_CURRENT_ARCHIVE:-0}" == "1" ]]; then
+    kill -KILL "$$"
+  fi
+  temporary="$state_dir/.PREDECESSOR-CURRENT.$$"
+  [[ ! -e "$temporary" && ! -L "$temporary" ]] || \
+    holdfast_die "predecessor CURRENT replacement temporary exists"
+  install -o 0 -g 0 -m 0600 -- "$predecessor_current_file" "$temporary"
+  commit_atomic_file "$temporary" "$state_file"
+  [[ "$(holdfast_sha256 "$state_file")" == "$predecessor_current_sha" ]] || \
+    holdfast_die "successor recovery did not atomically restore predecessor CURRENT"
+}
+
+successor_generation_authorities=()
+persist_successor_generation_authority() {
+  local authority_dir line digest relative source
+  local -A seen=()
+  [[ "$successor" == "true" ]] || return 0
+  authority_dir="$backup/successor-authority"
+  [[ ! -e "$authority_dir" && ! -L "$authority_dir" ]] || \
+    holdfast_die "successor generation authority directory already exists"
+  mkdir -m 0700 -- "$authority_dir"
+  successor_generation_authorities=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([0-9a-f]{64})[[:space:]][[:space:]]([A-Za-z0-9._-]+)$ ]] || \
+      holdfast_die "successor render-input authority contains an invalid line"
+    digest=${BASH_REMATCH[1]}
+    relative=${BASH_REMATCH[2]}
+    [[ -z "${seen[$relative]+x}" ]] || \
+      holdfast_die "successor render-input authority repeats a path"
+    seen[$relative]=1
+    source="$script_dir/$relative"
+    require_root_control_file "$source"
+    [[ "$(holdfast_sha256 "$source")" == "$digest" ]] || \
+      holdfast_die "successor generation authority drifted before persistence: $relative"
+    atomic_copy_authority "$source" "$authority_dir/$relative"
+    successor_generation_authorities+=("$relative")
+  done <"$render_inputs"
+  ((${#successor_generation_authorities[@]} == 6)) || \
+    holdfast_die "successor generation authority set is not exactly six files"
+  mkdir -m 0700 -- "$authority_dir/assets"
+  for relative in 20260823_rikune_root_up.sql 20260823_rikune_root_down.sql; do
+    require_root_control_file "$script_dir/assets/$relative"
+    atomic_copy_authority \
+      "$script_dir/assets/$relative" "$authority_dir/assets/$relative"
+  done
+  require_root_control_file "$script_dir/../../Dockerfile.analyzer"
+  atomic_copy_authority \
+    "$script_dir/../../Dockerfile.analyzer" \
+    "$authority_dir/Dockerfile.analyzer"
+  require_root_control_file "$script_dir/../../bridge/package-lock.json"
+  atomic_copy_authority \
+    "$script_dir/../../bridge/package-lock.json" \
+    "$authority_dir/bridge-package-lock.json"
+}
+
+persist_successor_authority() {
+  local successor_tmp successor_state_tmp successor_armed_at
+  [[ "$successor" == "true" ]] || return 0
+  [[ "$(holdfast_sha256 "$state_file")" == "$predecessor_current_sha" ]] || \
+    holdfast_die "predecessor CURRENT changed before successor authority persistence"
+  predecessor_current_file="$backup/PREDECESSOR-CURRENT.json"
+  atomic_copy_authority "$state_file" "$predecessor_current_file"
+  [[ "$(holdfast_sha256 "$predecessor_current_file")" == "$predecessor_current_sha" ]] || \
+    holdfast_die "persisted predecessor CURRENT differs"
+  successor_armed_receipt="$backup/SUCCESSOR-ARMED.receipt"
+  successor_tmp="$backup/.SUCCESSOR-ARMED.receipt.$$"
+  successor_armed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  {
+    printf 'schema_version=1\n'
+    printf 'armed_at=%s\n' "$successor_armed_at"
+    printf 'estate_root=%s\n' "$estate_root"
+    printf 'successor_backup_dir=%s\n' "$backup"
+    printf 'candidate_dry_run_receipt_sha256=%s\n' "$bound_dry_receipt_sha"
+    printf 'candidate_release_evidence_sha256=%s\n' "$(holdfast_sha256 "$stage/RELEASE-EVIDENCE.json")"
+    printf 'predecessor_current_file=PREDECESSOR-CURRENT.json\n'
+    printf 'predecessor_current_sha256=%s\n' "$predecessor_current_sha"
+    printf 'predecessor_backup_dir=%s\n' "$predecessor_backup"
+    printf 'predecessor_control_sha256=%s\n' "$predecessor_control_sha"
+    printf 'predecessor_apply_receipt_sha256=%s\n' "$predecessor_apply_sha"
+    printf 'predecessor_release_evidence_sha256=%s\n' "$predecessor_release_sha"
+    printf 'predecessor_runtime_backup_receipt_sha256=%s\n' "$predecessor_runtime_receipt_sha"
+    printf 'predecessor_runtime_backup_manifest_sha256=%s\n' "$predecessor_runtime_manifest_sha"
+    printf 'predecessor_release_generation=%s\n' "$predecessor_generation"
+    printf 'release_generation=%s\n' "$release_generation"
+    printf 'route_database_state=absent\n'
+    printf 'public_ipv4_ipv6_closed_status=404\n'
+    printf 'predecessor_runtime_verified=true\n'
+    printf 'ingress_opened=false\n'
+  } >"$successor_tmp"
+  commit_atomic_file "$successor_tmp" "$successor_armed_receipt"
+  successor_armed_sha=$(holdfast_sha256 "$successor_armed_receipt")
+
+  successor_state_tmp="$state_dir/.CURRENT.json.$$"
+  jq -n \
+    --arg armed_at "$successor_armed_at" \
+    --arg estate "$estate_root" \
+    --arg backup "$backup" \
+    --arg dry "$dry_run_dir" \
+    --arg release_env_sha "$release_env_sha" \
+    --arg release_evidence_sha "$(holdfast_sha256 "$stage/RELEASE-EVIDENCE.json")" \
+    --arg dry_receipt_sha "$bound_dry_receipt_sha" \
+    --arg successor_armed_sha "$successor_armed_sha" \
+    --arg predecessor_current_sha "$predecessor_current_sha" \
+    --arg predecessor_backup "$predecessor_backup" \
+    --arg predecessor_control "$predecessor_control_sha" \
+    --arg predecessor_apply "$predecessor_apply_sha" \
+    --arg predecessor_release "$predecessor_release_sha" \
+    --arg predecessor_runtime_receipt "$predecessor_runtime_receipt_sha" \
+    --arg predecessor_runtime_manifest "$predecessor_runtime_manifest_sha" \
+    --argjson predecessor_generation "$predecessor_generation" \
+    --argjson generation "$release_generation" \
+    '{schema_version:2,state:"successor_armed",successor_armed_at:$armed_at,
+      estate_root:$estate,backup_dir:$backup,dry_run_dir:$dry,
+      release_env_sha256:$release_env_sha,release_evidence_sha256:$release_evidence_sha,
+      dry_run_receipt_sha256:$dry_receipt_sha,successor:true,
+      successor_armed_receipt:"SUCCESSOR-ARMED.receipt",
+      successor_armed_receipt_sha256:$successor_armed_sha,
+      predecessor_current_file:"PREDECESSOR-CURRENT.json",
+      predecessor_current_sha256:$predecessor_current_sha,
+      predecessor_backup_dir:$predecessor_backup,
+      predecessor_control_sha256:$predecessor_control,
+      predecessor_apply_receipt_sha256:$predecessor_apply,
+      predecessor_release_evidence_sha256:$predecessor_release,
+      predecessor_runtime_backup_receipt_sha256:$predecessor_runtime_receipt,
+      predecessor_runtime_backup_manifest_sha256:$predecessor_runtime_manifest,
+      predecessor_release_generation:$predecessor_generation,
+      release_generation:$generation,route_database_state:"absent",
+      public_ipv4_ipv6_closed_status:404,predecessor_runtime_verified:true,
+      ingress_opened:false}' >"$successor_state_tmp"
+  commit_atomic_file "$successor_state_tmp" "$state_file"
+  validate_persisted_successor_authority "$state_file"
+  if [[ "${HOLDFAST_TEST_MODE:-0}" == "1" && \
+    "${HOLDFAST_TEST_SIGKILL_AFTER_SUCCESSOR_ARM:-0}" == "1" ]]; then
+    kill -KILL "$$"
+  fi
+}
+
 verify_database_absent() {
   local observed
   observed=$(PGAPPNAME=holdfast-rikune-apply-db-absent psql "$routes_database_url" -XAtq \
@@ -193,6 +387,218 @@ verify_closed_bracket() {
   verify_database_absent
   "$script_dir/public-origin-verify.sh" --mode closed --url https://analyze.w33d.xyz/
   verify_database_absent
+}
+
+predecessor_current_file=""
+predecessor_current_sha=""
+predecessor_backup=""
+predecessor_control_sha=""
+predecessor_apply_sha=""
+predecessor_release_sha=""
+predecessor_runtime_receipt_sha=""
+predecessor_runtime_manifest_sha=""
+predecessor_generation=""
+release_generation=""
+successor_armed_receipt=""
+successor_armed_sha=""
+
+validate_predecessor_snapshot() {
+  local snapshot=$1 expected key value predecessor_apply predecessor_file
+  require_root_control_file "$snapshot"
+  jq -e \
+    --arg estate "$estate_root" \
+    '.schema_version == 2 and .state == "applied_ingress_closed" and
+     .estate_root == $estate and .route_database_state == "absent" and
+     .public_ipv4_ipv6_closed_status == 404 and .runtime_verified == true and
+     .services_activated == true and .ingress_opened == false' \
+    "$snapshot" >/dev/null || \
+    holdfast_die "successor requires an applied, runtime-verified, dual-stack-404 predecessor"
+
+  predecessor_backup=$(jq -er '.backup_dir' "$snapshot")
+  holdfast_require_absolute "$predecessor_backup"
+  require_canonical_root_directory "$predecessor_backup"
+  [[ -z "$(find "$predecessor_backup" -maxdepth 0 -perm /077 -print -quit)" ]] || \
+    holdfast_die "predecessor backup must not be group/world accessible"
+  [[ -z "$(find "$predecessor_backup" -xdev -type l -print -quit)" ]] || \
+    holdfast_die "predecessor backup contains a symlink"
+  [[ -z "$(find "$predecessor_backup" -xdev ! -user root -print -quit)" ]] || \
+    holdfast_die "predecessor backup contains a non-root-owned entry"
+  for predecessor_file in \
+    "$predecessor_backup/CONTROL.sha256" "$predecessor_backup/APPLY.receipt" \
+    "$predecessor_backup/RELEASE-EVIDENCE.json" "$predecessor_backup/release.env" \
+    "$predecessor_backup/runtime/BACKUP.receipt" \
+    "$predecessor_backup/runtime/SHA256SUMS"; do
+    require_root_control_file "$predecessor_file"
+  done
+  (cd "$predecessor_backup" && sha256sum --check CONTROL.sha256)
+  (cd "$predecessor_backup/runtime" && sha256sum --check SHA256SUMS)
+
+  predecessor_control_sha=$(holdfast_sha256 "$predecessor_backup/CONTROL.sha256")
+  predecessor_apply_sha=$(holdfast_sha256 "$predecessor_backup/APPLY.receipt")
+  predecessor_release_sha=$(holdfast_sha256 "$predecessor_backup/RELEASE-EVIDENCE.json")
+  predecessor_runtime_receipt_sha=$(holdfast_sha256 "$predecessor_backup/runtime/BACKUP.receipt")
+  predecessor_runtime_manifest_sha=$(holdfast_sha256 "$predecessor_backup/runtime/SHA256SUMS")
+  for value in "$predecessor_control_sha" "$predecessor_apply_sha" \
+    "$predecessor_release_sha" "$predecessor_runtime_receipt_sha" \
+    "$predecessor_runtime_manifest_sha"; do
+    [[ "$value" =~ ^[0-9a-f]{64}$ ]] || holdfast_die "predecessor authority digest is invalid"
+  done
+  [[ "$(jq -er '.control_sha256' "$snapshot")" == "$predecessor_control_sha" ]] || \
+    holdfast_die "predecessor CURRENT CONTROL hash differs"
+  [[ "$(jq -er '.apply_receipt_sha256' "$snapshot")" == "$predecessor_apply_sha" ]] || \
+    holdfast_die "predecessor CURRENT APPLY hash differs"
+  [[ "$(jq -er '.release_evidence_sha256' "$snapshot")" == "$predecessor_release_sha" ]] || \
+    holdfast_die "predecessor CURRENT RELEASE hash differs"
+  if jq -e 'has("runtime_backup_receipt_sha256")' "$snapshot" >/dev/null; then
+    [[ "$(jq -er '.runtime_backup_receipt_sha256' "$snapshot")" == \
+      "$predecessor_runtime_receipt_sha" ]] || \
+      holdfast_die "predecessor CURRENT runtime receipt hash differs"
+  fi
+  if jq -e 'has("runtime_backup_manifest_sha256")' "$snapshot" >/dev/null; then
+    [[ "$(jq -er '.runtime_backup_manifest_sha256' "$snapshot")" == \
+      "$predecessor_runtime_manifest_sha" ]] || \
+      holdfast_die "predecessor CURRENT runtime manifest hash differs"
+  fi
+
+  predecessor_apply="$predecessor_backup/APPLY.receipt"
+  for expected in \
+    "schema_version=2" "completion_state=applied_ingress_closed" \
+    "estate_root=$estate_root" "backup_dir=$predecessor_backup" \
+    "control_sha256=$predecessor_control_sha" \
+    "release_evidence_sha256=$predecessor_release_sha" \
+    "runtime_backup=passed" "closed_bracket=passed" \
+    "route_database_state=absent" "public_ipv4_ipv6_closed_status=404" \
+    "services_activated=true" "runtime_verified=true" "ingress_opened=false"; do
+    key=${expected%%=*}
+    value=${expected#*=}
+    [[ "$(holdfast_receipt_value "$predecessor_apply" "$key")" == "$value" ]] || \
+      holdfast_die "predecessor APPLY authority differs: $key"
+  done
+  [[ "$(holdfast_receipt_value "$predecessor_backup/runtime/BACKUP.receipt" schema_version)" == "2" ]] || \
+    holdfast_die "predecessor runtime backup schema differs"
+  [[ "$(holdfast_receipt_value "$predecessor_backup/runtime/BACKUP.receipt" isolated_restore_probe)" == "passed" ]] || \
+    holdfast_die "predecessor runtime backup lacks an isolated restore proof"
+  predecessor_generation=$(jq -er '.release_generation // 1' "$snapshot")
+  [[ "$predecessor_generation" =~ ^[1-9][0-9]*$ ]] || \
+    holdfast_die "predecessor release generation is invalid"
+  release_generation=$((predecessor_generation + 1))
+}
+
+validate_live_predecessor_authority() {
+  local predecessor_release_policy_args=() predecessor_policy
+  predecessor_current_file="$state_file"
+  validate_predecessor_snapshot "$predecessor_current_file"
+  predecessor_current_sha=$(holdfast_sha256 "$predecessor_current_file")
+  if jq -e '.schema_version == 2 and .release_mode == "successor"' \
+    "$predecessor_backup/RELEASE-EVIDENCE.json" >/dev/null; then
+    predecessor_policy="$predecessor_backup/successor-authority/successor-policy.json"
+    require_root_control_file "$predecessor_policy"
+    grep -Fqx "$(holdfast_sha256 "$predecessor_policy")  successor-authority/successor-policy.json" \
+      "$predecessor_backup/CONTROL.sha256" || \
+      holdfast_die "predecessor CONTROL omits its successor policy"
+    predecessor_release_policy_args=(--successor-policy "$predecessor_policy")
+  fi
+  python3 "$script_dir/validate_release_evidence.py" \
+    --evidence "$predecessor_backup/RELEASE-EVIDENCE.json" \
+    "${predecessor_release_policy_args[@]}"
+  jq -e \
+    --arg current "$predecessor_current_sha" \
+    --arg control "$predecessor_control_sha" \
+    --arg apply "$predecessor_apply_sha" \
+    --arg release "$predecessor_release_sha" \
+    --arg runtime "$predecessor_runtime_manifest_sha" \
+    '.schema_version == 2 and .release_mode == "successor" and
+     .predecessor_binding.current_state_sha256 == $current and
+     .predecessor_binding.control_sha256 == $control and
+     .predecessor_binding.apply_receipt_sha256 == $apply and
+     .predecessor_binding.release_evidence_sha256 == $release and
+     .predecessor_binding.runtime_manifest_sha256 == $runtime' \
+    "$stage/RELEASE-EVIDENCE.json" >/dev/null || \
+    holdfast_die "successor RELEASE-EVIDENCE points to another predecessor"
+  verify_closed_bracket
+}
+
+validate_persisted_successor_authority() {
+  local pointer=$1 expected key value armed_predecessor_backup armed_generation
+  local armed_predecessor_generation
+  [[ "$(jq -er '(.successor // false) | tostring' "$pointer")" == "true" ]] || return 0
+  predecessor_current_file="$backup/PREDECESSOR-CURRENT.json"
+  successor_armed_receipt="$backup/SUCCESSOR-ARMED.receipt"
+  require_root_control_file "$predecessor_current_file"
+  require_root_control_file "$successor_armed_receipt"
+  successor_armed_sha=$(holdfast_sha256 "$successor_armed_receipt")
+  predecessor_current_sha=$(holdfast_sha256 "$predecessor_current_file")
+  armed_predecessor_backup=$(holdfast_receipt_value "$successor_armed_receipt" predecessor_backup_dir)
+  armed_predecessor_generation=$(holdfast_receipt_value "$successor_armed_receipt" predecessor_release_generation)
+  armed_generation=$(holdfast_receipt_value "$successor_armed_receipt" release_generation)
+  validate_predecessor_snapshot "$predecessor_current_file"
+  [[ "$predecessor_backup" == "$armed_predecessor_backup" && \
+    "$predecessor_generation" == "$armed_predecessor_generation" && \
+    "$release_generation" == "$armed_generation" ]] || \
+    holdfast_die "successor arm generation or predecessor backup differs"
+  for expected in \
+    "schema_version=1" "successor_backup_dir=$backup" \
+    "predecessor_current_file=PREDECESSOR-CURRENT.json" \
+    "predecessor_current_sha256=$predecessor_current_sha" \
+    "predecessor_backup_dir=$predecessor_backup" \
+    "predecessor_control_sha256=$predecessor_control_sha" \
+    "predecessor_apply_receipt_sha256=$predecessor_apply_sha" \
+    "predecessor_release_evidence_sha256=$predecessor_release_sha" \
+    "predecessor_runtime_backup_receipt_sha256=$predecessor_runtime_receipt_sha" \
+    "predecessor_runtime_backup_manifest_sha256=$predecessor_runtime_manifest_sha" \
+    "predecessor_release_generation=$predecessor_generation" \
+    "release_generation=$release_generation" "ingress_opened=false"; do
+    key=${expected%%=*}
+    value=${expected#*=}
+    [[ "$(holdfast_receipt_value "$successor_armed_receipt" "$key")" == "$value" ]] || \
+      holdfast_die "persisted successor authority differs: $key"
+  done
+  jq -e \
+    --arg successor_sha "$successor_armed_sha" \
+    --arg predecessor_sha "$predecessor_current_sha" \
+    --arg predecessor_backup "$predecessor_backup" \
+    --arg predecessor_control "$predecessor_control_sha" \
+    --arg predecessor_apply "$predecessor_apply_sha" \
+    --arg predecessor_release "$predecessor_release_sha" \
+    --arg predecessor_runtime_receipt "$predecessor_runtime_receipt_sha" \
+    --arg predecessor_runtime_manifest "$predecessor_runtime_manifest_sha" \
+    --argjson predecessor_generation "$predecessor_generation" \
+    --argjson generation "$release_generation" \
+    '(.successor // false) == true and
+     .successor_armed_receipt == "SUCCESSOR-ARMED.receipt" and
+     .successor_armed_receipt_sha256 == $successor_sha and
+     .predecessor_current_file == "PREDECESSOR-CURRENT.json" and
+     .predecessor_current_sha256 == $predecessor_sha and
+     .predecessor_backup_dir == $predecessor_backup and
+     .predecessor_control_sha256 == $predecessor_control and
+     .predecessor_apply_receipt_sha256 == $predecessor_apply and
+     .predecessor_release_evidence_sha256 == $predecessor_release and
+     .predecessor_runtime_backup_receipt_sha256 == $predecessor_runtime_receipt and
+     .predecessor_runtime_backup_manifest_sha256 == $predecessor_runtime_manifest and
+     .predecessor_release_generation == $predecessor_generation and
+     .release_generation == $generation' "$pointer" >/dev/null || \
+    holdfast_die "successor CURRENT linkage differs from its immutable authority"
+}
+
+append_successor_receipt_fields() {
+  [[ "$successor" == "true" ]] || return 0
+  printf 'successor=true\n'
+  printf 'successor_armed_receipt=SUCCESSOR-ARMED.receipt\n'
+  printf 'successor_armed_receipt_sha256=%s\n' "$successor_armed_sha"
+  printf 'predecessor_current_file=PREDECESSOR-CURRENT.json\n'
+  printf 'predecessor_current_sha256=%s\n' "$predecessor_current_sha"
+  printf 'predecessor_backup_dir=%s\n' "$predecessor_backup"
+  printf 'predecessor_control_sha256=%s\n' "$predecessor_control_sha"
+  printf 'predecessor_apply_receipt_sha256=%s\n' "$predecessor_apply_sha"
+  printf 'predecessor_release_evidence_sha256=%s\n' "$predecessor_release_sha"
+  printf 'predecessor_runtime_backup_receipt_sha256=%s\n' "$predecessor_runtime_receipt_sha"
+  printf 'predecessor_runtime_backup_manifest_sha256=%s\n' "$predecessor_runtime_manifest_sha"
+  printf 'predecessor_release_generation=%s\n' "$predecessor_generation"
+  printf 'release_generation=%s\n' "$release_generation"
+  if [[ -f "$backup/runtime/BACKUP.receipt" && -f "$backup/runtime/SHA256SUMS" ]]; then
+    printf 'runtime_backup_receipt_sha256=%s\n' "$(holdfast_sha256 "$backup/runtime/BACKUP.receipt")"
+    printf 'runtime_backup_manifest_sha256=%s\n' "$(holdfast_sha256 "$backup/runtime/SHA256SUMS")"
+  fi
 }
 
 prior_running_services=()
@@ -437,6 +843,9 @@ validate_runtime_backup_caller_authority() {
      .apply_absent_sha256 == $absent_sha and .render_inputs_sha256 == $render_sha and
      .stop_authority_contract == "absence-means-stop-not-started" and .ingress_opened == false' \
     "$state_file" >/dev/null || holdfast_die "runtime backup caller state differs from its receipt"
+  if [[ "$(jq -er '(.successor // false) | tostring' "$state_file")" == "true" ]]; then
+    validate_persisted_successor_authority "$state_file"
+  fi
   for expected in \
     "schema_version=2" "estate_root=$estate_root" "dry_run_dir=$dry_run_dir" \
     "backup_dir=$backup" "runtime_backup_dir=$backup/runtime" \
@@ -514,13 +923,51 @@ record_runtime_backup_cleanup() {
 }
 
 archive_runtime_backup_state() {
-  local archive
+  local archive was_successor="false"
   require_root_control_file "$state_file"
+  if [[ "$(jq -er '(.successor // false) | tostring' "$state_file")" == "true" ]]; then
+    was_successor="true"
+    validate_persisted_successor_authority "$state_file"
+  fi
   archive="$state_dir/RUNTIME-BACKUP-ABORTED-$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
-  [[ ! -e "$archive" && ! -L "$archive" ]] || holdfast_die "runtime backup state archive collision"
-  mv -T -- "$state_file" "$archive"
-  sync -f "$archive"
-  sync -f "$state_dir"
+  if [[ "$was_successor" == "true" ]]; then
+    archive_and_restore_predecessor_current "$archive"
+  else
+    [[ ! -e "$archive" && ! -L "$archive" ]] || holdfast_die "runtime backup state archive collision"
+    mv -T -- "$state_file" "$archive"
+    sync -f "$archive"
+    sync -f "$state_dir"
+  fi
+}
+
+recover_existing_successor_arm_state() {
+  local archive candidate_backup caller
+  require_root_control_file "$state_file"
+  jq -e \
+    --arg estate "$estate_root" \
+    '.schema_version == 2 and .state == "successor_armed" and
+     .successor == true and .estate_root == $estate and
+     .route_database_state == "absent" and
+     .public_ipv4_ipv6_closed_status == 404 and .ingress_opened == false' \
+    "$state_file" >/dev/null || \
+    holdfast_die "successor arm recovery state differs"
+  candidate_backup=$(jq -er '.backup_dir' "$state_file")
+  backup=$candidate_backup
+  validate_runtime_backup_location || \
+    holdfast_die "successor arm recovery path validation failed"
+  validate_persisted_successor_authority "$state_file"
+  [[ ! -e "$backup/runtime" && ! -L "$backup/runtime" ]] || \
+    holdfast_die "successor arm recovery refuses a backup with runtime mutation state"
+  caller="$backup/RUNTIME-BACKUP-CALLER-ARMED.receipt"
+  if [[ -e "$caller" || -L "$caller" ]]; then
+    require_root_control_file "$caller"
+    [[ "$(holdfast_receipt_value "$caller" backup_dir)" == "$backup" && \
+      "$(holdfast_receipt_value "$caller" estate_root)" == "$estate_root" ]] || \
+      holdfast_die "successor arm caller authority points elsewhere"
+  fi
+  archive="$state_dir/SUCCESSOR-ARM-ABORTED-${successor_armed_sha:0:24}.json"
+  archive_and_restore_predecessor_current "$archive"
+  holdfast_die "interrupted successor arm was archived and its predecessor restored; rerun apply with a fresh ceremony"
 }
 
 record_caller_receipt_only_abort() {
@@ -617,8 +1064,17 @@ if [[ -e "$state_dir" || -L "$state_dir" ]]; then
     require_canonical_root_directory "$backup_root"
     [[ -z "$(find "$backup_root" -maxdepth 0 -perm /077 -print -quit)" ]] || \
       holdfast_die "backup root must be private before runtime recovery"
-    recover_existing_runtime_backup_state
+    existing_state=$(jq -er '.state' "$state_file")
+    if [[ "$existing_state" == "runtime_backup_armed" ]]; then
+      recover_existing_runtime_backup_state
+    elif [[ "$existing_state" == "successor_armed" ]]; then
+      recover_existing_successor_arm_state
+    fi
+    [[ "$successor" == "true" ]] || \
+      holdfast_die "an active Holdfast release state already exists: $existing_state"
   fi
+elif [[ "$successor" == "true" ]]; then
+  holdfast_die "successor apply requires an active predecessor CURRENT"
 fi
 
 [[ -n "$routes_database_url" ]] || holdfast_die "ROUTES_DATABASE_URL is required to prove closed ingress"
@@ -628,6 +1084,11 @@ case "$routes_database_url" in
 esac
 if [[ "$routes_database_url" =~ [[:space:][:cntrl:]] ]]; then
   holdfast_die "ROUTES_DATABASE_URL contains unsafe whitespace or control characters"
+fi
+if [[ "$successor" == "true" ]]; then
+  [[ -f "$state_file" && ! -L "$state_file" ]] || \
+    holdfast_die "successor apply requires an active predecessor CURRENT"
+  validate_live_predecessor_authority
 fi
 [[ -d "$estate_root/access-governance" && -d "$stage" && -f "$receipt" && ! -L "$receipt" ]] || \
   holdfast_die "estate or dry-run package is incomplete"
@@ -651,13 +1112,21 @@ python3 "$script_dir/estate_transaction.py" preflight \
 
 ensure_private_control_directory "$backup_root"
 ensure_private_control_directory "$state_dir"
-[[ ! -e "$state_file" && ! -L "$state_file" ]] || \
-  holdfast_die "an active Holdfast release state appeared after recovery preflight"
+if [[ "$successor" == "true" ]]; then
+  [[ -f "$state_file" && ! -L "$state_file" && \
+    "$(holdfast_sha256 "$state_file")" == "$predecessor_current_sha" ]] || \
+    holdfast_die "predecessor CURRENT changed during successor preflight"
+else
+  [[ ! -e "$state_file" && ! -L "$state_file" ]] || \
+    holdfast_die "an active Holdfast release state appeared after recovery preflight"
+fi
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup="$backup_root/holdfast-rikune-${timestamp}-$$"
 [[ ! -e "$backup" && ! -L "$backup" ]] || holdfast_die "backup collision"
 mkdir -m 0700 -- "$backup"
 validate_runtime_backup_location || holdfast_die "new runtime backup path validation failed"
+persist_successor_authority
+persist_successor_generation_authority
 
 # Persist caller authority before runtime-backup may stop a writer.  A lone
 # caller receipt proves the runtime stop call has not begun; CURRENT is always
@@ -688,6 +1157,7 @@ caller_armed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf 'runtime_backup_armed_receipt=runtime/RUNTIME-BACKUP-ARMED.receipt\n'
   printf 'stop_authority_contract=absence-means-stop-not-started\n'
   printf 'ingress_opened=false\n'
+  append_successor_receipt_fields
 } >"$caller_armed_tmp"
 commit_atomic_file "$caller_armed_tmp" "$caller_armed_receipt"
 
@@ -703,9 +1173,24 @@ jq -n \
   --arg preimages_sha "$(holdfast_sha256 "$apply_preimages")" \
   --arg absent_sha "$(holdfast_sha256 "$apply_absent")" \
   --arg render_sha "$(holdfast_sha256 "$render_inputs")" \
-  '{schema_version:2,state:"runtime_backup_armed",runtime_backup_armed_at:$armed_at,estate_root:$estate,backup_dir:$backup,dry_run_dir:$dry,runtime_backup_dir:$runtime,runtime_backup_caller_armed_receipt:"RUNTIME-BACKUP-CALLER-ARMED.receipt",runtime_backup_caller_armed_receipt_sha256:$caller_sha,runtime_backup_armed_receipt:"runtime/RUNTIME-BACKUP-ARMED.receipt",release_env_sha256:$release_sha,release_evidence_sha256:$evidence_sha,dry_run_receipt_sha256:$dry_sha,targets_sha256:$targets_sha,apply_preimages_sha256:$preimages_sha,apply_absent_sha256:$absent_sha,render_inputs_sha256:$render_sha,stop_authority_contract:"absence-means-stop-not-started",ingress_opened:false}' \
+  --arg successor_armed_sha "$successor_armed_sha" \
+  --arg predecessor_current_sha "$predecessor_current_sha" \
+  --arg predecessor_backup "$predecessor_backup" \
+  --arg predecessor_control "$predecessor_control_sha" \
+  --arg predecessor_apply "$predecessor_apply_sha" \
+  --arg predecessor_release "$predecessor_release_sha" \
+  --arg predecessor_runtime_receipt "$predecessor_runtime_receipt_sha" \
+  --arg predecessor_runtime_manifest "$predecessor_runtime_manifest_sha" \
+  --argjson successor "$successor" \
+  --argjson predecessor_generation "${predecessor_generation:-0}" \
+  --argjson generation "${release_generation:-0}" \
+  '{schema_version:2,state:"runtime_backup_armed",runtime_backup_armed_at:$armed_at,estate_root:$estate,backup_dir:$backup,dry_run_dir:$dry,runtime_backup_dir:$runtime,runtime_backup_caller_armed_receipt:"RUNTIME-BACKUP-CALLER-ARMED.receipt",runtime_backup_caller_armed_receipt_sha256:$caller_sha,runtime_backup_armed_receipt:"runtime/RUNTIME-BACKUP-ARMED.receipt",release_env_sha256:$release_sha,release_evidence_sha256:$evidence_sha,dry_run_receipt_sha256:$dry_sha,targets_sha256:$targets_sha,apply_preimages_sha256:$preimages_sha,apply_absent_sha256:$absent_sha,render_inputs_sha256:$render_sha,stop_authority_contract:"absence-means-stop-not-started",ingress_opened:false} +
+   (if $successor then {successor:true,successor_armed_receipt:"SUCCESSOR-ARMED.receipt",successor_armed_receipt_sha256:$successor_armed_sha,predecessor_current_file:"PREDECESSOR-CURRENT.json",predecessor_current_sha256:$predecessor_current_sha,predecessor_backup_dir:$predecessor_backup,predecessor_control_sha256:$predecessor_control,predecessor_apply_receipt_sha256:$predecessor_apply,predecessor_release_evidence_sha256:$predecessor_release,predecessor_runtime_backup_receipt_sha256:$predecessor_runtime_receipt,predecessor_runtime_backup_manifest_sha256:$predecessor_runtime_manifest,predecessor_release_generation:$predecessor_generation,release_generation:$generation} else {} end)' \
   >"$state_tmp"
 commit_atomic_file "$state_tmp" "$state_file"
+if [[ "$successor" == "true" ]]; then
+  validate_persisted_successor_authority "$state_file"
+fi
 if [[ "${HOLDFAST_TEST_MODE:-0}" == "1" && \
   "${HOLDFAST_TEST_SIGKILL_AFTER_RUNTIME_CALLER_ARM:-0}" == "1" ]]; then
   kill -KILL "$$"
@@ -729,6 +1214,14 @@ atomic_copy_authority "$targets" "$backup/TARGETS.sha256"
 atomic_copy_authority "$apply_preimages" "$backup/APPLY-PREIMAGES.sha256"
 atomic_copy_authority "$apply_absent" "$backup/APPLY-ABSENT.paths"
 atomic_copy_authority "$render_inputs" "$backup/RENDER-INPUTS.sha256"
+if [[ "$successor" == "true" ]]; then
+  atomic_copy_authority "$successor_delta" "$backup/SUCCESSOR-DELTA.sha256"
+  [[ "$(holdfast_receipt_value "$backup/DRY-RUN.receipt" successor_delta_sha256)" == \
+    "$(holdfast_sha256 "$backup/SUCCESSOR-DELTA.sha256")" && \
+    "$(jq -er '.successor_delta_sha256' "$backup/RELEASE-EVIDENCE.json")" == \
+    "$(holdfast_sha256 "$backup/SUCCESSOR-DELTA.sha256")" ]] || \
+    holdfast_die "persisted successor delta differs from its ceremony authority"
+fi
 rollback_image=$(jq -er '.release.ACCESS_GOVERNANCE_ROLLBACK_IMAGE' "$backup/RELEASE-EVIDENCE.json")
 rollback_tmp="$backup/.rollback.override.yml.$$"
 printf 'services:\n  access-governance:\n    image: %s\n' "$rollback_image" >"$rollback_tmp"
@@ -763,18 +1256,38 @@ for key in evidence signature public_key; do
 done
 [[ "$(jq -er '.release_env_sha256' "$backup/RELEASE-EVIDENCE.json")" == "$(holdfast_sha256 "$backup/release.env")" ]] || \
   holdfast_die "persisted release evidence points to another release env"
-python3 "$script_dir/validate_release_evidence.py" --evidence "$backup/RELEASE-EVIDENCE.json"
+persisted_release_validator_policy_args=()
+if [[ "$successor" == "true" ]]; then
+  persisted_release_validator_policy_args=(
+    --successor-policy "$backup/successor-authority/successor-policy.json"
+  )
+fi
+python3 "$script_dir/validate_release_evidence.py" \
+  --evidence "$backup/RELEASE-EVIDENCE.json" \
+  "${persisted_release_validator_policy_args[@]}"
+persisted_dockerfile="$script_dir/../../Dockerfile.analyzer"
+persisted_bridge_lock="$script_dir/../../bridge/package-lock.json"
+persisted_supply_chain_policy_args=()
+if [[ "$successor" == "true" ]]; then
+  persisted_dockerfile="$backup/successor-authority/Dockerfile.analyzer"
+  persisted_bridge_lock="$backup/successor-authority/bridge-package-lock.json"
+  persisted_supply_chain_policy_args=(
+    --successor-policy "$backup/successor-authority/successor-policy.json"
+  )
+fi
 python3 "$script_dir/supply_chain_evidence.py" \
   --release-env "$backup/release.env" \
   --evidence "$backup/SUPPLY-CHAIN.json" \
   --signature "$backup/SUPPLY-CHAIN.sig" \
   --public-key "$backup/SUPPLY-CHAIN.pub" \
-  --dockerfile "$script_dir/../../Dockerfile.analyzer" \
-  --bridge-lock "$script_dir/../../bridge/package-lock.json" \
-  --release-evidence "$backup/RELEASE-EVIDENCE.json"
+  --dockerfile "$persisted_dockerfile" \
+  --bridge-lock "$persisted_bridge_lock" \
+  --release-evidence "$backup/RELEASE-EVIDENCE.json" \
+  "${persisted_supply_chain_policy_args[@]}"
 python3 "$script_dir/render_input_binding.py" verify \
   --ops-root "$script_dir" --manifest "$backup/RENDER-INPUTS.sha256" \
   --stage-root "$stage" --release-evidence "$stage/RELEASE-EVIDENCE.json" \
+  --expected-mode "$render_expected_mode" \
   --require-root-owner
 (cd "$stage" && sha256sum --check "$backup/TARGETS.sha256")
 
@@ -802,6 +1315,7 @@ armed_tmp="$backup/.APPLY-ARMED.receipt.$$"
   printf 'runtime_backup_caller_armed_sha256=%s\n' "$(holdfast_sha256 "$caller_armed_receipt")"
   printf 'runtime_backup_stop_authority_sha256=%s\n' "$(holdfast_sha256 "$backup/runtime/RUNTIME-BACKUP-ARMED.receipt")"
   printf 'ingress_opened=false\n'
+  append_successor_receipt_fields
 } >"$armed_tmp"
 commit_atomic_file "$armed_tmp" "$armed_receipt"
 
@@ -817,6 +1331,16 @@ control_tmp="$backup/.CONTROL.sha256.$$"
     APPLY-ABSENT.paths RENDER-INPUTS.sha256 rollback.override.yml APPLY-ARMED.receipt \
     RUNTIME-BACKUP-CALLER-ARMED.receipt runtime/SHA256SUMS runtime/BACKUP.receipt \
     runtime/RUNTIME-BACKUP-ARMED.receipt runtime/RUNNING-SERVICES.before
+  if [[ "$successor" == "true" ]]; then
+    sha256sum PREDECESSOR-CURRENT.json SUCCESSOR-ARMED.receipt SUCCESSOR-DELTA.sha256 \
+      successor-authority/Dockerfile.analyzer \
+      successor-authority/bridge-package-lock.json \
+      successor-authority/assets/20260823_rikune_root_up.sql \
+      successor-authority/assets/20260823_rikune_root_down.sql
+    for relative in "${successor_generation_authorities[@]}"; do
+      sha256sum "successor-authority/$relative"
+    done
+  fi
 ) >"$control_tmp"
 commit_atomic_file "$control_tmp" "$control_file"
 (cd "$backup" && sha256sum --check CONTROL.sha256)
@@ -833,9 +1357,28 @@ jq -n \
   --arg control_sha "$control_sha" \
   --arg caller_sha "$(holdfast_sha256 "$caller_armed_receipt")" \
   --arg runtime_arm_sha "$(holdfast_sha256 "$backup/runtime/RUNTIME-BACKUP-ARMED.receipt")" \
-  '{schema_version:2,state:"apply_armed",apply_armed_at:$armed_at,estate_root:$estate,backup_dir:$backup,apply_armed_receipt_sha256:$armed_sha,release_evidence_sha256:$release_sha,dry_run_receipt_sha256:$dry_sha,control_sha256:$control_sha,runtime_backup_caller_armed_sha256:$caller_sha,runtime_backup_stop_authority_sha256:$runtime_arm_sha,ingress_opened:false}' \
+  --arg successor_armed_sha "$successor_armed_sha" \
+  --arg predecessor_current_sha "$predecessor_current_sha" \
+  --arg predecessor_backup "$predecessor_backup" \
+  --arg predecessor_control "$predecessor_control_sha" \
+  --arg predecessor_apply "$predecessor_apply_sha" \
+  --arg predecessor_release "$predecessor_release_sha" \
+  --arg predecessor_runtime_receipt "$predecessor_runtime_receipt_sha" \
+  --arg predecessor_runtime_manifest "$predecessor_runtime_manifest_sha" \
+  --argjson successor "$successor" \
+  --argjson predecessor_generation "${predecessor_generation:-0}" \
+  --argjson generation "${release_generation:-0}" \
+  '{schema_version:2,state:"apply_armed",apply_armed_at:$armed_at,estate_root:$estate,backup_dir:$backup,apply_armed_receipt_sha256:$armed_sha,release_evidence_sha256:$release_sha,dry_run_receipt_sha256:$dry_sha,control_sha256:$control_sha,runtime_backup_caller_armed_sha256:$caller_sha,runtime_backup_stop_authority_sha256:$runtime_arm_sha,ingress_opened:false} +
+   (if $successor then {successor:true,successor_armed_receipt:"SUCCESSOR-ARMED.receipt",successor_armed_receipt_sha256:$successor_armed_sha,predecessor_current_file:"PREDECESSOR-CURRENT.json",predecessor_current_sha256:$predecessor_current_sha,predecessor_backup_dir:$predecessor_backup,predecessor_control_sha256:$predecessor_control,predecessor_apply_receipt_sha256:$predecessor_apply,predecessor_release_evidence_sha256:$predecessor_release,predecessor_runtime_backup_receipt_sha256:$predecessor_runtime_receipt,predecessor_runtime_backup_manifest_sha256:$predecessor_runtime_manifest,predecessor_release_generation:$predecessor_generation,release_generation:$generation} else {} end)' \
   >"$state_tmp"
 commit_atomic_file "$state_tmp" "$state_file"
+if [[ "$successor" == "true" ]]; then
+  validate_persisted_successor_authority "$state_file"
+  grep -Fqx "$predecessor_current_sha  PREDECESSOR-CURRENT.json" "$control_file" || \
+    holdfast_die "CONTROL does not bind predecessor CURRENT"
+  grep -Fqx "$successor_armed_sha  SUCCESSOR-ARMED.receipt" "$control_file" || \
+    holdfast_die "CONTROL does not bind successor arm"
+fi
 prearm_cleanup_active="false"
 trap - EXIT HUP INT TERM
 
@@ -917,8 +1460,12 @@ if [[ $estate_status -ne 0 ]]; then
   commit_atomic_file "$state_tmp" "$state_file"
   if [[ "$failure_state" == "apply_estate_rolled_back" ]]; then
     rolled_back_state="$state_dir/APPLY-ESTATE-ROLLED-BACK-${failure_stamp}-$$.json"
-    mv -- "$state_file" "$rolled_back_state"
-    sync -f "$state_dir"
+    if [[ "$successor" == "true" ]]; then
+      archive_and_restore_predecessor_current "$rolled_back_state"
+    else
+      mv -- "$state_file" "$rolled_back_state"
+      sync -f "$state_dir"
+    fi
   fi
   holdfast_die "estate apply failed with status $estate_status; transaction state is $transaction_state"
 fi
@@ -1034,6 +1581,7 @@ apply_receipt_tmp="$backup/.APPLY.receipt.$$"
   printf 'ingress_opened=false\n'
   printf 'services_activated=%s\n' "$activate"
   printf 'runtime_verified=%s\n' "$activate"
+  append_successor_receipt_fields
 } >"$apply_receipt_tmp"
 commit_atomic_file "$apply_receipt_tmp" "$pending_apply_receipt"
 pending_apply_sha=$(holdfast_sha256 "$pending_apply_receipt")
@@ -1052,8 +1600,22 @@ jq -n \
   --arg transaction_sha "$transaction_sha" \
   --arg applied_targets_sha "$applied_targets_sha" \
   --arg closed_at "$closed_verified_at" \
+  --arg successor_armed_sha "$successor_armed_sha" \
+  --arg predecessor_current_sha "$predecessor_current_sha" \
+  --arg predecessor_backup "$predecessor_backup" \
+  --arg predecessor_control "$predecessor_control_sha" \
+  --arg predecessor_apply "$predecessor_apply_sha" \
+  --arg predecessor_release "$predecessor_release_sha" \
+  --arg predecessor_runtime_receipt "$predecessor_runtime_receipt_sha" \
+  --arg predecessor_runtime_manifest "$predecessor_runtime_manifest_sha" \
+  --arg runtime_receipt_sha "$(holdfast_sha256 "$backup/runtime/BACKUP.receipt")" \
+  --arg runtime_manifest_sha "$(holdfast_sha256 "$backup/runtime/SHA256SUMS")" \
+  --argjson successor "$successor" \
+  --argjson predecessor_generation "${predecessor_generation:-0}" \
+  --argjson generation "${release_generation:-0}" \
   --argjson activated "$activate" \
-  '{schema_version:2,state:"apply_finalizing_ingress_closed",estate_root:$estate,backup_dir:$backup,pending_apply_receipt:"APPLY-PENDING.receipt",pending_apply_receipt_sha256:$pending_apply_sha,apply_armed_receipt_sha256:$armed_sha,control_sha256:$control_sha,release_evidence_sha256:$release_sha,transaction_sha256:$transaction_sha,applied_targets_sha256:$applied_targets_sha,closed_verified_at:$closed_at,route_database_state:"absent",public_ipv4_ipv6_closed_status:404,services_activated:$activated,runtime_verified:$activated,ingress_opened:false}' \
+  '{schema_version:2,state:"apply_finalizing_ingress_closed",estate_root:$estate,backup_dir:$backup,pending_apply_receipt:"APPLY-PENDING.receipt",pending_apply_receipt_sha256:$pending_apply_sha,apply_armed_receipt_sha256:$armed_sha,control_sha256:$control_sha,release_evidence_sha256:$release_sha,transaction_sha256:$transaction_sha,applied_targets_sha256:$applied_targets_sha,closed_verified_at:$closed_at,route_database_state:"absent",public_ipv4_ipv6_closed_status:404,services_activated:$activated,runtime_verified:$activated,ingress_opened:false} +
+   (if $successor then {successor:true,successor_armed_receipt:"SUCCESSOR-ARMED.receipt",successor_armed_receipt_sha256:$successor_armed_sha,predecessor_current_file:"PREDECESSOR-CURRENT.json",predecessor_current_sha256:$predecessor_current_sha,predecessor_backup_dir:$predecessor_backup,predecessor_control_sha256:$predecessor_control,predecessor_apply_receipt_sha256:$predecessor_apply,predecessor_release_evidence_sha256:$predecessor_release,predecessor_runtime_backup_receipt_sha256:$predecessor_runtime_receipt,predecessor_runtime_backup_manifest_sha256:$predecessor_runtime_manifest,predecessor_release_generation:$predecessor_generation,release_generation:$generation,runtime_backup_receipt_sha256:$runtime_receipt_sha,runtime_backup_manifest_sha256:$runtime_manifest_sha} else {} end)' \
   >"$state_tmp"
 commit_atomic_file "$state_tmp" "$state_file"
 [[ ! -e "$apply_receipt" && ! -L "$apply_receipt" ]] || \
@@ -1073,8 +1635,22 @@ jq -n \
   --arg transaction_sha "$transaction_sha" \
   --arg applied_targets_sha "$applied_targets_sha" \
   --arg closed_at "$closed_verified_at" \
+  --arg successor_armed_sha "$successor_armed_sha" \
+  --arg predecessor_current_sha "$predecessor_current_sha" \
+  --arg predecessor_backup "$predecessor_backup" \
+  --arg predecessor_control "$predecessor_control_sha" \
+  --arg predecessor_apply "$predecessor_apply_sha" \
+  --arg predecessor_release "$predecessor_release_sha" \
+  --arg predecessor_runtime_receipt "$predecessor_runtime_receipt_sha" \
+  --arg predecessor_runtime_manifest "$predecessor_runtime_manifest_sha" \
+  --arg runtime_receipt_sha "$(holdfast_sha256 "$backup/runtime/BACKUP.receipt")" \
+  --arg runtime_manifest_sha "$(holdfast_sha256 "$backup/runtime/SHA256SUMS")" \
+  --argjson successor "$successor" \
+  --argjson predecessor_generation "${predecessor_generation:-0}" \
+  --argjson generation "${release_generation:-0}" \
   --argjson activated "$activate" \
-  '{schema_version:2,state:"applied_ingress_closed",estate_root:$estate,backup_dir:$backup,apply_receipt_sha256:$apply_sha,apply_armed_receipt_sha256:$armed_sha,control_sha256:$control_sha,release_evidence_sha256:$release_sha,transaction_sha256:$transaction_sha,applied_targets_sha256:$applied_targets_sha,closed_verified_at:$closed_at,route_database_state:"absent",public_ipv4_ipv6_closed_status:404,services_activated:$activated,runtime_verified:$activated,ingress_opened:false}' \
+  '{schema_version:2,state:"applied_ingress_closed",estate_root:$estate,backup_dir:$backup,apply_receipt_sha256:$apply_sha,apply_armed_receipt_sha256:$armed_sha,control_sha256:$control_sha,release_evidence_sha256:$release_sha,transaction_sha256:$transaction_sha,applied_targets_sha256:$applied_targets_sha,closed_verified_at:$closed_at,route_database_state:"absent",public_ipv4_ipv6_closed_status:404,services_activated:$activated,runtime_verified:$activated,ingress_opened:false} +
+   (if $successor then {successor:true,successor_armed_receipt:"SUCCESSOR-ARMED.receipt",successor_armed_receipt_sha256:$successor_armed_sha,predecessor_current_file:"PREDECESSOR-CURRENT.json",predecessor_current_sha256:$predecessor_current_sha,predecessor_backup_dir:$predecessor_backup,predecessor_control_sha256:$predecessor_control,predecessor_apply_receipt_sha256:$predecessor_apply,predecessor_release_evidence_sha256:$predecessor_release,predecessor_runtime_backup_receipt_sha256:$predecessor_runtime_receipt,predecessor_runtime_backup_manifest_sha256:$predecessor_runtime_manifest,predecessor_release_generation:$predecessor_generation,release_generation:$generation,runtime_backup_receipt_sha256:$runtime_receipt_sha,runtime_backup_manifest_sha256:$runtime_manifest_sha} else {} end)' \
   >"$state_tmp"
 commit_atomic_file "$state_tmp" "$state_dir/CURRENT.json"
 echo "estate transaction applied with runtime backup; ingress remains closed"

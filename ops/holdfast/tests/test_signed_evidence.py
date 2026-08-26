@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,10 @@ from pathlib import Path
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(OPS_ROOT))
+
+import supply_chain_evidence  # noqa: E402
+
 PERMISSIONS = sorted(
     {
         "rikune.analysis.create",
@@ -151,8 +156,48 @@ class SignedEvidenceTests(unittest.TestCase):
         }
         return release, evidence_value
 
+    def test_release_env_uses_one_safe_root_owned_regular_file(self) -> None:
+        release_env = self.root / "safe-release.env"
+        raw = b"STRAD_REVISION=" + b"a" * 40 + b"\n"
+        release_env.write_bytes(raw)
+        values, observed_sha = supply_chain_evidence.release_env(release_env)
+        self.assertEqual(values, {"STRAD_REVISION": "a" * 40})
+        self.assertEqual(observed_sha, hashlib.sha256(raw).hexdigest())
+
+        symlink = self.root / "release-symlink.env"
+        symlink.symlink_to(release_env)
+        with self.assertRaises((OSError, ValueError)):
+            supply_chain_evidence.release_env(symlink)
+
+        real_parent = self.root / "real-release-parent"
+        real_parent.mkdir()
+        nested_release = real_parent / "release.env"
+        nested_release.write_bytes(raw)
+        parent_symlink = self.root / "release-parent-symlink"
+        parent_symlink.symlink_to(real_parent, target_is_directory=True)
+        with self.assertRaises((OSError, ValueError)):
+            supply_chain_evidence.release_env(parent_symlink / "release.env")
+
+        hardlink = self.root / "release-hardlink.env"
+        os.link(release_env, hardlink)
+        with self.assertRaisesRegex(ValueError, "single-link"):
+            supply_chain_evidence.release_env(release_env)
+
+        if os.geteuid() == 0:
+            foreign = self.root / "release-foreign.env"
+            foreign.write_bytes(raw)
+            os.chown(foreign, 65534, 65534)
+            with self.assertRaisesRegex(ValueError, "root-owned"):
+                supply_chain_evidence.release_env(foreign)
+
     def run_supply_fixture(
-        self, release: dict[str, str], evidence_value: dict[str, object], label: str
+        self,
+        release: dict[str, str],
+        evidence_value: dict[str, object],
+        label: str,
+        *,
+        successor_policy: Path | None = None,
+        release_evidence_value: dict[str, object] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         evidence = self.root / f"supply-{label}.json"
         evidence.write_text(json.dumps(evidence_value, sort_keys=True), encoding="utf-8")
@@ -181,6 +226,22 @@ class SignedEvidenceTests(unittest.TestCase):
             "--bridge-lock",
             str(OPS_ROOT.parents[1] / "bridge/package-lock.json"),
         ]
+        if successor_policy is not None:
+            command.extend(("--successor-policy", str(successor_policy)))
+        if release_evidence_value is not None:
+            release_evidence = self.root / f"release-evidence-{label}.json"
+            release_evidence_document = json.loads(
+                json.dumps(release_evidence_value)
+            )
+            release_evidence_document.setdefault("release", dict(bound_release))
+            release_evidence_document.setdefault(
+                "release_env_sha256", sha256(release_env)
+            )
+            release_evidence.write_text(
+                json.dumps(release_evidence_document, sort_keys=True),
+                encoding="utf-8",
+            )
+            command.extend(("--release-evidence", str(release_evidence)))
         return subprocess.run(
             command,
             check=False,
@@ -273,10 +334,118 @@ class SignedEvidenceTests(unittest.TestCase):
         evidence["waivers"] = waivers
         return release, evidence
 
+    def make_supply_v3_fixture(
+        self,
+    ) -> tuple[dict[str, str], dict[str, object], dict[str, object]]:
+        release, evidence = self.make_supply_v2_fixture()
+        policy = json.loads(
+            (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
+        )
+        predecessor = policy["predecessor"]
+        successor = policy["successor"]
+        release.update(
+            {
+                "ACCESS_GOVERNANCE_ROLLBACK_IMAGE": predecessor["access_image"],
+                "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256": successor[
+                    "access_build_input_sha256"
+                ],
+                "PERMISSION_CATALOG_SHA256": predecessor[
+                    "permission_catalog_sha256"
+                ],
+                "PACKAGE_CATALOG_SHA256": predecessor["package_catalog_sha256"],
+                "HOLDFAST_RELEASE_TOOL_REVISION": "a" * 40,
+            }
+        )
+        registry = evidence["registry_verification"]
+        assert isinstance(registry, dict)
+        images = registry["images"]
+        assert isinstance(images, dict)
+        rollback = images["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"]
+        assert isinstance(rollback, dict)
+        rollback_digest = release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"].rsplit("@", 1)[1]
+        rollback.update(
+            {
+                "image": release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"],
+                "manifest_digest": rollback_digest,
+                "registry": release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"].split(
+                    "/", 1
+                )[0],
+                "subject_digest": rollback_digest,
+            }
+        )
+        waivers = evidence["waivers"]
+        assert isinstance(waivers, list)
+        for waiver in waivers:
+            assert isinstance(waiver, dict)
+            if waiver["image_key"] == "ACCESS_GOVERNANCE_ROLLBACK_IMAGE":
+                waiver["image"] = release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"]
+
+        evidence["schema_version"] = 3
+        evidence["successor_binding"] = json.loads(json.dumps(predecessor))
+        evidence["access_candidate"] = {
+            "image": release["ACCESS_GOVERNANCE_IMAGE"],
+            "build_input_schema": "access-build-input/2",
+            "build_input_sha256": release[
+                "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256"
+            ],
+            "permission_catalog_sha256": release["PERMISSION_CATALOG_SHA256"],
+            "package_catalog_sha256": release["PACKAGE_CATALOG_SHA256"],
+            "tool_revision": release["HOLDFAST_RELEASE_TOOL_REVISION"],
+        }
+        canonical = "".join(
+            f"{key}={release[key]}\n"
+            for key in sorted(release)
+            if key
+            not in {
+                "SUPPLY_CHAIN_EVIDENCE_SHA256",
+                "SUPPLY_CHAIN_SIGNATURE_SHA256",
+            }
+        )
+        evidence["release_pins_sha256"] = hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+        return release, evidence, policy
+
     def test_supply_chain_requires_signature_registry_materials_and_access_build_input(self) -> None:
         release, evidence_value = self.make_supply_fixture()
         valid = self.run_supply_fixture(release, evidence_value, "v1-valid")
         self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+
+        release_evidence = {
+            "schema_version": 1,
+            "analyzer_image_binding": {
+                "dockerfile_sha256": evidence_value["analyzer_overlay"][
+                    "dockerfile_sha256"
+                ],
+                "bridge_lock_sha256": evidence_value["analyzer_overlay"][
+                    "bridge_lock_sha256"
+                ],
+                "base_image": release["RIKUNE_ANALYZER_IMAGE"],
+                "overlay_image": release["STRAD_ANALYZER_IMAGE"],
+                "source_revision": release["STRAD_REVISION"],
+            },
+        }
+        bound = self.run_supply_fixture(
+            release,
+            evidence_value,
+            "v1-release-binding",
+            release_evidence_value=release_evidence,
+        )
+        self.assertEqual(bound.returncode, 0, bound.stdout + bound.stderr)
+
+        mismatched_release = json.loads(json.dumps(release_evidence))
+        mismatched_release["release"] = dict(release)
+        mismatched_release["release"]["STRAD_IMAGE"] = (
+            "registry.example/w33d/base-pin-mismatch@sha256:" + "e" * 64
+        )
+        rejected_binding = self.run_supply_fixture(
+            release,
+            evidence_value,
+            "v1-release-binding-mismatch",
+            release_evidence_value=mismatched_release,
+        )
+        self.assertNotEqual(rejected_binding.returncode, 0)
+        self.assertIn("selected release pins differ", rejected_binding.stderr)
 
         v1_with_waivers = json.loads(json.dumps(evidence_value))
         v1_with_waivers["waivers"] = []
@@ -284,6 +453,14 @@ class SignedEvidenceTests(unittest.TestCase):
             release, v1_with_waivers, "v1-extra-waivers"
         )
         self.assertNotEqual(invalid.returncode, 0)
+
+        boolean_schema = json.loads(json.dumps(evidence_value))
+        boolean_schema["schema_version"] = True
+        invalid = self.run_supply_fixture(
+            release, boolean_schema, "v1-boolean-schema"
+        )
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("unsupported supply-chain schema", invalid.stderr)
 
         evidence_value = json.loads(json.dumps(evidence_value))
         evidence_value["access_candidate"]["build_input_sha256"] = "f" * 64
@@ -377,6 +554,197 @@ class SignedEvidenceTests(unittest.TestCase):
                 self.assertNotEqual(
                     invalid.returncode, 0, invalid.stdout + invalid.stderr
                 )
+
+    def test_supply_chain_v3_binds_successor_without_claiming_strad_as_access_source(
+        self,
+    ) -> None:
+        release, evidence, policy = self.make_supply_v3_fixture()
+        policy_path = OPS_ROOT / "successor-policy.json"
+        valid = self.run_supply_fixture(
+            release,
+            evidence,
+            "v3-valid",
+            successor_policy=policy_path,
+        )
+        self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+        self.assertEqual(
+            evidence["analyzer_overlay"]["source_revision"],
+            release["STRAD_REVISION"],
+        )
+        self.assertNotIn("source_revision", evidence["access_candidate"])
+
+        missing_policy = self.run_supply_fixture(
+            release,
+            evidence,
+            "v3-missing-policy",
+        )
+        self.assertNotEqual(missing_policy.returncode, 0)
+        self.assertIn("requires --successor-policy", missing_policy.stderr)
+
+        cases: list[tuple[str, dict[str, object], str]] = []
+
+        legacy_source_claim = json.loads(json.dumps(evidence))
+        legacy_source_claim["access_candidate"]["source_revision"] = release[
+            "STRAD_REVISION"
+        ]
+        cases.append(("legacy-source-claim", legacy_source_claim, "field set is not exact"))
+
+        old_build_schema = json.loads(json.dumps(evidence))
+        old_build_schema["access_candidate"]["build_input_schema"] = (
+            "access-build-input/1"
+        )
+        cases.append(("old-build-schema", old_build_schema, "build_input_schema"))
+
+        wrong_tool = json.loads(json.dumps(evidence))
+        wrong_tool["access_candidate"]["tool_revision"] = release["STRAD_REVISION"]
+        cases.append(("wrong-tool", wrong_tool, "tool_revision"))
+
+        wrong_analyzer_source = json.loads(json.dumps(evidence))
+        wrong_analyzer_source["analyzer_overlay"]["source_revision"] = "b" * 40
+        cases.append(
+            (
+                "wrong-analyzer-source",
+                wrong_analyzer_source,
+                "analyzer overlay revision differs",
+            )
+        )
+
+        predecessor_tamper = json.loads(json.dumps(evidence))
+        predecessor_tamper["successor_binding"]["control_sha256"] = "f" * 64
+        cases.append(("predecessor-tamper", predecessor_tamper, "immediate predecessor"))
+
+        binding_extra = json.loads(json.dumps(evidence))
+        binding_extra["successor_binding"]["source_revision"] = release[
+            "STRAD_REVISION"
+        ]
+        cases.append(("binding-extra", binding_extra, "field set is not exact"))
+
+        for label, candidate, error in cases:
+            with self.subTest(label=label):
+                invalid = self.run_supply_fixture(
+                    release,
+                    candidate,
+                    f"v3-{label}",
+                    successor_policy=policy_path,
+                )
+                self.assertNotEqual(
+                    invalid.returncode, 0, invalid.stdout + invalid.stderr
+                )
+                self.assertIn(error, invalid.stderr)
+
+        wrong_rollback_release = dict(release)
+        wrong_rollback_release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"] = (
+            "registry.example/w33d/not-predecessor@sha256:" + "e" * 64
+        )
+        wrong_rollback_evidence = json.loads(json.dumps(evidence))
+        wrong_rollback_registry = wrong_rollback_evidence["registry_verification"][
+            "images"
+        ]["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"]
+        wrong_rollback_digest = wrong_rollback_release[
+            "ACCESS_GOVERNANCE_ROLLBACK_IMAGE"
+        ].rsplit("@", 1)[1]
+        wrong_rollback_registry.update(
+            {
+                "image": wrong_rollback_release[
+                    "ACCESS_GOVERNANCE_ROLLBACK_IMAGE"
+                ],
+                "manifest_digest": wrong_rollback_digest,
+                "registry": "registry.example",
+                "subject_digest": wrong_rollback_digest,
+            }
+        )
+        for waiver in wrong_rollback_evidence["waivers"]:
+            if waiver["image_key"] == "ACCESS_GOVERNANCE_ROLLBACK_IMAGE":
+                waiver["image"] = wrong_rollback_release[
+                    "ACCESS_GOVERNANCE_ROLLBACK_IMAGE"
+                ]
+        canonical = "".join(
+            f"{key}={wrong_rollback_release[key]}\n"
+            for key in sorted(wrong_rollback_release)
+            if key
+            not in {
+                "SUPPLY_CHAIN_EVIDENCE_SHA256",
+                "SUPPLY_CHAIN_SIGNATURE_SHA256",
+            }
+        )
+        wrong_rollback_evidence["release_pins_sha256"] = hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+        wrong_rollback = self.run_supply_fixture(
+            wrong_rollback_release,
+            wrong_rollback_evidence,
+            "v3-wrong-rollback",
+            successor_policy=policy_path,
+        )
+        self.assertNotEqual(wrong_rollback.returncode, 0)
+        self.assertIn("immediate predecessor candidate", wrong_rollback.stderr)
+
+        release_evidence = {
+            "schema_version": 2,
+            "release_mode": "successor",
+            "access_governance_build_input_schema": "access-build-input/2",
+            "access_governance_build_input_sha256": release[
+                "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256"
+            ],
+            "permission_catalog_sha256": release["PERMISSION_CATALOG_SHA256"],
+            "package_catalog_sha256": release["PACKAGE_CATALOG_SHA256"],
+            "holdfast_release_tool_revision": release[
+                "HOLDFAST_RELEASE_TOOL_REVISION"
+            ],
+            "predecessor_binding": json.loads(
+                json.dumps(policy["predecessor"])
+            ),
+            "analyzer_image_binding": {
+                "dockerfile_sha256": evidence["analyzer_overlay"][
+                    "dockerfile_sha256"
+                ],
+                "bridge_lock_sha256": evidence["analyzer_overlay"][
+                    "bridge_lock_sha256"
+                ],
+                "base_image": release["RIKUNE_ANALYZER_IMAGE"],
+                "overlay_image": release["STRAD_ANALYZER_IMAGE"],
+                "source_revision": release["STRAD_REVISION"],
+            },
+        }
+        with_release = self.run_supply_fixture(
+            release,
+            evidence,
+            "v3-release-binding",
+            successor_policy=policy_path,
+            release_evidence_value=release_evidence,
+        )
+        self.assertEqual(
+            with_release.returncode,
+            0,
+            with_release.stdout + with_release.stderr,
+        )
+
+        mismatched_release = json.loads(json.dumps(release_evidence))
+        mismatched_release["predecessor_binding"]["control_sha256"] = "f" * 64
+        mismatch = self.run_supply_fixture(
+            release,
+            evidence,
+            "v3-release-binding-mismatch",
+            successor_policy=policy_path,
+            release_evidence_value=mismatched_release,
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("predecessor_binding", mismatch.stderr)
+
+        mismatched_pins = json.loads(json.dumps(release_evidence))
+        mismatched_pins["release"] = dict(release)
+        mismatched_pins["release"]["STRAD_IMAGE"] = (
+            "registry.example/w33d/not-the-release@sha256:" + "d" * 64
+        )
+        pin_mismatch = self.run_supply_fixture(
+            release,
+            evidence,
+            "v3-release-pin-mismatch",
+            successor_policy=policy_path,
+            release_evidence_value=mismatched_pins,
+        )
+        self.assertNotEqual(pin_mismatch.returncode, 0)
+        self.assertIn("selected release pins differ", pin_mismatch.stderr)
 
     def test_authority_rollback_proves_route_close_then_same_grant_then_tombstones(self) -> None:
         release_env = self.root / "authority.release.env"
@@ -678,7 +1046,13 @@ class SignedEvidenceTests(unittest.TestCase):
         route_receipt.write_text(
             "\n".join(
                 (
+                    "schema_version=2",
                     "route_closed_at=2026-08-22T03:00:00Z",
+                    "source_state=ingress_open",
+                    "estate_root=/srv/w33d_infra",
+                    "backup_dir=/var/lib/holdfast-rikune/backups/test",
+                    f"control_sha256={'a' * 64}",
+                    f"state_before_sha256={'b' * 64}",
                     f"route_down_sha256={'c' * 64}",
                     f"route_down_execution_evidence_sha256={'9' * 64}",
                     f"open_evidence_sha256={sha256(open_evidence)}",
@@ -759,6 +1133,138 @@ class SignedEvidenceTests(unittest.TestCase):
         rolled_back = self.run_signed_edge(rollback_value, rollback_evidence, rollback_command)
         self.assertEqual(rolled_back.returncode, 0, rolled_back.stdout + rolled_back.stderr)
 
+    def test_actual_route_close_receipt_is_accepted_by_edge_rollback_validator(
+        self,
+    ) -> None:
+        from ops.holdfast.tests.test_rollback_lifecycle import RollbackLifecycleTests
+
+        value, evidence, command, release_env, release_evidence, open_evidence = (
+            self.make_preopen_fixture()
+        )
+        valid = self.run_signed_edge(value, evidence, command)
+        self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+
+        lifecycle = RollbackLifecycleTests(
+            methodName="test_route_close_receipt_crash_is_adopted_without_external_evidence"
+        )
+        lifecycle.setUp()
+        try:
+            lifecycle.route_receipt.unlink()
+            lifecycle.route_preimage.unlink()
+            open_receipt = lifecycle.state_dir / "OPEN.receipt"
+            open_receipt.write_text(
+                f"edge_evidence_sha256={sha256(evidence)}\n", encoding="utf-8"
+            )
+            state = json.loads(lifecycle.state_file.read_text(encoding="utf-8"))
+            state["state"] = "ingress_open"
+            state["open_receipt_sha256"] = sha256(open_receipt)
+            state["ingress_opened"] = True
+            for key in (
+                "route_close_receipt",
+                "route_close_receipt_sha256",
+                "route_close_preimage",
+                "route_close_preimage_sha256",
+            ):
+                state.pop(key, None)
+            lifecycle.state_file.write_text(
+                json.dumps(state) + "\n", encoding="utf-8"
+            )
+            lifecycle.open_evidence = open_evidence
+            lifecycle.open_signature = self.sign(open_evidence)
+            lifecycle.public_key = self.public_key
+
+            closed = lifecycle.run_close_route()
+            self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+            closed_state = json.loads(
+                lifecycle.state_file.read_text(encoding="utf-8")
+            )
+            route_receipt = (
+                lifecycle.state_dir / closed_state["route_close_receipt"]
+            )
+            receipt_values = dict(
+                line.split("=", 1)
+                for line in route_receipt.read_text(encoding="utf-8").splitlines()
+            )
+            route_closed_at = datetime.fromisoformat(
+                receipt_values["route_closed_at"].removesuffix("Z") + "+00:00"
+            )
+
+            def utc_after(minutes: int) -> str:
+                return (
+                    (route_closed_at + timedelta(minutes=minutes))
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+
+            revocation = self.root / "actual-route-edge-revocation.json"
+            revocation.write_text(
+                json.dumps(
+                    {
+                        "issued_at": utc_after(5),
+                        "source_grant_id": "source-grant-0001",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rollback_value = {
+                "schema_version": 2,
+                "ceremony": "holdfast-rikune-edge-rollback-v2",
+                "issued_at": utc_after(15),
+                "signature_key_sha256": sha256(self.public_key),
+                "release_evidence_sha256": sha256(release_evidence),
+                "preopen_edge_evidence_sha256": sha256(evidence),
+                "route_close_receipt_sha256": sha256(route_receipt),
+                "revocation_evidence_sha256": sha256(revocation),
+                "source_grant_id": "source-grant-0001",
+                "host": "analyze.w33d.xyz",
+                "edge_owner": "existing-w33d-sluice",
+                "route_state": "absent",
+                "external_edge_mutations": [],
+                "public_probes": [
+                    {
+                        "family": family,
+                        "observed_at": utc_after(10),
+                        "url": "https://analyze.w33d.xyz/",
+                        "status": 404,
+                        "edge_owner": "existing-w33d-sluice",
+                        "route_state": "absent",
+                        "response_headers_sha256": digest * 64,
+                    }
+                    for family, digest in (("ipv4", "d"), ("ipv6", "e"))
+                ],
+            }
+            rollback_evidence = self.root / "actual-route-edge-rollback.json"
+            rollback_command = [
+                "python3",
+                str(OPS_ROOT / "edge_evidence.py"),
+                "--mode",
+                "rollback",
+                "--evidence",
+                str(rollback_evidence),
+                "--public-key",
+                str(self.public_key),
+                "--release-env",
+                str(release_env),
+                "--release-evidence",
+                str(release_evidence),
+                "--open-edge-evidence",
+                str(evidence),
+                "--route-close-receipt",
+                str(route_receipt),
+                "--revocation-evidence",
+                str(revocation),
+            ]
+            rolled_back = self.run_signed_edge(
+                rollback_value, rollback_evidence, rollback_command
+            )
+            self.assertEqual(
+                rolled_back.returncode,
+                0,
+                rolled_back.stdout + rolled_back.stderr,
+            )
+        finally:
+            lifecycle.tearDown()
+
     def test_edge_preopen_rejects_v1_pages_single_stack_wrong_status_host_and_mutation(self) -> None:
         value, evidence, command, *_ = self.make_preopen_fixture()
         cases: list[tuple[str, dict[str, object], str]] = []
@@ -837,7 +1343,10 @@ class SignedEvidenceTests(unittest.TestCase):
         close_phase = rollback[rollback.index('if [[ "$phase" == "close-route" ]]'):]
         self.assertLess(close_phase.index("execute_frozen_route_down"), close_phase.index("current_state=$(jq"))
         self.assertLess(close_phase.index("verify_closed_bracket"), close_phase.index("validate_backup_and_open_authority"))
-        self.assertIn("ROUTE-CLOSE-PREIMAGE.jsonl", rollback)
+        self.assertIn(
+            'route_preimage_name="ROUTE-CLOSE-PREIMAGE-${route_generation_identity}.jsonl"',
+            rollback,
+        )
         self.assertIn("20260823_rikune_root_down.sql", rollback)
         self.assertNotIn("DELETE FROM routes", rollback)
         self.assertNotIn("row_to_json(snapshot)", rollback)

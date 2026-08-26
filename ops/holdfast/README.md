@@ -41,18 +41,47 @@ a maximum 30-day UTC interval, and a signed compensating attestation with Rekor 
 signature, subject/digest, platform, and transparency-log evidence are never waivable. The Access
 candidate and both final Strad images are never waivable. Schema v1 remains accepted unchanged.
 
+Schema v3 is the successor-release form. It keeps the analyzer overlay bound to `STRAD_REVISION`,
+but binds the Access candidate to `access-build-input/2` and the independent
+`HOLDFAST_RELEASE_TOOL_REVISION`. It embeds the exact immediate predecessor authority and requires
+`ACCESS_GOVERNANCE_ROLLBACK_IMAGE` to be that predecessor image. A schema-v3 document requires the
+canonical `successor-policy.json`; it cannot be verified as schema v1/v2 or skip a generation.
+
 Keep `STRAD_DATABASE_URL`, bridge/file-server/NewAPI tokens, and all existing gateway/Verdict
 secrets in a separate mode-`0600` secret env. Evidence files contain only identities and hashes.
 
 ## Candidate and dry-run
 
-Render the Access candidate source first and build/push it from exactly that tree:
+The first-apply renderer remains available for a new estate. An estate with an active
+`applied_ingress_closed` `CURRENT.json` must use the successor ceremony. Create a new root-owned,
+mode-`0700`, versioned release directory; never overwrite or reuse an earlier candidate, dry-run,
+release env, or predecessor backup.
+
+Render from the sealed immediate predecessor plus the exact seven-file TASK-001 overlay, then
+build and push from that immutable tree:
 
 ```sh
 ./candidate-source.sh \
+  --successor \
   --estate-root /root/w33d_infra \
-  --output /secure/release/rikune-candidate-source
+  --current-state /var/lib/holdfast-rikune/CURRENT.json \
+  --predecessor-candidate /secure/release/<sealed-predecessor>/rikune-candidate-source \
+  --predecessor-stage /secure/release/<sealed-predecessor>/rikune-dry-run/stage \
+  --release-tool-revision <clean-strad-head-commit> \
+  --output /secure/release/holdfast-successor-<release-id>/rikune-candidate-source
+
+./build-access-candidate.sh \
+  --candidate-root /secure/release/holdfast-successor-<release-id>/rikune-candidate-source \
+  --image-tag registry.w33d.xyz/steadholme/access-governance:<release-id> \
+  --release-tool-revision <clean-strad-head-commit> \
+  --metadata-file /secure/release/holdfast-successor-<release-id>/access-build.metadata.json \
+  --receipt /secure/release/holdfast-successor-<release-id>/ACCESS-BUILD.receipt
 ```
+
+The build always pushes `linux/amd64` with BuildKit `mode=max` provenance and SBOM, then records
+the immutable digest. Real registry attestation, image-signature, signer/issuer, and
+transparency-log evidence must be collected into schema-v3 `SUPPLY-CHAIN.json` and detached-signed
+off host before the full dry-run. The script does not invent or locally sign that evidence.
 
 Then run the full gate. There is no `--skip-cargo` option; every production receipt records
 `cargo_gate=passed`, and `apply.sh` rejects a missing or altered gate.
@@ -60,17 +89,21 @@ Then run the full gate. There is no `--skip-cargo` option; every production rece
 ```sh
 TMPDIR=/secure/tmp CARGO_TARGET_DIR=/secure/build/access \
 ./dry-run.sh \
+  --successor \
   --estate-root /root/w33d_infra \
-  --release-env /secure/release/rikune.release.env \
-  --secret-env /secure/release/rikune.secrets.env \
-  --supply-chain-evidence /secure/release/SUPPLY-CHAIN.json \
-  --supply-chain-signature /secure/release/SUPPLY-CHAIN.sig \
-  --supply-chain-public-key /secure/release/release-authority.pub \
-  --output /secure/release/rikune-dry-run
+  --current-state /var/lib/holdfast-rikune/CURRENT.json \
+  --predecessor-candidate /secure/release/<sealed-predecessor>/rikune-candidate-source \
+  --predecessor-stage /secure/release/<sealed-predecessor>/rikune-dry-run/stage \
+  --release-env /secure/release/holdfast-successor-<release-id>/rikune.release.env \
+  --secret-env /secure/release/holdfast-successor-<release-id>/rikune.secrets.env \
+  --supply-chain-evidence /secure/release/holdfast-successor-<release-id>/SUPPLY-CHAIN.json \
+  --supply-chain-signature /secure/release/holdfast-successor-<release-id>/SUPPLY-CHAIN.sig \
+  --supply-chain-public-key /secure/release/holdfast-successor-<release-id>/release-authority.pub \
+  --output /secure/release/holdfast-successor-<release-id>/rikune-dry-run
 
 ./verify.sh \
   --estate-root /root/w33d_infra \
-  --dry-run-dir /secure/release/rikune-dry-run \
+  --dry-run-dir /secure/release/holdfast-successor-<release-id>/rikune-dry-run \
   --phase staged --deep
 ```
 
@@ -78,6 +111,12 @@ TMPDIR=/secure/tmp CARGO_TARGET_DIR=/secure/build/access \
 `DRY-RUN.receipt`, `TARGETS.sha256`, `RELEASE-EVIDENCE.json`, release-env identity, signed supply
 chain, patches, catalog tests, Compose expansion, shell/Python tests, and Rust tests form one
 immutable review unit.
+
+The dry-run reads the release env, secret env, and all three supply-chain files once through a
+root-owned, non-symlink, single-link boundary, snapshots those exact bytes into its private
+attempt directory, and uses only the snapshots afterward. A successor stage also freezes the six
+generation policy inputs, Dockerfile, bridge lock, and both route assets; apply, recovery, and
+rollback validate those generation-local copies rather than the later live checkout.
 
 ## Apply while ingress remains closed
 
@@ -96,15 +135,22 @@ third-party checksum.
 
 ```sh
 ROUTES_DATABASE_URL='supplied by route authority' ./apply.sh --execute \
+  --successor \
   --estate-root /root/w33d_infra \
-  --dry-run-dir /secure/release/rikune-dry-run \
-  --release-env /secure/release/rikune.release.env \
+  --dry-run-dir /secure/release/holdfast-successor-<release-id>/rikune-dry-run \
+  --release-env /secure/release/holdfast-successor-<release-id>/rikune.release.env \
   --backup-root /secure/backups \
   --activate-services
 ```
 
 Ingress is still closed. Preserve the printed backup directory and `/var/lib/holdfast-rikune`
 state receipts.
+
+Each successor is exactly generation `n + 1` of the checksum-bound immediate predecessor. Its
+backup contains the predecessor `CURRENT.json`, lineage receipt, delta, and frozen generation
+authority. Successful successor recovery or rollback restores that exact predecessor pointer;
+terminal reruns adopt the existing completion evidence and do not replay runtime, estate, or
+Compose mutations.
 
 ### Recover an interrupted, activation-failed, or legacy orphan apply
 
@@ -286,8 +332,11 @@ ROUTES_DATABASE_URL='supplied by route authority' ./rollback.sh --execute --phas
 
 The close phase is valid from `ingress_open`, `finalizing_route_armed`,
 `ingress_compensation_unverified`, `edge_prepared_route_closed`, or
-`applied_ingress_closed`. `ROUTE-CLOSE-PREIMAGE.jsonl` preserves the complete pre-delete rows,
-including drift, before the fail-closed conflict cleanup.
+`applied_ingress_closed`. The route-close receipt and
+`ROUTE-CLOSE-PREIMAGE-<CONTROL-SHA256>.jsonl` are scoped to the exact release generation and
+preserve the complete pre-delete rows, including drift, before the fail-closed conflict cleanup.
+Older generation artifacts remain immutable so a completed successor terminal can still be
+revalidated while the restored predecessor begins a separate rollback ceremony.
 
 Populate and sign `authority-rollback.example.json` only after route close. If
 `was_public_open=true`, also populate and sign `edge-rollback.example.json`; it binds the v2

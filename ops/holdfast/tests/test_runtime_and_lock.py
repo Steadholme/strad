@@ -1733,6 +1733,57 @@ class RuntimeAndLockTests(unittest.TestCase):
         self.assertNotEqual(live.returncode, 0)
         self.assertIn("FAILED", live.stdout + live.stderr)
 
+    def test_successor_apply_cross_checks_all_dry_run_downgrade_fields(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        verify_start = script.index("verify_release_bindings()")
+        verify_end = script.index("commit_atomic_file()", verify_start)
+        verify = script[verify_start:verify_end]
+        for field in (
+            "release_mode",
+            "predecessor_current_sha256",
+            "successor_delta_sha256",
+            "holdfast_release_tool_revision",
+        ):
+            self.assertIn(f'holdfast_receipt_value "$receipt" {field}', verify)
+        self.assertIn('successor_delta_sha=$(holdfast_sha256 "$successor_delta")', verify)
+        self.assertIn(".predecessor_binding.current_state_sha256", verify)
+        self.assertIn("HOLDFAST_RELEASE_TOOL_REVISION", verify)
+        self.assertIn('--expected-mode "$render_expected_mode"', script)
+        self.assertIn('--successor-policy "$script_dir/successor-policy.json"', script)
+        recovery = (OPS_ROOT / "apply-recover.sh").read_text(encoding="utf-8")
+        rollback = (OPS_ROOT / "rollback.sh").read_text(encoding="utf-8")
+        for source in (recovery, rollback):
+            self.assertIn(
+                '--successor-policy "$authority_dir/successor-policy.json"', source
+            )
+            self.assertIn('--dockerfile "$authority_dir/Dockerfile.analyzer"', source)
+            self.assertIn(
+                '--bridge-lock "$authority_dir/bridge-package-lock.json"', source
+            )
+
+    def test_successor_arm_is_durable_before_runtime_caller_boundary(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        state = script.index('state:"successor_armed"')
+        commit = script.index(
+            'commit_atomic_file "$successor_state_tmp" "$state_file"', state
+        )
+        boundary = script.index("HOLDFAST_TEST_SIGKILL_AFTER_SUCCESSOR_ARM", commit)
+        frozen_authority = script.index(
+            "persist_successor_generation_authority", boundary
+        )
+        caller = script.index(
+            'caller_armed_receipt="$backup/RUNTIME-BACKUP-CALLER-ARMED.receipt"',
+            frozen_authority,
+        )
+        self.assertLess(state, commit)
+        self.assertLess(commit, boundary)
+        self.assertLess(boundary, frozen_authority)
+        self.assertLess(frozen_authority, caller)
+        self.assertLess(boundary, caller)
+        self.assertIn('elif [[ "$existing_state" == "successor_armed" ]]', script)
+        self.assertIn("recover_existing_successor_arm_state", script)
+        self.assertIn("successor apply requires --activate-services", script)
+
 
 if __name__ == "__main__":
     unittest.main()

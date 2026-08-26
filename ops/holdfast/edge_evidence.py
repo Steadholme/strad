@@ -265,7 +265,13 @@ def validate_preopen_reference(value: dict[str, Any]) -> None:
 def validate_route_close_receipt(path: Path) -> tuple[dict[str, str], datetime]:
     values = receipt(path)
     required = {
+        "schema_version",
         "route_closed_at",
+        "source_state",
+        "estate_root",
+        "backup_dir",
+        "control_sha256",
+        "state_before_sha256",
         "route_down_sha256",
         "route_down_execution_evidence_sha256",
         "open_evidence_sha256",
@@ -284,7 +290,14 @@ def validate_route_close_receipt(path: Path) -> tuple[dict[str, str], datetime]:
     if set(values) != required:
         fail("route-close receipt field set is not exact")
     if (
-        values["was_public_open"] != "true"
+        values["schema_version"] != "2"
+        or values["source_state"]
+        not in {
+            "ingress_open",
+            "finalizing_route_armed",
+            "ingress_compensation_unverified",
+        }
+        or values["was_public_open"] != "true"
         or values["route_state"] != ROUTE_STATE
         or values["public_host"] != PUBLIC_HOST
         or values["edge_owner"] != EDGE_OWNER
@@ -295,6 +308,8 @@ def validate_route_close_receipt(path: Path) -> tuple[dict[str, str], datetime]:
     ):
         fail("route-close receipt does not prove a formerly-open route is closed on Sluice")
     for name in (
+        "control_sha256",
+        "state_before_sha256",
         "route_down_sha256",
         "route_down_execution_evidence_sha256",
         "open_evidence_sha256",
@@ -302,6 +317,16 @@ def validate_route_close_receipt(path: Path) -> tuple[dict[str, str], datetime]:
         "route_preimage_sha256",
     ):
         hex64(values[name], f"route-close receipt {name}")
+    for name in ("estate_root", "backup_dir"):
+        raw_path = values[name]
+        path_value = Path(raw_path)
+        if (
+            not path_value.is_absolute()
+            or "." in path_value.parts
+            or ".." in path_value.parts
+            or str(path_value) != raw_path
+        ):
+            fail(f"route-close receipt {name} is not a canonical absolute path")
     return values, moment(values["route_closed_at"], "route close time")
 
 

@@ -64,7 +64,10 @@ class ApplyContractTests(unittest.TestCase):
         frozen = {
             "schema_version": 1,
             "generator": "holdfast-rikune-estate/test",
+            "release_epoch": 1,
             **semantic,
+            "tokenizer": {},
+            "required_unresolved_inputs": [],
         }
         (ops / "frozen-targets.json").write_text(
             json.dumps(frozen, sort_keys=True) + "\n", encoding="utf-8"
@@ -76,15 +79,252 @@ class ApplyContractTests(unittest.TestCase):
         evidence = stage / "RELEASE-EVIDENCE.json"
         evidence.write_text(
             json.dumps(
-                {"schema_version": 1, "generator": frozen["generator"], **semantic}
+                {
+                    "schema_version": 1,
+                    "generator": frozen["generator"],
+                    "catalog_only": False,
+                    **semantic,
+                    "secret_references": [],
+                    "release": {},
+                    "release_env_sha256": "0" * 64,
+                    "supply_chain_binding": {},
+                    "analyzer_image_binding": {},
+                }
             )
             + "\n",
             encoding="utf-8",
         )
         binding = self.root / "FIXTURE-RENDER-INPUTS.sha256"
         render_input_binding.write_binding(ops, binding)
-        render_input_binding.verify_apply_binding(ops, binding, stage, evidence)
+        render_input_binding.verify_apply_binding(
+            ops, binding, stage, evidence, "base"
+        )
         return ops, stage, evidence, binding
+
+    def make_successor_catalog_binding_fixture(
+        self,
+    ) -> tuple[Path, Path, Path, Path]:
+        ops = self.root / "successor-catalog-ops"
+        stage = self.root / "successor-catalog-stage"
+        ops.mkdir()
+        stage.mkdir()
+        for relative in render_input_binding.CATALOG_STATIC_PATHS:
+            target = stage / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"successor catalog: {relative}\n", encoding="utf-8")
+        overlay = []
+        for index in range(7):
+            relative = f"access-governance/tests/successor_{index}.rs"
+            target = stage / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"successor overlay {index}\n", encoding="utf-8")
+            overlay.append(
+                {
+                    "path": relative,
+                    "before_sha256": None,
+                    "after_sha256": render_input_binding.digest(target),
+                }
+            )
+        supporting_paths = (
+            "verdict/src/lib.rs",
+            "relay/upstream/new-api/router/enterprise_permissions.json",
+            "relay/upstream/new-api/router/newapi-authz-v1.json",
+        )
+        for relative in supporting_paths:
+            target = stage / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"successor supporting: {relative}\n", encoding="utf-8")
+
+        assets = ops / "assets"
+        assets.mkdir()
+        for relative in render_input_binding.ROUTE_ASSET_PATHS.values():
+            target = ops / relative
+            target.write_text(f"successor route: {relative}\n", encoding="utf-8")
+        static_lines = []
+        for relative in render_input_binding.FROZEN_STATIC_PATHS:
+            target = stage / relative
+            target_sha = (
+                render_input_binding.digest(target)
+                if target.is_file()
+                else "0" * 64
+            )
+            static_lines.append(f"{target_sha}  {relative}")
+        (ops / "successor-static-targets.sha256").write_text(
+            "\n".join(static_lines) + "\n", encoding="utf-8"
+        )
+        semantic = {
+            field: render_input_binding.digest(stage / relative)
+            for field, relative in render_input_binding.STAGE_SEMANTIC_PATHS.items()
+        }
+        semantic["access_governance_build_input_sha256"] = (
+            render_input_binding.access_build_input_sha_v2(stage)
+        )
+        semantic.update(
+            {
+                field: render_input_binding.digest(ops / relative)
+                for field, relative in render_input_binding.ROUTE_ASSET_PATHS.items()
+            }
+        )
+        predecessor = {
+            "current_state_sha256": "1" * 64,
+            "control_sha256": "2" * 64,
+            "apply_receipt_sha256": "3" * 64,
+            "release_evidence_sha256": "4" * 64,
+            "runtime_manifest_sha256": "5" * 64,
+            "candidate_evidence_sha256": "6" * 64,
+            "candidate_targets_sha256": "7" * 64,
+            "access_image": "registry.example/access@sha256:" + "8" * 64,
+            "access_build_input_schema": "access-build-input/1",
+            "access_build_input_sha256": "9" * 64,
+            "permission_catalog_sha256": semantic["permission_catalog_sha256"],
+            "package_catalog_sha256": semantic["package_catalog_sha256"],
+        }
+        policy = {
+            "schema_version": 1,
+            "ceremony": "holdfast-rikune-successor-v1",
+            "predecessor": predecessor,
+            "successor": {
+                "generator": "holdfast-rikune-estate/test-successor-catalog",
+                "access_build_input_schema": "access-build-input/2",
+                "access_build_input_sha256": semantic[
+                    "access_governance_build_input_sha256"
+                ],
+                "preimages_manifest": "successor-preimages.sha256",
+                "absent_manifest": "successor-absent.paths",
+                "static_targets_manifest": "successor-static-targets.sha256",
+                "frozen_targets_manifest": "successor-frozen-targets.json",
+                "supporting_targets_manifest": "successor-supporting-targets.sha256",
+            },
+            "overlay": overlay,
+        }
+        (ops / "successor-policy.json").write_text(
+            json.dumps(policy) + "\n", encoding="utf-8"
+        )
+        (ops / "successor-preimages.sha256").write_text(
+            f"{'0' * 64}  fixture.txt\n", encoding="utf-8"
+        )
+        (ops / "successor-absent.paths").write_text("", encoding="utf-8")
+        (ops / "successor-supporting-targets.sha256").write_text(
+            "".join(
+                f"{render_input_binding.digest(stage / relative)}  {relative}\n"
+                for relative in supporting_paths
+            ),
+            encoding="utf-8",
+        )
+        frozen = {
+            "schema_version": 2,
+            "generator": policy["successor"]["generator"],
+            "release_epoch": 1,
+            **semantic,
+            "access_governance_build_input_schema": "access-build-input/2",
+            "tokenizer": {
+                "name": "fixture",
+                "package": "fixture@1",
+                "vocabulary_sha256": "a" * 64,
+                "minimum_context_tokens": 1,
+            },
+            "required_unresolved_inputs": list(
+                render_input_binding.SUCCESSOR_UNRESOLVED_INPUTS
+            ),
+        }
+        (ops / "successor-frozen-targets.json").write_text(
+            json.dumps(frozen) + "\n", encoding="utf-8"
+        )
+        delta = stage / "SUCCESSOR-DELTA.sha256"
+        delta.write_text(
+            "".join(
+                f"{'0' * 64}  {item['after_sha256']}  {item['path']}\n"
+                for item in overlay
+            ),
+            encoding="utf-8",
+        )
+        revision = "b" * 40
+        evidence = stage / "RELEASE-EVIDENCE.json"
+        evidence.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "generator": frozen["generator"],
+                    "catalog_only": True,
+                    **semantic,
+                    "secret_references": [],
+                    "release": {},
+                    "release_mode": "successor",
+                    "access_governance_build_input_schema": "access-build-input/2",
+                    "holdfast_release_tool_revision": revision,
+                    "predecessor_binding": predecessor,
+                    "successor_delta_sha256": render_input_binding.digest(delta),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        binding = self.root / "SUCCESSOR-CATALOG-RENDER-INPUTS.sha256"
+        render_input_binding.write_binding(ops, binding, successor=True)
+        return ops, stage, evidence, binding
+
+    def test_access_candidate_build_requires_successor_catalog_semantics(self) -> None:
+        ops, stage, evidence, binding = self.make_successor_catalog_binding_fixture()
+        render_input_binding.verify_apply_binding(
+            ops, binding, stage, evidence, "successor-catalog"
+        )
+        with self.assertRaisesRegex(RuntimeError, "field set|catalog mode"):
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "successor"
+            )
+
+        permission_path = stage / render_input_binding.STAGE_SEMANTIC_PATHS[
+            "permission_catalog_sha256"
+        ]
+        permission_path.write_text("catalog semantic drift\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "static target drift|semantic digest"):
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "successor-catalog"
+            )
+
+        script = (OPS_ROOT / "build-access-candidate.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            script.index("--expected-mode successor-catalog"),
+            script.index("docker buildx build"),
+        )
+        self.assertIn('--stage-root "$candidate_root"', script)
+        self.assertIn('--release-evidence "$evidence"', script)
+        snapshot_create = script.index("build_snapshot=$(mktemp -d")
+        snapshot_copy = script.index('cp -a -- "$candidate_root/."')
+        ignored_debris_guard = script.index("ignored_entry=$(find")
+        snapshot_freeze = script.index(
+            'find "$snapshot_candidate" -type f -exec chmod 0400'
+        )
+        semantic_verify = script.index("--expected-mode successor-catalog")
+        docker_build = script.index("docker buildx build")
+        self.assertLess(snapshot_create, snapshot_copy)
+        self.assertLess(snapshot_copy, ignored_debris_guard)
+        self.assertLess(ignored_debris_guard, snapshot_freeze)
+        self.assertLess(snapshot_freeze, semantic_verify)
+        self.assertLess(semantic_verify, docker_build)
+        self.assertIn("trap cleanup_snapshot EXIT", script)
+        self.assertIn('rm -rf --one-file-system -- "$build_snapshot"', script)
+        self.assertIn('require_control_file "$evidence"', script)
+        self.assertIn('require_control_file "$targets"', script)
+        self.assertIn('require_control_file "$render_inputs"', script)
+        for ignored_name in (
+            ".git",
+            ".workflow",
+            "target",
+            "__pycache__",
+            "*.pyc",
+            "*.log",
+        ):
+            self.assertIn(ignored_name, script)
+        self.assertEqual(
+            render_input_binding.SUCCESSOR_BOUND_INPUTS[-2:],
+            (
+                "successor-supporting-targets.sha256",
+                "successor-policy.json",
+            ),
+        )
 
     def test_checked_in_manifests_generate_exact_full_apply_coverage(self) -> None:
         stage = self.root / "stage"
@@ -316,7 +556,9 @@ class ApplyContractTests(unittest.TestCase):
         target = stage / "deploy/docker-compose.yml"
         target.write_bytes(target.read_bytes() + b"tampered\n")
         with self.assertRaisesRegex(RuntimeError, "stage static target drift"):
-            render_input_binding.verify_apply_binding(ops, binding, stage, evidence)
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "base"
+            )
 
     def test_apply_binding_rejects_release_evidence_tampering(self) -> None:
         ops, stage, evidence, binding = self.make_apply_binding_fixture()
@@ -324,21 +566,27 @@ class ApplyContractTests(unittest.TestCase):
         value["package_catalog_sha256"] = "f" * 64
         evidence.write_text(json.dumps(value) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "frozen semantic drift"):
-            render_input_binding.verify_apply_binding(ops, binding, stage, evidence)
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "base"
+            )
 
     def test_apply_binding_rejects_access_build_input_tampering(self) -> None:
         ops, stage, evidence, binding = self.make_apply_binding_fixture()
         target = stage / "access-governance/fixture-extra.txt"
         target.write_bytes(target.read_bytes() + b"tampered\n")
         with self.assertRaisesRegex(RuntimeError, "access_governance_build_input"):
-            render_input_binding.verify_apply_binding(ops, binding, stage, evidence)
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "base"
+            )
 
     def test_apply_binding_rejects_route_asset_tampering(self) -> None:
         ops, stage, evidence, binding = self.make_apply_binding_fixture()
         route = ops / render_input_binding.ROUTE_ASSET_PATHS["route_up_sha256"]
         route.write_bytes(route.read_bytes() + b"tampered\n")
         with self.assertRaisesRegex(RuntimeError, "route_up_sha256"):
-            render_input_binding.verify_apply_binding(ops, binding, stage, evidence)
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "base"
+            )
 
     def test_apply_preflights_before_backup_and_fully_rebinds_after_backup(self) -> None:
         script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
@@ -569,7 +817,20 @@ class ApplyContractTests(unittest.TestCase):
         self.assertLess(apply_receipt, final_state)
         self.assertIn("ROUTES_DATABASE_URL must be a PostgreSQL URI", script)
         self.assertIn("assets/verify_rikune_root_absent.sql", script)
-        self.assertNotIn("20260823_rikune_root_up.sql", script)
+        route_up_lines = [
+            line
+            for line in script.splitlines()
+            if "20260823_rikune_root_up.sql" in line
+        ]
+        self.assertTrue(route_up_lines)
+        self.assertTrue(
+            all(
+                "for relative in" in line
+                or "successor-authority/assets/" in line
+                for line in route_up_lines
+            ),
+            "apply may freeze route-up authority but must never execute it",
+        )
         for evidence in (
             "closed_bracket=passed",
             "route_database_state=absent",
