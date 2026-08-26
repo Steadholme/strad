@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --execute --mode restore|resume --backup-dir PATH [--estate-root PATH] [--state-dir PATH] [--legacy-empty-strad]" >&2
+  echo "usage: $0 --execute --mode restore|resume --backup-dir PATH [--estate-root PATH] [--state-dir PATH] [--legacy-empty-strad] [--quarantine-access-chain]" >&2
   exit 2
 }
 
@@ -12,6 +12,7 @@ backup=""
 estate_root=""
 state_dir="/var/lib/holdfast-rikune"
 legacy_empty_strad="false"
+quarantine_access_chain="false"
 while (($#)); do
   case "$1" in
     --execute) execute="true"; shift ;;
@@ -20,11 +21,13 @@ while (($#)); do
     --estate-root) [[ $# -ge 2 ]] || usage; estate_root=$2; shift 2 ;;
     --state-dir) [[ $# -ge 2 ]] || usage; state_dir=$2; shift 2 ;;
     --legacy-empty-strad) legacy_empty_strad="true"; shift ;;
+    --quarantine-access-chain) quarantine_access_chain="true"; shift ;;
     *) usage ;;
   esac
 done
 [[ "$execute" == "true" && ( "$mode" == "restore" || "$mode" == "resume" ) && -n "$backup" ]] || usage
 if [[ "$legacy_empty_strad" == "true" && "$mode" != "restore" ]]; then usage; fi
+if [[ "$quarantine_access_chain" == "true" && "$mode" != "restore" ]]; then usage; fi
 [[ $EUID -eq 0 ]] || { echo "apply recovery requires root" >&2; exit 1; }
 [[ -n "${ROUTES_DATABASE_URL:-}" ]] || { echo "ROUTES_DATABASE_URL is required to prove closed ingress" >&2; exit 1; }
 
@@ -581,6 +584,9 @@ case "$runtime_schema" in
     ;;
   *) holdfast_die "unsupported runtime backup schema" ;;
 esac
+if [[ "$quarantine_access_chain" == "true" && "$runtime_schema" != "2" ]]; then
+  holdfast_die "access-chain quarantine requires a schema-v2 runtime backup"
+fi
 
 # Reject path tricks before handing the immutable manifest to sha256sum.
 while IFS= read -r control_line; do
@@ -810,6 +816,12 @@ else
   fi
 fi
 
+if [[ "$quarantine_access_chain" == "true" && \
+  "$prior_state" != "restore_failed" && "$prior_state" != "apply_recovery_armed" && \
+  -z "$completed_state_match" ]]; then
+  holdfast_die "access-chain quarantine requires a restore-failed retry"
+fi
+
 runtime_restore=$(test_override HOLDFAST_RUNTIME_RESTORE_BIN "$script_dir/runtime-restore.sh")
 runtime_verify=$(test_override HOLDFAST_RUNTIME_VERIFY_BIN "$script_dir/runtime-verify.sh")
 recovery_compose_root="$estate_root"
@@ -924,6 +936,7 @@ compose=("$docker_bin" compose --env-file "$estate_root/deploy/.env" -f "$estate
 application_writers=(
   access-governance verdict newapi rikune-analyzer strad sluice sluice-internal
 )
+access_chain_writers=(access-governance newapi)
 runtime_prior_services=()
 if [[ "$runtime_schema" == "2" ]]; then
   mapfile -t runtime_prior_services <"$backup/runtime/RUNNING-SERVICES.before"
@@ -947,6 +960,40 @@ service_container_ids() {
   "$docker_bin" ps -aq \
     --filter "label=com.docker.compose.project=$compose_project" \
     --filter "label=com.docker.compose.service=$service"
+}
+
+validate_access_chain_live_failure() {
+  local output state health
+  local -a ids=()
+  output=$(service_container_ids access-governance) || \
+    holdfast_die "could not inspect access-governance for quarantine"
+  if [[ -n "$output" ]]; then mapfile -t ids <<<"$output"; fi
+  ((${#ids[@]} == 1)) || \
+    holdfast_die "access-chain quarantine lacks one failed access-governance container"
+  state=$("$docker_bin" inspect -f '{{.State.Status}}' "${ids[0]}") || \
+    holdfast_die "could not inspect access-governance state for quarantine"
+  case "$state" in
+    restarting|exited|dead|created) ;;
+    running)
+      health=$("$docker_bin" inspect -f \
+        '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${ids[0]}") || \
+        holdfast_die "could not inspect access-governance health for quarantine"
+      [[ "$health" == "unhealthy" ]] || \
+        holdfast_die "access-chain quarantine requires failed access-governance health evidence"
+      ;;
+    *) holdfast_die "access-chain quarantine refuses access-governance state: $state" ;;
+  esac
+}
+
+verify_live_quarantine_absence() {
+  local service output
+  [[ "$writer_set_quarantined" == "access-governance,newapi" ]] || return 0
+  for service in "${access_chain_writers[@]}"; do
+    output=$(service_container_ids "$service") || \
+      holdfast_die "could not verify quarantined writer absence: $service"
+    [[ -z "$output" ]] || \
+      holdfast_die "quarantined writer container exists at completion: $service"
+  done
 }
 
 validate_writer_sequence() {
@@ -1013,6 +1060,7 @@ load_preimage_compose_authority() {
 validate_writer_reconciliation_source() {
   local source_state source_failure_name source_failure source_arm_name source_arm
   local source_manifest_name source_manifest source_arm_sha service
+  local access_found="false" newapi_found="false"
   local -a source_writers=() expected_writers=()
 
   source_state="$state_dir/APPLY-RECOVERY-FAILED-${writer_set_source_attempt}.json"
@@ -1034,6 +1082,13 @@ validate_writer_reconciliation_source() {
      .recovery_route_database_state == "absent" and .ingress_opened == false' \
     "$source_state" >/dev/null || \
     holdfast_die "writer reconciliation source state authority differs"
+  if [[ "$writer_set_quarantined" == "access-governance,newapi" ]]; then
+    jq -e \
+      '.recovery_prior_state == "apply_activation_failed" and
+       (.writer_set_quarantined // "none") == "none"' \
+      "$source_state" >/dev/null || \
+      holdfast_die "access-chain quarantine source was not an activation failure"
+  fi
 
   source_failure_name=$(jq -er '.apply_failure_receipt' "$source_state")
   [[ "$source_failure_name" =~ ^APPLY-RECOVERY-FAILED-${writer_set_source_attempt}(-retry-[0-9]+)?\.receipt$ ]] || \
@@ -1071,6 +1126,15 @@ validate_writer_reconciliation_source() {
     "$(holdfast_receipt_value "$source_arm" restore_running_writers_sha256)" == \
       "$writer_set_source_manifest_sha" ]] || \
     holdfast_die "writer reconciliation source arm authority differs"
+  if [[ "$writer_set_quarantined" == "access-governance,newapi" ]]; then
+    [[ "$(holdfast_receipt_value "$source_arm" prior_state)" == \
+        "apply_activation_failed" && \
+      "$(holdfast_receipt_value "$source_arm" writer_set_quarantined 2>/dev/null || printf none)" == \
+        "none" && \
+      "$(holdfast_receipt_value "$source_failure" writer_set_quarantined 2>/dev/null || printf none)" == \
+        "none" ]] || \
+      holdfast_die "access-chain quarantine source receipt authority differs"
+  fi
 
   source_manifest_name=$(jq -er '.restore_running_writers_manifest' "$source_state")
   [[ "$source_manifest_name" == "RESTORE-RUNNING-WRITERS-${writer_set_source_attempt}.txt" ]] || \
@@ -1082,10 +1146,24 @@ validate_writer_reconciliation_source() {
   mapfile -t source_writers <"$source_manifest"
   validate_writer_sequence source_writers
   for service in "${source_writers[@]}"; do
+    if [[ "$service" == "access-governance" ]]; then access_found="true"; fi
+    if [[ "$service" == "newapi" ]]; then newapi_found="true"; fi
     if [[ -n "${preimage_compose_services[$service]:-}" ]]; then
+      if [[ "$writer_set_quarantined" == "access-governance,newapi" && \
+        ( "$service" == "access-governance" || "$service" == "newapi" ) ]]; then
+        continue
+      fi
       expected_writers+=("$service")
     fi
   done
+  if [[ "$writer_set_quarantined" == "access-governance,newapi" ]]; then
+    [[ "$access_found" == "true" && "$newapi_found" == "true" && \
+      -n "${preimage_compose_services[access-governance]:-}" && \
+      -n "${preimage_compose_services[newapi]:-}" ]] || \
+      holdfast_die "access-chain quarantine source lacks both bound writers"
+  elif [[ "$writer_set_quarantined" != "none" ]]; then
+    holdfast_die "writer reconciliation carries an unknown quarantine set"
+  fi
   ((${#expected_writers[@]} == ${#restore_running_writers[@]})) || \
     holdfast_die "writer reconciliation result differs from estate preimage"
   for index in "${!expected_writers[@]}"; do
@@ -1198,6 +1276,7 @@ pre_restored_superseded_attempt="none"
 pre_restored_superseded_failure_sha="none"
 pre_restored_superseded_state_sha="none"
 pre_restored_runtime_disposition="not-applicable"
+writer_set_quarantined="none"
 
 pre_restored_runtime_writers_are_inactive() {
   local service output state
@@ -1710,6 +1789,24 @@ if [[ -n "$completed_state_match" ]]; then
   completed_writer_source_state=$(holdfast_receipt_value "$completed_receipt" writer_set_source_state_sha256 2>/dev/null || printf legacy-absent)
   completed_writer_source_manifest=$(holdfast_receipt_value "$completed_receipt" writer_set_source_manifest_sha256 2>/dev/null || printf legacy-absent)
   completed_writer_preimage=$(holdfast_receipt_value "$completed_receipt" writer_set_preimage_compose_sha256 2>/dev/null || printf legacy-absent)
+  completed_writer_quarantined=$(holdfast_receipt_value "$completed_receipt" writer_set_quarantined 2>/dev/null || printf none)
+  [[ "$completed_writer_quarantined" == \
+      "$(holdfast_receipt_value "$completed_armed" writer_set_quarantined 2>/dev/null || printf none)" && \
+    "$completed_writer_quarantined" == \
+      "$(jq -er '.writer_set_quarantined // "none"' "$completed_state_match")" ]] || \
+    holdfast_die "completed writer quarantine authority differs"
+  writer_set_quarantined=$completed_writer_quarantined
+  if [[ "$writer_set_quarantined" == "access-governance,newapi" ]]; then
+    [[ "$quarantine_access_chain" == "true" ]] || \
+      holdfast_die "completed access-chain quarantine requires its explicit flag"
+    [[ "$(holdfast_receipt_value "$completed_receipt" quarantined_writers_inactive)" == \
+      "passed" ]] || holdfast_die "completed access-chain quarantine lacks inactive proof"
+  else
+    [[ "$writer_set_quarantined" == "none" ]] || \
+      holdfast_die "completed recovery carries an unknown writer quarantine set"
+    [[ "$quarantine_access_chain" == "false" ]] || \
+      holdfast_die "completed recovery does not carry access-chain quarantine"
+  fi
   if [[ "$completed_writer_reconciled" == "legacy-absent" && \
     "$completed_writer_source_attempt" == "legacy-absent" && \
     "$completed_writer_source_failure" == "legacy-absent" && \
@@ -1796,8 +1893,13 @@ if [[ -n "$completed_state_match" ]]; then
         holdfast_die "completed inactive writer reconciliation carries source evidence"
     fi
   fi
+  if [[ "$writer_set_quarantined" == "access-governance,newapi" && \
+    "$writer_set_reconciled" != "true" ]]; then
+    holdfast_die "completed access-chain quarantine lacks reconciliation authority"
+  fi
   if [[ "$mode" == "restore" ]]; then
     verify_live_disposition preimage
+    verify_live_quarantine_absence
     if [[ -f "$state_file" && ! -L "$state_file" ]]; then
       finalized_attempt=$(holdfast_receipt_value "$completed_receipt" attempt_id)
       [[ "$finalized_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || \
@@ -1958,6 +2060,20 @@ if [[ "$prior_state" == "apply_recovery_armed" ]]; then
   armed_writer_set_source_state=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_source_state_sha256 2>/dev/null || printf legacy-absent)
   armed_writer_set_source_manifest=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_source_manifest_sha256 2>/dev/null || printf legacy-absent)
   armed_writer_set_preimage_compose=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_preimage_compose_sha256 2>/dev/null || printf legacy-absent)
+  armed_writer_set_quarantined=$(holdfast_receipt_value "$recovery_armed_receipt" writer_set_quarantined 2>/dev/null || printf none)
+  [[ "$armed_writer_set_quarantined" == \
+    "$(jq -er '.writer_set_quarantined // "none"' "$state_file")" ]] || \
+    holdfast_die "armed writer quarantine authority differs"
+  writer_set_quarantined=$armed_writer_set_quarantined
+  if [[ "$writer_set_quarantined" == "access-governance,newapi" ]]; then
+    [[ "$quarantine_access_chain" == "true" ]] || \
+      holdfast_die "armed access-chain quarantine requires its explicit flag"
+  else
+    [[ "$writer_set_quarantined" == "none" ]] || \
+      holdfast_die "armed recovery carries an unknown writer quarantine set"
+    [[ "$quarantine_access_chain" == "false" ]] || \
+      holdfast_die "armed recovery does not carry access-chain quarantine"
+  fi
   if [[ "$armed_writer_set_reconciled" == "legacy-absent" && \
     "$armed_writer_set_source_attempt" == "legacy-absent" && \
     "$armed_writer_set_source_failure" == "legacy-absent" && \
@@ -2019,6 +2135,10 @@ if [[ "$prior_state" == "apply_recovery_armed" ]]; then
         "$writer_set_preimage_compose_sha" ]] || \
       holdfast_die "armed writer reconciliation state differs"
   fi
+  if [[ "$writer_set_quarantined" == "access-governance,newapi" && \
+    "$writer_set_reconciled" != "true" ]]; then
+    holdfast_die "armed access-chain quarantine lacks reconciliation authority"
+  fi
   if [[ "$mode" == "restore" ]]; then
     restore_writers_name=$(jq -er '.restore_running_writers_manifest' "$state_file")
     [[ "$restore_writers_name" == "RESTORE-RUNNING-WRITERS-${attempt_id}.txt" ]] || \
@@ -2056,6 +2176,17 @@ else
         fi
       done
       prior_writer_set_reconciled=$(jq -er '(.writer_set_reconciled // false) | tostring' "$state_file")
+      prior_writer_set_quarantined=$(jq -er '.writer_set_quarantined // "none"' "$state_file")
+      [[ "$prior_writer_set_quarantined" == "none" || \
+        "$prior_writer_set_quarantined" == "access-governance,newapi" ]] || \
+        holdfast_die "restore-failed state carries an unknown writer quarantine set"
+      if [[ "$prior_writer_set_quarantined" == "access-governance,newapi" ]]; then
+        [[ "$quarantine_access_chain" == "true" ]] || \
+          holdfast_die "access-chain quarantine retry requires its explicit flag"
+      elif [[ "$prior_writer_set_reconciled" == "true" && \
+        "$quarantine_access_chain" == "true" ]]; then
+        holdfast_die "writer reconciliation retry does not carry access-chain quarantine"
+      fi
       if [[ "$prior_writer_set_reconciled" == "true" ]]; then
         ((${#reconciled_writers[@]} == source_writer_count)) || \
           holdfast_die "previously reconciled writer set differs from estate preimage"
@@ -2065,6 +2196,7 @@ else
         writer_set_source_state_sha=$(jq -er '.writer_set_source_state_sha256' "$state_file")
         writer_set_source_manifest_sha=$(jq -er '.writer_set_source_manifest_sha256' "$state_file")
         writer_set_preimage_compose_sha=$(jq -er '.writer_set_preimage_compose_sha256' "$state_file")
+        writer_set_quarantined=$prior_writer_set_quarantined
         [[ "$writer_set_source_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
           "$writer_set_source_failure_sha" =~ ^[0-9a-f]{64}$ && \
           "$writer_set_source_state_sha" =~ ^[0-9a-f]{64}$ && \
@@ -2100,6 +2232,34 @@ else
             "$(holdfast_receipt_value "$current_arm" "$key")" == \
               "$(jq -er ".${key} | tostring" "$state_file")" ]] || \
             holdfast_die "inherited writer reconciliation authority differs: $key"
+        done
+        [[ "$(holdfast_receipt_value "$current_failure" writer_set_quarantined 2>/dev/null || printf none)" == \
+            "$writer_set_quarantined" && \
+          "$(holdfast_receipt_value "$current_arm" writer_set_quarantined 2>/dev/null || printf none)" == \
+            "$writer_set_quarantined" ]] || \
+          holdfast_die "inherited writer quarantine authority differs"
+        validate_writer_reconciliation_source
+      elif [[ "$quarantine_access_chain" == "true" ]]; then
+        [[ "$prior_writer_set_quarantined" == "none" ]] || \
+          holdfast_die "inactive reconciliation carries writer quarantine evidence"
+        validate_access_chain_live_failure
+        writer_set_source_attempt=$(jq -er '.recovery_attempt_id' "$state_file")
+        [[ "$writer_set_source_attempt" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || \
+          holdfast_die "access-chain quarantine source attempt is unsafe"
+        writer_set_source_failure_sha=$(jq -er '.apply_failure_receipt_sha256' "$state_file")
+        writer_set_source_manifest_sha=$(holdfast_sha256 "$prior_writers_manifest")
+        writer_set_source_state_sha=$(holdfast_sha256 "$state_file")
+        source_failed_state="$state_dir/APPLY-RECOVERY-FAILED-${writer_set_source_attempt}.json"
+        require_root_file "$source_failed_state"
+        [[ "$(holdfast_sha256 "$source_failed_state")" == "$writer_set_source_state_sha" ]] || \
+          holdfast_die "access-chain quarantine CURRENT differs from immutable failure state"
+        writer_set_reconciled="true"
+        writer_set_quarantined="access-governance,newapi"
+        restore_running_writers=()
+        for service in "${reconciled_writers[@]}"; do
+          if [[ "$service" != "access-governance" && "$service" != "newapi" ]]; then
+            restore_running_writers+=("$service")
+          fi
         done
         validate_writer_reconciliation_source
       elif ((${#reconciled_writers[@]} != source_writer_count)); then
@@ -2191,6 +2351,7 @@ else
     printf 'writer_set_source_state_sha256=%s\n' "$writer_set_source_state_sha"
     printf 'writer_set_source_manifest_sha256=%s\n' "$writer_set_source_manifest_sha"
     printf 'writer_set_preimage_compose_sha256=%s\n' "$writer_set_preimage_compose_sha"
+    printf 'writer_set_quarantined=%s\n' "$writer_set_quarantined"
     printf 'pre_restored_retry=%s\n' "$pre_restored_retry"
     printf 'pre_restored_source_attempt=%s\n' "$pre_restored_source_attempt"
     printf 'pre_restored_runtime_snapshot_sha256=%s\n' "$pre_restored_runtime_snapshot"
@@ -2228,8 +2389,9 @@ else
       --arg writer_source_state "$writer_set_source_state_sha" \
       --arg writer_source_manifest "$writer_set_source_manifest_sha" \
       --arg writer_preimage_compose "$writer_set_preimage_compose_sha" \
+      --arg writer_quarantined "$writer_set_quarantined" \
       --arg transaction "$transaction_sha" --arg applied_targets "$applied_targets_sha" \
-      '.state="apply_recovery_armed" | .recovery_prior_state=$prior | .recovery_mode=$mode | .recovery_attempt_id=$attempt | .recovery_armed_receipt=$armed | .recovery_armed_receipt_sha256=$armed_sha | .restore_running_writers_manifest=$writers | .restore_running_writers_sha256=$writers_sha | .legacy_empty_strad=($legacy_empty == "true") | .pre_restored_retry=($pre_restored == "true") | .pre_restored_source_attempt=$pre_restored_attempt | .pre_restored_runtime_snapshot_sha256=$pre_restored_runtime | .pre_restored_estate_snapshot_sha256=$pre_restored_estate | .pre_restored_superseded_attempt=$pre_restored_superseded_attempt | .pre_restored_superseded_failure_receipt_sha256=$pre_restored_superseded_failure | .pre_restored_superseded_state_sha256=$pre_restored_superseded_state | .pre_restored_runtime_disposition=$pre_restored_disposition | .writer_set_reconciled=($writer_reconciled == "true") | .writer_set_source_attempt=$writer_source_attempt | .writer_set_source_failure_receipt_sha256=$writer_source_failure | .writer_set_source_state_sha256=$writer_source_state | .writer_set_source_manifest_sha256=$writer_source_manifest | .writer_set_preimage_compose_sha256=$writer_preimage_compose | .transaction_sha256=$transaction | .applied_targets_sha256=$applied_targets' \
+      '.state="apply_recovery_armed" | .recovery_prior_state=$prior | .recovery_mode=$mode | .recovery_attempt_id=$attempt | .recovery_armed_receipt=$armed | .recovery_armed_receipt_sha256=$armed_sha | .restore_running_writers_manifest=$writers | .restore_running_writers_sha256=$writers_sha | .legacy_empty_strad=($legacy_empty == "true") | .pre_restored_retry=($pre_restored == "true") | .pre_restored_source_attempt=$pre_restored_attempt | .pre_restored_runtime_snapshot_sha256=$pre_restored_runtime | .pre_restored_estate_snapshot_sha256=$pre_restored_estate | .pre_restored_superseded_attempt=$pre_restored_superseded_attempt | .pre_restored_superseded_failure_receipt_sha256=$pre_restored_superseded_failure | .pre_restored_superseded_state_sha256=$pre_restored_superseded_state | .pre_restored_runtime_disposition=$pre_restored_disposition | .writer_set_reconciled=($writer_reconciled == "true") | .writer_set_source_attempt=$writer_source_attempt | .writer_set_source_failure_receipt_sha256=$writer_source_failure | .writer_set_source_state_sha256=$writer_source_state | .writer_set_source_manifest_sha256=$writer_source_manifest | .writer_set_preimage_compose_sha256=$writer_preimage_compose | .writer_set_quarantined=$writer_quarantined | .transaction_sha256=$transaction | .applied_targets_sha256=$applied_targets' \
       "$state_file" >"$state_tmp"
   else
     jq -n \
@@ -2253,8 +2415,9 @@ else
       --arg writer_source_state "$writer_set_source_state_sha" \
       --arg writer_source_manifest "$writer_set_source_manifest_sha" \
       --arg writer_preimage_compose "$writer_set_preimage_compose_sha" \
+      --arg writer_quarantined "$writer_set_quarantined" \
       --arg transaction "$transaction_sha" --arg applied_targets "$applied_targets_sha" \
-      '{schema_version:2,state:"apply_recovery_armed",estate_root:$estate,backup_dir:$backup,apply_armed_receipt_sha256:$apply_armed_sha,release_evidence_sha256:$release,dry_run_receipt_sha256:$dry,control_sha256:$control,transaction_sha256:$transaction,applied_targets_sha256:$applied_targets,recovery_prior_state:$prior,recovery_mode:$mode,recovery_attempt_id:$attempt,recovery_armed_receipt:$armed,recovery_armed_receipt_sha256:$armed_sha,restore_running_writers_manifest:$writers,restore_running_writers_sha256:$writers_sha,legacy_orphan_adopted:($legacy_adopted == "true"),apply_armed_pointer_was_missing:($armed_pointer_missing == "true"),legacy_empty_strad:($legacy_empty == "true"),pre_restored_retry:($pre_restored == "true"),pre_restored_source_attempt:$pre_restored_attempt,pre_restored_runtime_snapshot_sha256:$pre_restored_runtime,pre_restored_estate_snapshot_sha256:$pre_restored_estate,pre_restored_superseded_attempt:$pre_restored_superseded_attempt,pre_restored_superseded_failure_receipt_sha256:$pre_restored_superseded_failure,pre_restored_superseded_state_sha256:$pre_restored_superseded_state,pre_restored_runtime_disposition:$pre_restored_disposition,writer_set_reconciled:($writer_reconciled == "true"),writer_set_source_attempt:$writer_source_attempt,writer_set_source_failure_receipt_sha256:$writer_source_failure,writer_set_source_state_sha256:$writer_source_state,writer_set_source_manifest_sha256:$writer_source_manifest,writer_set_preimage_compose_sha256:$writer_preimage_compose,ingress_opened:false}' \
+      '{schema_version:2,state:"apply_recovery_armed",estate_root:$estate,backup_dir:$backup,apply_armed_receipt_sha256:$apply_armed_sha,release_evidence_sha256:$release,dry_run_receipt_sha256:$dry,control_sha256:$control,transaction_sha256:$transaction,applied_targets_sha256:$applied_targets,recovery_prior_state:$prior,recovery_mode:$mode,recovery_attempt_id:$attempt,recovery_armed_receipt:$armed,recovery_armed_receipt_sha256:$armed_sha,restore_running_writers_manifest:$writers,restore_running_writers_sha256:$writers_sha,legacy_orphan_adopted:($legacy_adopted == "true"),apply_armed_pointer_was_missing:($armed_pointer_missing == "true"),legacy_empty_strad:($legacy_empty == "true"),pre_restored_retry:($pre_restored == "true"),pre_restored_source_attempt:$pre_restored_attempt,pre_restored_runtime_snapshot_sha256:$pre_restored_runtime,pre_restored_estate_snapshot_sha256:$pre_restored_estate,pre_restored_superseded_attempt:$pre_restored_superseded_attempt,pre_restored_superseded_failure_receipt_sha256:$pre_restored_superseded_failure,pre_restored_superseded_state_sha256:$pre_restored_superseded_state,pre_restored_runtime_disposition:$pre_restored_disposition,writer_set_reconciled:($writer_reconciled == "true"),writer_set_source_attempt:$writer_source_attempt,writer_set_source_failure_receipt_sha256:$writer_source_failure,writer_set_source_state_sha256:$writer_source_state,writer_set_source_manifest_sha256:$writer_source_manifest,writer_set_preimage_compose_sha256:$writer_preimage_compose,writer_set_quarantined:$writer_quarantined,ingress_opened:false}' \
       >"$state_tmp"
   fi
   chmod 0600 "$state_tmp"
@@ -2300,6 +2463,7 @@ record_recovery_failure() {
     printf 'writer_set_source_state_sha256=%s\n' "$writer_set_source_state_sha"
     printf 'writer_set_source_manifest_sha256=%s\n' "$writer_set_source_manifest_sha"
     printf 'writer_set_preimage_compose_sha256=%s\n' "$writer_set_preimage_compose_sha"
+    printf 'writer_set_quarantined=%s\n' "$writer_set_quarantined"
     printf 'pre_restored_retry=%s\n' "$pre_restored_retry"
     printf 'pre_restored_source_attempt=%s\n' "$pre_restored_source_attempt"
     printf 'pre_restored_runtime_snapshot_sha256=%s\n' "$pre_restored_runtime_snapshot"
@@ -2348,6 +2512,7 @@ runtime_restore_snapshot="none"
 estate_restore_state="none"
 writers_reactivated="not-applicable"
 uncaptured_writers_inactive="not-applicable"
+quarantined_writers_inactive="not-applicable"
 if [[ "$mode" == "restore" ]]; then
   failure_stage="quiesce_release_services"
   for service in "${application_writers[@]}"; do
@@ -2474,6 +2639,10 @@ if [[ "$mode" == "restore" ]]; then
     done
   done
   uncaptured_writers_inactive="passed"
+  if [[ "$writer_set_quarantined" == "access-governance,newapi" ]]; then
+    verify_live_quarantine_absence
+    quarantined_writers_inactive="passed"
+  fi
 else
   failure_stage="resume_exact_runtime"
   verify_live_disposition applied
@@ -2526,6 +2695,14 @@ if [[ -f "$recovery_receipt" && ! -L "$recovery_receipt" ]]; then
   completion_writer_source_state=$(holdfast_receipt_value "$recovery_receipt" writer_set_source_state_sha256 2>/dev/null || printf legacy-absent)
   completion_writer_source_manifest=$(holdfast_receipt_value "$recovery_receipt" writer_set_source_manifest_sha256 2>/dev/null || printf legacy-absent)
   completion_writer_preimage=$(holdfast_receipt_value "$recovery_receipt" writer_set_preimage_compose_sha256 2>/dev/null || printf legacy-absent)
+  completion_writer_quarantined=$(holdfast_receipt_value "$recovery_receipt" writer_set_quarantined 2>/dev/null || printf none)
+  [[ "$completion_writer_quarantined" == "$writer_set_quarantined" ]] || \
+    holdfast_die "existing completion receipt writer quarantine authority differs"
+  if [[ "$writer_set_quarantined" == "access-governance,newapi" ]]; then
+    [[ "$(holdfast_receipt_value "$recovery_receipt" quarantined_writers_inactive)" == \
+      "$quarantined_writers_inactive" && "$quarantined_writers_inactive" == "passed" ]] || \
+      holdfast_die "existing completion receipt quarantined-writer proof differs"
+  fi
   if [[ "$completion_writer_reconciled" == "legacy-absent" && \
     "$completion_writer_source_attempt" == "legacy-absent" && \
     "$completion_writer_source_failure" == "legacy-absent" && \
@@ -2582,8 +2759,10 @@ else
     printf 'writer_set_source_state_sha256=%s\n' "$writer_set_source_state_sha"
     printf 'writer_set_source_manifest_sha256=%s\n' "$writer_set_source_manifest_sha"
     printf 'writer_set_preimage_compose_sha256=%s\n' "$writer_set_preimage_compose_sha"
+    printf 'writer_set_quarantined=%s\n' "$writer_set_quarantined"
     printf 'writers_reactivated=%s\n' "$writers_reactivated"
     printf 'uncaptured_writers_inactive=%s\n' "$uncaptured_writers_inactive"
+    printf 'quarantined_writers_inactive=%s\n' "$quarantined_writers_inactive"
     printf 'runtime_verified=%s\n' "$([[ "$mode" == "resume" ]] && printf passed || printf not-applicable)"
     printf 'live_estate_disposition=%s\n' "$([[ "$mode" == "resume" ]] && printf applied || printf preimage)"
     printf 'route_state=absent\n'
@@ -2624,6 +2803,7 @@ else
   # no longer applied and no later open ceremony may treat it as active.
   armed_state_archive="$state_dir/APPLY-RECOVERY-ARMED-STATE-${attempt_id}.json"
   [[ ! -e "$armed_state_archive" && ! -L "$armed_state_archive" ]] || holdfast_die "recovery armed state archive already exists"
+  verify_live_quarantine_absence
   mv -- "$state_file" "$armed_state_archive"
   sync -f "$state_dir"
 fi

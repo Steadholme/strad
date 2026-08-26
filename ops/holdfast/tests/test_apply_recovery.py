@@ -671,6 +671,7 @@ class ApplyRecoveryTests(unittest.TestCase):
             'if [[ " $* " == *" compose "* && " $* " == *" ps -aq "* ]]; then\n'
             '  service=${!#}\n'
             '  [[ "${HOLDFAST_TEST_DOCKER_PS_FAIL_SERVICE:-}" != "$service" ]] || exit 44\n'
+            '  [[ ! -e "$HOLDFAST_TEST_LOG.removed-$service" ]] || exit 0\n'
             '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES:-} " == *" $service "* ]]; then exit 0; fi\n'
             '  after_up=""\n'
             '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then after_up=${HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES:-}; fi\n'
@@ -680,17 +681,24 @@ class ApplyRecoveryTests(unittest.TestCase):
             'fi\n'
             'if [[ " $* " == *" compose "* && " $* " == *" up -d "* ]]; then\n'
             '  rm -f "$HOLDFAST_TEST_LOG.requiesced"\n'
+            '  for service in "$@"; do rm -f "$HOLDFAST_TEST_LOG.stopped-$service"; done\n'
             '  touch "$HOLDFAST_TEST_LOG.writers-stopped"\n'
             '  exit 0\n'
             'fi\n'
             'if [[ "${1:-}" == "ps" && " $* " == *" -aq "* ]]; then\n'
             '  service=${!#}; service=${service#label=com.docker.compose.service=}\n'
             '  [[ "${HOLDFAST_TEST_DOCKER_PS_FAIL_SERVICE:-}" != "$service" ]] || exit 44\n'
+            '  [[ ! -e "$HOLDFAST_TEST_LOG.removed-$service" ]] || exit 0\n'
             '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_REMOVED_AFTER_RESTORE_SERVICES:-} " == *" $service "* ]]; then exit 0; fi\n'
             '  after_up=""\n'
             '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then after_up=${HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES:-}; fi\n'
             '  all=" ${HOLDFAST_TEST_RUNNING_SERVICES:-} ${HOLDFAST_TEST_RESTARTING_SERVICES:-} ${HOLDFAST_TEST_CREATED_SERVICES:-} $after_up "\n'
             '  [[ "$all" == *" $service "* ]] && printf "cid-%s\\n" "$service"\n'
+            '  exit 0\n'
+            'fi\n'
+            'if [[ "${1:-}" == "rm" && "${2:-}" == "-f" ]]; then\n'
+            '  shift 2\n'
+            '  for container_id in "$@"; do service=${container_id#cid-}; touch "$HOLDFAST_TEST_LOG.removed-$service"; done\n'
             '  exit 0\n'
             'fi\n'
             'if [[ "${1:-}" == "inspect" ]]; then\n'
@@ -703,6 +711,7 @@ class ApplyRecoveryTests(unittest.TestCase):
             '  if [[ -e "$HOLDFAST_TEST_LOG.requiesced" ]]; then printf "exited\\n"\n'
             '  elif [[ -e "$HOLDFAST_TEST_LOG.quiesced" && ! -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then printf "exited\\n"\n'
             '  elif [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_STOP_LEAK_SERVICES:-} " == *" $service "* ]]; then printf "running\\n"\n'
+            '  elif [[ -e "$HOLDFAST_TEST_LOG.stopped-$service" ]]; then printf "exited\\n"\n'
             '  elif [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_RUNNING_AFTER_UP_SERVICES:-} " == *" $service "* ]]; then printf "running\\n"\n'
             '  elif [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" && " ${HOLDFAST_TEST_RUNNING_SERVICES:-} " != *" $service "* ]]; then printf "exited\\n"\n'
             '  elif [[ " ${HOLDFAST_TEST_RUNNING_SERVICES:-} " == *" $service "* ]]; then printf "running\\n"\n'
@@ -711,6 +720,7 @@ class ApplyRecoveryTests(unittest.TestCase):
             '  else printf "exited\\n"; fi\n'
             'fi\n'
             'if [[ "${1:-}" == "stop" ]]; then\n'
+            '  for container_id in "${@:4}"; do service=${container_id#cid-}; touch "$HOLDFAST_TEST_LOG.stopped-$service"; done\n'
             '  if [[ -e "$HOLDFAST_TEST_LOG.writers-stopped" ]]; then touch "$HOLDFAST_TEST_LOG.requiesced"; fi\n'
             '  touch "$HOLDFAST_TEST_LOG.quiesced"\n'
             '  if [[ "${HOLDFAST_TEST_SIGKILL_ON_STOP:-0}" == "1" ]]; then kill -KILL "$PPID"; exit 137; fi\n'
@@ -765,6 +775,7 @@ class ApplyRecoveryTests(unittest.TestCase):
         env: dict[str, str] | None = None,
         backup: Path | None = None,
         legacy_empty_strad: bool = False,
+        quarantine_access_chain: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         command = [
                 "bash",
@@ -781,6 +792,8 @@ class ApplyRecoveryTests(unittest.TestCase):
             ]
         if legacy_empty_strad:
             command.append("--legacy-empty-strad")
+        if quarantine_access_chain:
+            command.append("--quarantine-access-chain")
         return subprocess.run(
             command,
             check=False,
@@ -805,6 +818,29 @@ class ApplyRecoveryTests(unittest.TestCase):
         self.assertEqual(current["recovery_failure_stage"], "restore_prior_running_writers")
         manifest = self.state / str(current["restore_running_writers_manifest"])
         self.assertEqual(manifest.read_text(encoding="utf-8").splitlines(), running.split())
+        return current
+
+    def install_activation_restore_failed_with_access_chain(
+        self,
+        *,
+        running: str = "access-governance verdict newapi rikune-analyzer strad sluice sluice-internal",
+    ) -> dict[str, object]:
+        self.install_activation_failed_state()
+        result = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES="access-governance",
+            ),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = json.loads((self.state / "CURRENT.json").read_text(encoding="utf-8"))
+        self.assertEqual(current["state"], "restore_failed")
+        self.assertEqual(current["recovery_prior_state"], "apply_activation_failed")
+        self.assertEqual(current["recovery_failure_stage"], "restore_prior_running_writers")
+        manifest = self.state / str(current["restore_running_writers_manifest"])
+        self.assertIn("access-governance", manifest.read_text(encoding="utf-8").splitlines())
+        self.assertIn("newapi", manifest.read_text(encoding="utf-8").splitlines())
         return current
 
     def test_runtime_caller_arm_without_stop_archives_state_without_runtime_restore(self) -> None:
@@ -1767,6 +1803,286 @@ class ApplyRecoveryTests(unittest.TestCase):
         self.assertFalse(list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")))
         calls = self.log.read_text(encoding="utf-8").splitlines()
         self.assertFalse(any(line.startswith("runtime-restore ") for line in calls))
+
+    def test_access_chain_quarantine_is_receipt_bound_and_removes_both_writers(
+        self,
+    ) -> None:
+        source = self.install_activation_restore_failed_with_access_chain()
+        source_attempt = str(source["recovery_attempt_id"])
+        source_manifest = self.state / str(source["restore_running_writers_manifest"])
+        source_failure = self.state / str(source["apply_failure_receipt"])
+        source_state = self.state / f"APPLY-RECOVERY-FAILED-{source_attempt}.json"
+        self.log.write_text("", encoding="utf-8")
+
+        result = self.recover(
+            "restore",
+            quarantine_access_chain=True,
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES="access-governance verdict newapi rikune-analyzer strad sluice sluice-internal",
+                HOLDFAST_TEST_UNHEALTHY_SERVICES="access-governance",
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        manifests = list(self.state.glob("RESTORE-RUNNING-WRITERS-*.txt"))
+        self.assertEqual(len(manifests), 2)
+        quarantined_manifest = next(path for path in manifests if path != source_manifest)
+        self.assertEqual(
+            quarantined_manifest.read_text(encoding="utf-8").splitlines(),
+            ["verdict", "rikune-analyzer", "strad", "sluice", "sluice-internal"],
+        )
+
+        arm = next(
+            path
+            for path in self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")
+            if f"attempt_id={source_attempt}\n" not in path.read_text(encoding="utf-8")
+        )
+        completion = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        completed_state = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.json"))
+        for path in (arm, completion):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("writer_set_quarantined=access-governance,newapi", text)
+            self.assertIn(f"writer_set_source_attempt={source_attempt}", text)
+            self.assertIn(
+                f"writer_set_source_failure_receipt_sha256={sha256(source_failure)}",
+                text,
+            )
+            self.assertIn(f"writer_set_source_state_sha256={sha256(source_state)}", text)
+            self.assertIn(
+                f"writer_set_source_manifest_sha256={sha256(source_manifest)}", text
+            )
+        completion_text = completion.read_text(encoding="utf-8")
+        self.assertIn("quarantined_writers_inactive=passed", completion_text)
+        completed = json.loads(completed_state.read_text(encoding="utf-8"))
+        self.assertEqual(
+            completed["writer_set_quarantined"], "access-governance,newapi"
+        )
+
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        up = next(line for line in calls if " up -d --no-build --wait " in line)
+        self.assertNotIn(" access-governance", up)
+        self.assertNotIn(" newapi", up)
+        self.assertTrue(any(" rm -f cid-access-governance" in line for line in calls))
+        self.assertTrue(any(" rm -f cid-newapi" in line for line in calls))
+
+    def test_access_chain_quarantine_rejects_non_retry_resume_and_schema_v1(
+        self,
+    ) -> None:
+        direct = self.recover("restore", quarantine_access_chain=True)
+        self.assertNotEqual(direct.returncode, 0)
+        self.assertIn("requires a restore-failed retry", direct.stderr)
+        self.assertFalse(list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")))
+
+        resume = self.recover("resume", quarantine_access_chain=True)
+        self.assertEqual(resume.returncode, 2)
+        self.assertIn("usage:", resume.stderr)
+
+        self.install_legacy_runtime()
+        schema_v1 = self.recover(
+            "restore",
+            legacy_empty_strad=True,
+            quarantine_access_chain=True,
+        )
+        self.assertNotEqual(schema_v1.returncode, 0)
+        self.assertIn("requires a schema-v2 runtime backup", schema_v1.stderr)
+        self.assertFalse(list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")))
+
+    def test_access_chain_quarantine_rejects_healthy_and_non_activation_sources(
+        self,
+    ) -> None:
+        source = self.install_activation_restore_failed_with_access_chain()
+        arms_before = list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt"))
+        healthy = self.recover(
+            "restore",
+            quarantine_access_chain=True,
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES="access-governance verdict newapi rikune-analyzer strad sluice sluice-internal"
+            ),
+        )
+        self.assertNotEqual(healthy.returncode, 0)
+        self.assertIn("requires failed access-governance health evidence", healthy.stderr)
+        self.assertEqual(list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")), arms_before)
+        self.assertEqual(
+            json.loads((self.state / "CURRENT.json").read_text())["recovery_attempt_id"],
+            source["recovery_attempt_id"],
+        )
+
+    def test_access_chain_quarantine_rejects_missing_source_writer(
+        self,
+    ) -> None:
+        self.install_activation_failed_state()
+        running = "access-governance verdict rikune-analyzer strad sluice sluice-internal"
+        failed = self.recover(
+            "restore",
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES="access-governance",
+            ),
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        rejected = self.recover(
+            "restore",
+            quarantine_access_chain=True,
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=running,
+                HOLDFAST_TEST_UNHEALTHY_SERVICES="access-governance",
+            ),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("source lacks both bound writers", rejected.stderr)
+
+    def test_access_chain_quarantine_rejects_non_activation_failure_source(
+        self,
+    ) -> None:
+        self.install_restore_failed_with_release_only_writer()
+        rejected = self.recover(
+            "restore",
+            quarantine_access_chain=True,
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES="access-governance verdict newapi rikune-analyzer sluice sluice-internal",
+                HOLDFAST_TEST_UNHEALTHY_SERVICES="access-governance",
+            ),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("was not an activation failure", rejected.stderr)
+
+    def test_access_chain_quarantine_failure_is_reentrant_only_with_same_flag(
+        self,
+    ) -> None:
+        source = self.install_activation_restore_failed_with_access_chain()
+        source_attempt = str(source["recovery_attempt_id"])
+        common = {
+            "HOLDFAST_TEST_RUNNING_SERVICES": "access-governance verdict newapi rikune-analyzer strad sluice sluice-internal",
+            "HOLDFAST_TEST_UNHEALTHY_SERVICES": "access-governance verdict",
+        }
+        failed = self.recover(
+            "restore",
+            quarantine_access_chain=True,
+            env=self.environment(**common),
+        )
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        failed_current = json.loads(
+            (self.state / "CURRENT.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            failed_current["writer_set_quarantined"], "access-governance,newapi"
+        )
+        self.assertEqual(failed_current["writer_set_source_attempt"], source_attempt)
+        quarantine_attempt = str(failed_current["recovery_attempt_id"])
+        quarantine_arm = self.state / str(failed_current["recovery_armed_receipt"])
+        quarantine_arm_bytes = quarantine_arm.read_bytes()
+
+        missing_flag = self.recover("restore", env=self.environment(**common))
+        self.assertNotEqual(missing_flag.returncode, 0)
+        self.assertIn("requires its explicit flag", missing_flag.stderr)
+        self.assertEqual(quarantine_arm.read_bytes(), quarantine_arm_bytes)
+        self.assertEqual(
+            json.loads((self.state / "CURRENT.json").read_text())["recovery_attempt_id"],
+            quarantine_attempt,
+        )
+
+        completed = self.recover(
+            "restore",
+            quarantine_access_chain=True,
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES=common[
+                    "HOLDFAST_TEST_RUNNING_SERVICES"
+                ],
+            ),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        receipt = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        values = dict(
+            line.split("=", 1) for line in receipt.read_text().splitlines()
+        )
+        self.assertEqual(values["writer_set_quarantined"], "access-governance,newapi")
+        self.assertEqual(values["writer_set_source_attempt"], source_attempt)
+
+    def test_access_chain_quarantine_rejects_tampered_source_state(self) -> None:
+        source = self.install_activation_restore_failed_with_access_chain()
+        source_state = self.state / (
+            f"APPLY-RECOVERY-FAILED-{source['recovery_attempt_id']}.json"
+        )
+        source_state.write_bytes(source_state.read_bytes() + b"tampered\n")
+        arms_before = list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt"))
+        rejected = self.recover(
+            "restore",
+            quarantine_access_chain=True,
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES="access-governance verdict newapi rikune-analyzer strad sluice sluice-internal",
+                HOLDFAST_TEST_UNHEALTHY_SERVICES="access-governance",
+            ),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("CURRENT differs from immutable failure state", rejected.stderr)
+        self.assertEqual(list(self.state.glob("APPLY-RECOVERY-ARMED-*.receipt")), arms_before)
+
+    def test_completed_access_chain_quarantine_revalidates_bound_evidence(self) -> None:
+        self.install_activation_restore_failed_with_access_chain()
+        common = self.environment(
+            HOLDFAST_TEST_RUNNING_SERVICES="access-governance verdict newapi rikune-analyzer strad sluice sluice-internal",
+            HOLDFAST_TEST_UNHEALTHY_SERVICES="access-governance",
+        )
+        completed = self.recover(
+            "restore", quarantine_access_chain=True, env=common
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        receipt = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        completed_state = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.json"))
+        values = dict(line.split("=", 1) for line in receipt.read_text().splitlines())
+        attempt = values["attempt_id"]
+        armed_archive = self.state / f"APPLY-RECOVERY-ARMED-STATE-{attempt}.json"
+        current = self.state / "CURRENT.json"
+        armed_archive.rename(current)
+        self.replace_receipt_value(receipt, "writer_set_quarantined", "none")
+        state = json.loads(completed_state.read_text(encoding="utf-8"))
+        state["recovery_receipt_sha256"] = sha256(receipt)
+        completed_state.write_text(json.dumps(state) + "\n", encoding="utf-8")
+
+        rejected = self.recover(
+            "restore", quarantine_access_chain=True, env=common
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("completed writer quarantine authority differs", rejected.stderr)
+        self.assertTrue(current.exists())
+
+    def test_completed_access_chain_quarantine_rejects_recreated_writer(
+        self,
+    ) -> None:
+        self.install_activation_restore_failed_with_access_chain()
+        common = self.environment(
+            HOLDFAST_TEST_RUNNING_SERVICES="access-governance verdict newapi rikune-analyzer strad sluice sluice-internal",
+            HOLDFAST_TEST_UNHEALTHY_SERVICES="access-governance",
+        )
+        completed = self.recover(
+            "restore", quarantine_access_chain=True, env=common
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        receipt = next(self.state.glob("APPLY-RECOVERY-COMPLETE-*.receipt"))
+        values = dict(line.split("=", 1) for line in receipt.read_text().splitlines())
+        attempt = values["attempt_id"]
+        armed_archive = self.state / f"APPLY-RECOVERY-ARMED-STATE-{attempt}.json"
+        current = self.state / "CURRENT.json"
+        armed_archive.rename(current)
+        current_bytes = current.read_bytes()
+        for service in ("access-governance", "newapi"):
+            (Path(f"{self.log}.removed-{service}")).unlink()
+
+        rejected = self.recover(
+            "restore",
+            quarantine_access_chain=True,
+            env=self.environment(
+                HOLDFAST_TEST_RUNNING_SERVICES="access-governance newapi"
+            ),
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(
+            "quarantined writer container exists at completion: access-governance",
+            rejected.stderr,
+        )
+        self.assertEqual(current.read_bytes(), current_bytes)
+        self.assertFalse(
+            (self.state / f"APPLY-RECOVERY-FINALIZED-STATE-{attempt}.json").exists()
+        )
 
     def test_restore_reactivation_health_failure_keeps_restore_failed_state(self) -> None:
         result = self.recover(

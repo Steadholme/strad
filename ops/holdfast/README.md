@@ -143,6 +143,16 @@ ROUTES_DATABASE_URL='supplied by route authority' ./apply-recover.sh --execute -
   --estate-root /root/w33d_infra
 ```
 
+If an earlier restore reached `restore_prior_running_writers` but the Access database has already
+advanced beyond the estate preimage, a retry may add `--quarantine-access-chain`. This is a narrow,
+fail-closed exception: it requires a schema-v2 activation-failure receipt, closed ingress, an
+unhealthy or non-running `access-governance` container, and both `access-governance` and `newapi`
+in the signed source writer set and preimage Compose. The retry restores every other prior writer,
+removes both quarantined containers, and binds the exclusion and inactive proof into the recovery
+arm, failure, completion, and state records. The same flag is mandatory after a crash. This mode
+does not roll back the shared Access database or start either quarantined service; follow it
+immediately with a separately verified release apply while ingress remains closed.
+
 The one historical schema-v1 backup may be adopted only with `--legacy-empty-strad`. That path
 first proves the literal `strad` database has zero connections, public tables, and non-system user
 relations, restores only the six absent volume dispositions, and deliberately ignores the old
