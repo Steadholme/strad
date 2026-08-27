@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --candidate-root PATH --image-tag REGISTRY/REPO:TAG --release-tool-revision COMMIT --metadata-file NEW_FILE --receipt NEW_FILE" >&2
+  echo "usage: $0 --candidate-root PATH --image-tag REGISTRY/REPO:TAG --builder-id HTTPS_URI --release-tool-revision COMMIT --metadata-file NEW_FILE --receipt NEW_FILE" >&2
   exit 2
 }
 
@@ -42,6 +42,7 @@ cleanup_snapshot() {
 
 candidate_root=""
 image_tag=""
+builder_id=""
 release_tool_revision=""
 metadata_file=""
 receipt=""
@@ -49,18 +50,23 @@ while (($#)); do
   case "$1" in
     --candidate-root) [[ $# -ge 2 ]] || usage; candidate_root=$2; shift 2 ;;
     --image-tag) [[ $# -ge 2 ]] || usage; image_tag=$2; shift 2 ;;
+    --builder-id) [[ $# -ge 2 ]] || usage; builder_id=$2; shift 2 ;;
     --release-tool-revision) [[ $# -ge 2 ]] || usage; release_tool_revision=$2; shift 2 ;;
     --metadata-file) [[ $# -ge 2 ]] || usage; metadata_file=$2; shift 2 ;;
     --receipt) [[ $# -ge 2 ]] || usage; receipt=$2; shift 2 ;;
     *) usage ;;
   esac
 done
-[[ -n "$candidate_root" && -n "$image_tag" && -n "$release_tool_revision" && -n "$metadata_file" && -n "$receipt" ]] || usage
+[[ -n "$candidate_root" && -n "$image_tag" && -n "$builder_id" && -n "$release_tool_revision" && -n "$metadata_file" && -n "$receipt" ]] || usage
 for path in "$candidate_root" "$metadata_file" "$receipt"; do
   [[ "$path" = /* && "$path" != "/" ]] || usage
 done
 [[ "$release_tool_revision" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$image_tag" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+:[A-Za-z0-9._-]+$ && "$image_tag" != *@sha256:* ]] || usage
+[[ "$builder_id" =~ ^https://[^[:space:]]+$ ]] || {
+  echo "builder identity must be a stable HTTPS URI" >&2
+  exit 1
+}
 [[ ! -e "$metadata_file" && ! -L "$metadata_file" && ! -e "$receipt" && ! -L "$receipt" ]] || {
   echo "metadata and receipt outputs must be new paths" >&2
   exit 1
@@ -201,7 +207,7 @@ expected_build_input=$(jq -r '.access_governance_build_input_sha256' "$evidence"
 docker buildx build \
   --file "$candidate_access/Dockerfile" \
   --platform linux/amd64 \
-  --provenance=mode=max \
+  --provenance="mode=max,builder-id=$builder_id" \
   --sbom=true \
   --metadata-file "$metadata_file" \
   --tag "$image_tag" \
@@ -210,6 +216,15 @@ docker buildx build \
 image_digest=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$metadata_file")
 image_ref="${image_tag%:*}@${image_digest}"
 docker buildx imagetools inspect "$image_ref" >/dev/null
+observed_builder_id=$(
+  docker buildx imagetools inspect "$image_ref" \
+    --format '{{json .Provenance.SLSA.runDetails.builder.id}}' |
+    jq -er 'select(type == "string" and length >= 8)'
+)
+[[ "$observed_builder_id" == "$builder_id" ]] || {
+  echo "registry provenance builder identity differs from the requested builder" >&2
+  exit 1
+}
 
 umask 077
 set -o noclobber
@@ -225,6 +240,7 @@ set -o noclobber
   printf 'metadata_sha256=%s\n' "$(sha256sum "$metadata_file" | cut -d' ' -f1)"
   printf 'holdfast_release_tool_revision=%s\n' "$release_tool_revision"
   printf 'provenance=mode.max\n'
+  printf 'provenance_builder_id=%s\n' "$observed_builder_id"
   printf 'sbom=enabled\n'
 } >"$receipt"
 chmod 0600 "$metadata_file" "$receipt"

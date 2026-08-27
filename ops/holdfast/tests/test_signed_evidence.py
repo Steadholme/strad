@@ -406,6 +406,35 @@ class SignedEvidenceTests(unittest.TestCase):
         ).hexdigest()
         return release, evidence, policy
 
+    def use_keyed_cosign(self, evidence: dict[str, object]) -> None:
+        public_key_sha256 = sha256(self.public_key)
+        registry = evidence["registry_verification"]
+        assert isinstance(registry, dict)
+        images = registry["images"]
+        assert isinstance(images, dict)
+        for image in images.values():
+            assert isinstance(image, dict)
+            signature = image["signature"]
+            assert isinstance(signature, dict)
+            image["signature"] = {
+                "mode": "key",
+                "public_key_sha256": public_key_sha256,
+                "rekor_log_index": signature["rekor_log_index"],
+            }
+        waivers = evidence["waivers"]
+        assert isinstance(waivers, list)
+        for waiver in waivers:
+            assert isinstance(waiver, dict)
+            compensating = waiver["compensating_attestation"]
+            assert isinstance(compensating, dict)
+            waiver["compensating_attestation"] = {
+                "uri": compensating["uri"],
+                "sha256": compensating["sha256"],
+                "mode": "key",
+                "public_key_sha256": public_key_sha256,
+                "rekor_log_index": compensating["rekor_log_index"],
+            }
+
     def test_supply_chain_requires_signature_registry_materials_and_access_build_input(self) -> None:
         release, evidence_value = self.make_supply_fixture()
         valid = self.run_supply_fixture(release, evidence_value, "v1-valid")
@@ -554,6 +583,146 @@ class SignedEvidenceTests(unittest.TestCase):
                 self.assertNotEqual(
                     invalid.returncode, 0, invalid.stdout + invalid.stderr
                 )
+
+    def test_supply_chain_v3_accepts_exact_keyed_cosign_material(self) -> None:
+        release, evidence, _ = self.make_supply_v3_fixture()
+        self.use_keyed_cosign(evidence)
+        valid = self.run_supply_fixture(
+            release,
+            evidence,
+            "v3-keyed-cosign",
+            successor_policy=OPS_ROOT / "successor-policy.json",
+        )
+        self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+
+    def test_supply_chain_v3_rejects_malformed_keyed_cosign_material(self) -> None:
+        release, evidence, _ = self.make_supply_v3_fixture()
+        self.use_keyed_cosign(evidence)
+        policy_path = OPS_ROOT / "successor-policy.json"
+        cases: list[tuple[str, dict[str, object], str]] = []
+
+        registry_missing_hash = json.loads(json.dumps(evidence))
+        registry_signature = registry_missing_hash["registry_verification"]["images"][
+            "ACCESS_GOVERNANCE_IMAGE"
+        ]["signature"]
+        del registry_signature["public_key_sha256"]
+        cases.append(("registry-missing-hash", registry_missing_hash, "field set is not exact"))
+
+        registry_invalid_hash = json.loads(json.dumps(evidence))
+        registry_invalid_hash["registry_verification"]["images"][
+            "ACCESS_GOVERNANCE_IMAGE"
+        ]["signature"]["public_key_sha256"] = "A" * 64
+        cases.append(
+            (
+                "registry-invalid-hash",
+                registry_invalid_hash,
+                "must be lowercase SHA-256",
+            )
+        )
+
+        registry_mixed = json.loads(json.dumps(evidence))
+        registry_mixed["registry_verification"]["images"][
+            "ACCESS_GOVERNANCE_IMAGE"
+        ]["signature"]["issuer"] = "https://issuer.example"
+        cases.append(("registry-mixed-fields", registry_mixed, "field set is not exact"))
+
+        registry_fake_issuer = json.loads(json.dumps(evidence))
+        registry_signature = registry_fake_issuer["registry_verification"]["images"][
+            "ACCESS_GOVERNANCE_IMAGE"
+        ]["signature"]
+        del registry_signature["public_key_sha256"]
+        registry_signature["issuer"] = "sha256:" + "a" * 64
+        cases.append(
+            (
+                "registry-issuer-is-not-key-mode",
+                registry_fake_issuer,
+                "field set is not exact",
+            )
+        )
+
+        registry_wrong_mode = json.loads(json.dumps(evidence))
+        registry_wrong_mode["registry_verification"]["images"][
+            "ACCESS_GOVERNANCE_IMAGE"
+        ]["signature"]["mode"] = "keyless"
+        cases.append(("registry-wrong-mode", registry_wrong_mode, "mode must be key"))
+
+        registry_negative_index = json.loads(json.dumps(evidence))
+        registry_negative_index["registry_verification"]["images"][
+            "ACCESS_GOVERNANCE_IMAGE"
+        ]["signature"]["rekor_log_index"] = -1
+        cases.append(
+            (
+                "registry-negative-log-index",
+                registry_negative_index,
+                "transparency-log binding is invalid",
+            )
+        )
+
+        waiver_missing_hash = json.loads(json.dumps(evidence))
+        compensating = waiver_missing_hash["waivers"][0]["compensating_attestation"]
+        del compensating["public_key_sha256"]
+        cases.append(("waiver-missing-hash", waiver_missing_hash, "field set is not exact"))
+
+        waiver_invalid_hash = json.loads(json.dumps(evidence))
+        waiver_invalid_hash["waivers"][0]["compensating_attestation"][
+            "public_key_sha256"
+        ] = "not-a-sha256"
+        cases.append(
+            (
+                "waiver-invalid-hash",
+                waiver_invalid_hash,
+                "must be lowercase SHA-256",
+            )
+        )
+
+        waiver_mixed = json.loads(json.dumps(evidence))
+        waiver_mixed["waivers"][0]["compensating_attestation"][
+            "identity"
+        ] = "release@example.invalid"
+        cases.append(("waiver-mixed-fields", waiver_mixed, "field set is not exact"))
+
+        waiver_fake_issuer = json.loads(json.dumps(evidence))
+        compensating = waiver_fake_issuer["waivers"][0]["compensating_attestation"]
+        del compensating["public_key_sha256"]
+        compensating["issuer"] = "sha256:" + "b" * 64
+        cases.append(
+            (
+                "waiver-issuer-is-not-key-mode",
+                waiver_fake_issuer,
+                "field set is not exact",
+            )
+        )
+
+        waiver_wrong_mode = json.loads(json.dumps(evidence))
+        waiver_wrong_mode["waivers"][0]["compensating_attestation"][
+            "mode"
+        ] = "keyless"
+        cases.append(("waiver-wrong-mode", waiver_wrong_mode, "mode must be key"))
+
+        waiver_negative_index = json.loads(json.dumps(evidence))
+        waiver_negative_index["waivers"][0]["compensating_attestation"][
+            "rekor_log_index"
+        ] = -1
+        cases.append(
+            (
+                "waiver-negative-log-index",
+                waiver_negative_index,
+                "transparency-log binding is invalid",
+            )
+        )
+
+        for label, candidate, error in cases:
+            with self.subTest(label=label):
+                invalid = self.run_supply_fixture(
+                    release,
+                    candidate,
+                    f"v3-keyed-{label}",
+                    successor_policy=policy_path,
+                )
+                self.assertNotEqual(
+                    invalid.returncode, 0, invalid.stdout + invalid.stderr
+                )
+                self.assertIn(error, invalid.stderr)
 
     def test_supply_chain_v3_binds_successor_without_claiming_strad_as_access_source(
         self,

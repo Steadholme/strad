@@ -50,6 +50,8 @@ WAIVER_POLICY = {
     ("NEWAPI_IMAGE", "provenance.builder_id"): "legacy-builder-id-unavailable",
     ("SLUICE_IMAGE", "provenance.builder_id"): "legacy-builder-id-unavailable",
 }
+COSIGN_KEYLESS_FIELDS = {"identity", "issuer", "rekor_log_index"}
+COSIGN_KEY_FIELDS = {"mode", "public_key_sha256", "rekor_log_index"}
 
 
 def fail(message: str) -> NoReturn:
@@ -181,8 +183,38 @@ def require_utc_timestamp(value: object, label: str) -> datetime:
     return parsed
 
 
+def cosign_signature(
+    value: object,
+    label: str,
+    schema_version: int,
+    additional_fields: set[str] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    common_fields = additional_fields or set()
+    keyed_fields = common_fields | COSIGN_KEY_FIELDS
+    if (
+        schema_version == 3
+        and isinstance(value, dict)
+        and set(value) == keyed_fields
+    ):
+        signature = exact_keys(value, keyed_fields, label)
+        if signature["mode"] != "key":
+            fail(f"{label} mode must be key")
+        require_hex(signature["public_key_sha256"], f"{label} public key")
+        return signature, True
+    return exact_keys(value, common_fields | COSIGN_KEYLESS_FIELDS, label), False
+
+
+def valid_rekor_log_index(value: object, schema_version: int) -> bool:
+    if schema_version == 3:
+        return type(value) is int and value >= 0
+    return isinstance(value, int) and value >= 0
+
+
 def validate_waivers(
-    value: object, release: dict[str, str], now: datetime
+    value: object,
+    release: dict[str, str],
+    now: datetime,
+    schema_version: int = 2,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     if not isinstance(value, list):
         fail("waivers must be an array")
@@ -197,13 +229,6 @@ def validate_waivers(
         "issued_at",
         "expires_at",
         "compensating_attestation",
-    }
-    compensating_fields = {
-        "uri",
-        "sha256",
-        "identity",
-        "issuer",
-        "rekor_log_index",
     }
     result: dict[tuple[str, str], dict[str, Any]] = {}
     for index, raw in enumerate(value):
@@ -246,10 +271,11 @@ def validate_waivers(
             fail(f"waiver issuance is in the future for {image_key}")
         if expires_at <= now:
             fail(f"waiver is expired for {image_key}")
-        compensating = exact_keys(
+        compensating, keyed = cosign_signature(
             waiver["compensating_attestation"],
-            compensating_fields,
             f"waiver compensating attestation for {image_key}",
+            schema_version,
+            {"uri", "sha256"},
         )
         require_uri(
             compensating["uri"], f"waiver compensating attestation for {image_key}"
@@ -258,15 +284,12 @@ def validate_waivers(
             compensating["sha256"],
             f"waiver compensating attestation for {image_key}",
         )
-        if not all(
+        if not keyed and not all(
             isinstance(compensating[name], str) and compensating[name]
             for name in ("identity", "issuer")
         ):
             fail(f"waiver compensating signature is incomplete for {image_key}")
-        if (
-            not isinstance(compensating["rekor_log_index"], int)
-            or compensating["rekor_log_index"] < 0
-        ):
+        if not valid_rekor_log_index(compensating["rekor_log_index"], schema_version):
             fail(f"waiver compensating transparency-log binding is invalid for {image_key}")
         result[policy_key] = waiver
     return result
@@ -304,7 +327,9 @@ def validate_document(
     if not isinstance(value["issued_at"], str) or not value["issued_at"].endswith("Z"):
         fail("issued_at must be an immutable UTC timestamp")
     waivers = (
-        validate_waivers(value["waivers"], release, datetime.now(timezone.utc))
+        validate_waivers(
+            value["waivers"], release, datetime.now(timezone.utc), schema_version
+        )
         if schema_version in (2, 3)
         else {}
     )
@@ -403,12 +428,15 @@ def validate_document(
                 provenance["builder_id"]
             ) < 8:
                 fail(f"{key} builder identity is absent")
-        signature = exact_keys(
-            item["signature"], {"identity", "issuer", "rekor_log_index"}, f"{key} signature"
+        signature, keyed = cosign_signature(
+            item["signature"], f"{key} signature", schema_version
         )
-        if not all(isinstance(signature[name], str) and signature[name] for name in ("identity", "issuer")):
+        if not keyed and not all(
+            isinstance(signature[name], str) and signature[name]
+            for name in ("identity", "issuer")
+        ):
             fail(f"{key} signature identity is incomplete")
-        if not isinstance(signature["rekor_log_index"], int) or signature["rekor_log_index"] < 0:
+        if not valid_rekor_log_index(signature["rekor_log_index"], schema_version):
             fail(f"{key} transparency-log binding is invalid")
 
     if set(waivers) != consumed_waivers:

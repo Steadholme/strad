@@ -46,6 +46,8 @@ but binds the Access candidate to `access-build-input/2` and the independent
 `HOLDFAST_RELEASE_TOOL_REVISION`. It embeds the exact immediate predecessor authority and requires
 `ACCESS_GOVERNANCE_ROLLBACK_IMAGE` to be that predecessor image. A schema-v3 document requires the
 canonical `successor-policy.json`; it cannot be verified as schema v1/v2 or skip a generation.
+Schema v3 records keyless Cosign signatures as `identity` plus `issuer`, and key-based signatures as
+`mode=key` plus `public_key_sha256`; a key-based signature must not invent a Fulcio issuer.
 
 Keep `STRAD_DATABASE_URL`, bridge/file-server/NewAPI tokens, and all existing gateway/Verdict
 secrets in a separate mode-`0600` secret env. Evidence files contain only identities and hashes.
@@ -73,13 +75,15 @@ build and push from that immutable tree:
 ./build-access-candidate.sh \
   --candidate-root /secure/release/holdfast-successor-<release-id>/rikune-candidate-source \
   --image-tag registry.w33d.xyz/steadholme/access-governance:<release-id> \
+  --builder-id https://w33d.xyz/holdfast/builders/<stable-builder-id> \
   --release-tool-revision <clean-strad-head-commit> \
   --metadata-file /secure/release/holdfast-successor-<release-id>/access-build.metadata.json \
   --receipt /secure/release/holdfast-successor-<release-id>/ACCESS-BUILD.receipt
 ```
 
-The build always pushes `linux/amd64` with BuildKit `mode=max` provenance and SBOM, then records
-the immutable digest. Real registry attestation, image-signature, signer/issuer, and
+The build always pushes `linux/amd64` with BuildKit `mode=max` provenance, a required stable HTTPS
+builder identity, and SBOM, then records the immutable digest. Real registry attestation,
+image-signature, signer/issuer, and
 transparency-log evidence must be collected into schema-v3 `SUPPLY-CHAIN.json` and detached-signed
 off host before the full dry-run. The script does not invent or locally sign that evidence.
 
