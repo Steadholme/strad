@@ -21,6 +21,8 @@ from render_input_binding import (
     write_binding,
 )
 from successor_binding import (
+    MAX_SUCCESSOR_OVERLAY_PATHS,
+    POLICY_CEREMONIES,
     SUCCESSOR_STATIC_ASSET_SOURCES,
     validate_predecessor,
     validate_static_asset_transition,
@@ -432,12 +434,37 @@ def copy_successor_stage(
         stage_root / "access-governance",
     )
     overlay = policy.get("overlay")
-    if not isinstance(overlay, list) or len(overlay) != 7:
+    policy_version = policy.get("schema_version", 1)
+    if (
+        type(policy_version) is not int
+        or policy_version not in POLICY_CEREMONIES
+        or (
+            "schema_version" in policy
+            and policy.get("ceremony") != POLICY_CEREMONIES[policy_version]
+        )
+        or not isinstance(overlay, list)
+        or (policy_version == 1 and len(overlay) != 7)
+        or (
+            policy_version == 2
+            and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
+        )
+    ):
         fail("successor overlay contract is absent")
+    overlay_paths: list[str] = []
     for raw in overlay:
         if not isinstance(raw, dict) or not isinstance(raw.get("path"), str):
             fail("successor overlay entry is malformed")
         relative = raw["path"]
+        if (
+            not re.fullmatch(r"[A-Za-z0-9._/-]+", relative)
+            or not relative.startswith("access-governance/")
+            or len(Path(relative).parts) < 2
+            or ".." in Path(relative).parts
+            or Path(relative).as_posix() != relative
+            or relative in overlay_paths
+        ):
+            fail("successor overlay path is invalid")
+        overlay_paths.append(relative)
         source = estate_root / relative
         destination = stage_root / relative
         require_regular(source)
@@ -447,11 +474,18 @@ def copy_successor_stage(
         shutil.copy2(source, destination)
         if sha256_file(destination) != raw.get("after_sha256"):
             fail(f"successor overlay copy differs: {relative}")
+    if policy_version == 2 and overlay_paths != sorted(overlay_paths):
+        fail("successor overlay path order differs")
 
     static_asset_sources = validate_static_asset_transition(
-        preimages, static_targets, authority_root
+        preimages, static_targets, authority_root, policy_version
     )
-    if tuple(static_asset_sources.items()) != SUCCESSOR_STATIC_ASSET_SOURCES:
+    expected_static_asset_sources = tuple(
+        (relative, source_relative)
+        for relative, source_relative in SUCCESSOR_STATIC_ASSET_SOURCES
+        if preimages[relative] != static_targets[relative]
+    )
+    if tuple(static_asset_sources.items()) != expected_static_asset_sources:
         fail("successor static asset source order differs")
     for relative, source_relative in static_asset_sources.items():
         source = authority_root / source_relative

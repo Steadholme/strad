@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the exact predecessor and TASK-001 delta for a Holdfast successor."""
+"""Validate the exact predecessor and policy delta for a Holdfast successor."""
 
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from render_input_binding import (
+    ACCESS_BUILD_INPUT_SCHEMA_V1,
+    ACCESS_BUILD_INPUT_SCHEMA_V2,
     FROZEN_STATIC_PATHS,
-    access_build_input_sha,
+    access_build_input_sha_for_schema,
     access_tree_build_input_sha_v2,
 )
 
@@ -24,9 +26,14 @@ from render_input_binding import (
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 IMAGE = re.compile(r"^[^\s:@]+(?:/[^\s:@]+)+@sha256:[0-9a-f]{64}$")
 SAFE_RELATIVE = re.compile(r"^[A-Za-z0-9._/-]+$")
-POLICY_CEREMONY = "holdfast-rikune-successor-v1"
-BUILD_INPUT_V1 = "access-build-input/1"
-BUILD_INPUT_V2 = "access-build-input/2"
+POLICY_CEREMONIES = {
+    1: "holdfast-rikune-successor-v1",
+    2: "holdfast-rikune-successor-v2",
+}
+POLICY_CEREMONY = POLICY_CEREMONIES[1]
+BUILD_INPUT_V1 = ACCESS_BUILD_INPUT_SCHEMA_V1
+BUILD_INPUT_V2 = ACCESS_BUILD_INPUT_SCHEMA_V2
+MAX_SUCCESSOR_OVERLAY_PATHS = 64
 IGNORED_DIRECTORIES = frozenset({".git", ".workflow", "target", "__pycache__"})
 SUPPORTING_RELAY_PATHS = frozenset(
     {
@@ -129,6 +136,7 @@ def safe_relative(value: object, label: str) -> str:
         or not SAFE_RELATIVE.fullmatch(value)
         or value.startswith("/")
         or ".." in Path(value).parts
+        or Path(value).as_posix() != value
     ):
         fail(f"{label} is not a safe relative path")
     return value
@@ -145,6 +153,7 @@ def parse_checksum_manifest(path: Path) -> dict[str, str]:
             not match
             or match.group(2).startswith("/")
             or ".." in Path(match.group(2)).parts
+            or Path(match.group(2)).as_posix() != match.group(2)
             or match.group(2) in result
         ):
             fail(f"invalid checksum manifest line {line_number}: {path}")
@@ -166,6 +175,7 @@ def parse_path_manifest(path: Path) -> set[str]:
             not SAFE_RELATIVE.fullmatch(relative)
             or relative.startswith("/")
             or ".." in Path(relative).parts
+            or Path(relative).as_posix() != relative
             or relative in result
         ):
             fail(f"invalid or duplicate absent path line {line_number}: {path}")
@@ -177,6 +187,7 @@ def validate_static_asset_transition(
     preimages: dict[str, str],
     static_targets: dict[str, str],
     authority_root: Path,
+    policy_version: int = 1,
 ) -> dict[str, str]:
     expected_paths = set(FROZEN_STATIC_PATHS)
     if not expected_paths.issubset(preimages) or set(static_targets) != expected_paths:
@@ -189,10 +200,21 @@ def validate_static_asset_transition(
         for relative in FROZEN_STATIC_PATHS
         if preimages[relative] != static_targets[relative]
     }
-    if changed_paths != set(sources):
+    if policy_version == 1:
+        valid_transition = changed_paths == set(sources)
+    elif policy_version == 2:
+        valid_transition = changed_paths.issubset(sources)
+    else:
+        valid_transition = False
+    if not valid_transition:
         fail("successor static asset transition path set is not exact")
     root = require_directory(authority_root)
-    for relative, source_relative in sources.items():
+    changed_sources = {
+        relative: source_relative
+        for relative, source_relative in SUCCESSOR_STATIC_ASSET_SOURCES
+        if relative in changed_paths
+    }
+    for relative, source_relative in changed_sources.items():
         safe_relative(relative, "successor static asset target")
         safe_relative(source_relative, "successor static asset source")
         source = require_regular(root / source_relative)
@@ -200,7 +222,7 @@ def validate_static_asset_transition(
             fail(f"successor static asset source escapes authority: {relative}")
         if sha256(source) != static_targets[relative]:
             fail(f"successor static asset source differs: {relative}")
-    return sources
+    return changed_sources
 
 
 def verify_checksum_manifest(root: Path, manifest: Path) -> None:
@@ -239,10 +261,11 @@ def validate_policy(path: Path) -> dict[str, Any]:
         {"schema_version", "ceremony", "predecessor", "successor", "overlay"},
         "successor policy",
     )
+    policy_version = policy["schema_version"]
     if (
-        type(policy["schema_version"]) is not int
-        or policy["schema_version"] != 1
-        or policy["ceremony"] != POLICY_CEREMONY
+        type(policy_version) is not int
+        or policy_version not in POLICY_CEREMONIES
+        or policy["ceremony"] != POLICY_CEREMONIES[policy_version]
     ):
         fail("successor policy version or ceremony differs")
     predecessor = exact_object(
@@ -276,8 +299,16 @@ def validate_policy(path: Path) -> dict[str, Any]:
         "package_catalog_sha256",
     ):
         require_hex(predecessor[key], f"predecessor {key}")
-    if predecessor["access_build_input_schema"] != BUILD_INPUT_V1:
+    if predecessor["access_build_input_schema"] not in {
+        BUILD_INPUT_V1,
+        BUILD_INPUT_V2,
+    }:
         fail("predecessor build-input schema differs")
+    if (
+        policy_version == 1
+        and predecessor["access_build_input_schema"] != BUILD_INPUT_V1
+    ):
+        fail("legacy successor policy cannot bind a v2 predecessor")
     if not isinstance(predecessor["access_image"], str) or not IMAGE.fullmatch(
         predecessor["access_image"]
     ):
@@ -326,9 +357,15 @@ def validate_policy(path: Path) -> dict[str, Any]:
         if successor[key] != expected:
             fail(f"successor {key} differs from the canonical authority")
     overlay = policy["overlay"]
-    if not isinstance(overlay, list) or len(overlay) != 7:
-        fail("successor overlay must contain exactly seven paths")
+    if not isinstance(overlay, list) or (
+        policy_version == 1 and len(overlay) != 7
+    ) or (
+        policy_version == 2
+        and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
+    ):
+        fail("successor overlay size differs from its policy version")
     seen: set[str] = set()
+    paths: list[str] = []
     for index, item in enumerate(overlay):
         entry = exact_object(
             item,
@@ -336,12 +373,19 @@ def validate_policy(path: Path) -> dict[str, Any]:
             f"overlay {index}",
         )
         relative = safe_relative(entry["path"], f"overlay {index} path")
-        if not relative.startswith("access-governance/") or relative in seen:
+        if (
+            not relative.startswith("access-governance/")
+            or len(Path(relative).parts) < 2
+            or relative in seen
+        ):
             fail("successor overlay path is duplicate or outside Access")
         seen.add(relative)
+        paths.append(relative)
         if entry["before_sha256"] is not None:
             require_hex(entry["before_sha256"], f"overlay {relative} before")
         require_hex(entry["after_sha256"], f"overlay {relative} after")
+    if policy_version == 2 and paths != sorted(paths):
+        fail("successor overlay paths must be sorted")
     return policy
 
 
@@ -399,7 +443,7 @@ def validate_source_delta(
     }
     if observed_delta != set(overlay):
         unexpected = sorted(observed_delta ^ set(overlay))
-        fail(f"live Access delta differs from the exact TASK-001 overlay: {unexpected}")
+        fail(f"live Access delta differs from the exact policy overlay: {unexpected}")
     for relative, item in overlay.items():
         before_path = before.get(relative)
         expected_before = item["before_sha256"]
@@ -410,6 +454,86 @@ def validate_source_delta(
             fail(f"overlay predecessor hash differs: {relative}")
         if relative not in after or sha256(after[relative]) != item["after_sha256"]:
             fail(f"overlay successor hash differs: {relative}")
+
+
+def validate_predecessor_access_identity(
+    candidate_root: Path,
+    stage_root: Path,
+    predecessor: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    candidate = require_directory(candidate_root)
+    stage = require_directory(stage_root, private=True)
+    schema = predecessor.get("access_build_input_schema")
+    expected = require_hex(
+        predecessor.get("access_build_input_sha256"),
+        "predecessor build input",
+    )
+    observed = access_build_input_sha_for_schema(candidate, schema)
+    if observed != expected:
+        fail("sealed predecessor Access build input differs")
+
+    expected_evidence_schema = 1 if schema == BUILD_INPUT_V1 else 2
+    evidence_values: list[dict[str, Any]] = []
+    for label, root in (("candidate", candidate), ("stage", stage)):
+        evidence = load_json(root / "RELEASE-EVIDENCE.json")
+        if (
+            type(evidence.get("schema_version")) is not int
+            or evidence.get("schema_version") != expected_evidence_schema
+            or evidence.get("access_governance_build_input_sha256") != expected
+        ):
+            fail(f"predecessor {label} build-input evidence differs")
+        evidence_schema = evidence.get("access_governance_build_input_schema")
+        if (
+            schema == BUILD_INPUT_V1
+            and evidence_schema not in (None, BUILD_INPUT_V1)
+        ) or (schema == BUILD_INPUT_V2 and evidence_schema != BUILD_INPUT_V2):
+            fail(f"predecessor {label} build-input schema evidence differs")
+        evidence_values.append(evidence)
+    return evidence_values[0], evidence_values[1]
+
+
+def validate_predecessor_generation(
+    state: dict[str, Any], build_input_schema: object
+) -> int:
+    if build_input_schema == BUILD_INPUT_V1:
+        release_generation = state.get("release_generation", 1)
+        if (
+            type(release_generation) is not int
+            or release_generation != 1
+            or state.get("successor") not in (None, False)
+        ):
+            fail("legacy predecessor generation authority differs")
+        return release_generation
+    if build_input_schema != BUILD_INPUT_V2:
+        fail("predecessor build-input schema differs")
+    release_generation = state.get("release_generation")
+    previous_generation = state.get("predecessor_release_generation")
+    if (
+        state.get("successor") is not True
+        or type(release_generation) is not int
+        or type(previous_generation) is not int
+        or release_generation < 2
+        or previous_generation < 1
+        or release_generation != previous_generation + 1
+    ):
+        fail("successor predecessor generation authority differs")
+    return release_generation
+
+
+def validate_overlay_static_separation(
+    policy: dict[str, Any],
+    preimages: dict[str, str],
+    static_targets: dict[str, str],
+) -> None:
+    changed_static_paths = {
+        relative
+        for relative in FROZEN_STATIC_PATHS
+        if preimages[relative] != static_targets[relative]
+    }
+    overlay_paths = {item["path"] for item in policy["overlay"]}
+    overlap = sorted(changed_static_paths & overlay_paths)
+    if overlap:
+        fail(f"successor overlay overlaps a changed static target: {overlap}")
 
 
 def validate_predecessor(
@@ -443,7 +567,10 @@ def validate_predecessor(
     )
     if set(static_targets) != set(FROZEN_STATIC_PATHS):
         fail("successor static target path set is not exact")
-    validate_static_asset_transition(preimages, static_targets, authority_root)
+    validate_static_asset_transition(
+        preimages, static_targets, authority_root, policy["schema_version"]
+    )
+    validate_overlay_static_separation(policy, preimages, static_targets)
     supporting_targets = parse_checksum_manifest(
         authority_root / successor["supporting_targets_manifest"]
     )
@@ -474,6 +601,9 @@ def validate_predecessor(
         or state.get("runtime_verified") is not True
     ):
         fail("CURRENT is not a verified applied_ingress_closed predecessor")
+    validate_predecessor_generation(
+        state, predecessor["access_build_input_schema"]
+    )
     estate = require_directory(estate_root)
     if Path(str(state.get("estate_root"))).resolve() != estate:
         fail("CURRENT estate root differs")
@@ -516,10 +646,10 @@ def validate_predecessor(
         "release_evidence_sha256"
     ]:
         fail("sealed predecessor stage differs from live release evidence")
-    if access_build_input_sha(candidate) != predecessor["access_build_input_sha256"]:
-        fail("sealed predecessor Access build input differs")
+    _, release_evidence = validate_predecessor_access_identity(
+        candidate, stage, predecessor
+    )
     validate_supporting_snapshot(candidate, supporting_targets)
-    release_evidence = load_json(stage / "RELEASE-EVIDENCE.json")
     release = release_evidence.get("release")
     if not isinstance(release, dict):
         fail("predecessor release evidence lacks release pins")

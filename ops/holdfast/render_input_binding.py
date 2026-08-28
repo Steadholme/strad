@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -17,6 +18,26 @@ from typing import Any, NoReturn
 
 LINE = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9._-]+)$")
 STATIC_LINE = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9._/-]+)$")
+ACCESS_BUILD_INPUT_SCHEMA_V1 = "access-build-input/1"
+ACCESS_BUILD_INPUT_SCHEMA_V2 = "access-build-input/2"
+MAX_SUCCESSOR_OVERLAY_PATHS = 64
+SUCCESSOR_POLICY_CEREMONIES = {
+    1: "holdfast-rikune-successor-v1",
+    2: "holdfast-rikune-successor-v2",
+}
+SECURE_DESCRIPTOR_TRAVERSAL_SUPPORTED = (
+    all(
+        hasattr(os, name)
+        for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+    )
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.listdir in os.supports_fd
+)
+SECURE_FILE_LEASES_SUPPORTED = all(
+    hasattr(fcntl, name)
+    for name in ("F_GETLEASE", "F_SETLEASE", "F_RDLCK")
+)
 BOUND_INPUTS = (
     "static-targets.sha256",
     "frozen-targets.json",
@@ -293,34 +314,390 @@ def access_build_input_sha(
     return value.hexdigest()
 
 
+def stable_stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+    )
+
+
+def stable_stat_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        *stable_stat_identity(metadata),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def require_stable_directory(
+    metadata: os.stat_result,
+    label: str,
+    require_root_owner: bool,
+    allow_shared_ancestor: bool = False,
+) -> None:
+    if not stat.S_ISDIR(metadata.st_mode):
+        fail(f"Access build input directory is not stable: {label}")
+    permissions = stat.S_IMODE(metadata.st_mode)
+    shared_ancestor = (
+        allow_shared_ancestor
+        and metadata.st_uid == 0
+        and bool(permissions & stat.S_ISVTX)
+    )
+    if require_root_owner and (
+        metadata.st_uid != 0
+        or (permissions & 0o022 and not shared_ancestor)
+    ):
+        fail(
+            "Access build input directory must be root-owned and not "
+            f"group/world-writable: {label}"
+        )
+
+
+def require_stable_file(
+    metadata: os.stat_result, label: str, require_root_owner: bool
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        fail(f"Access build input must be a single-link regular file: {label}")
+    if require_root_owner and (
+        metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        fail(
+            "Access build input file must be root-owned and not "
+            f"group/world-writable: {label}"
+        )
+
+
+def secure_open_flags(directory: bool) -> int:
+    required = ("O_CLOEXEC", "O_NOFOLLOW")
+    if directory:
+        required += ("O_DIRECTORY",)
+    else:
+        required += ("O_NONBLOCK",)
+    if any(not hasattr(os, name) for name in required) or not (
+        SECURE_DESCRIPTOR_TRAVERSAL_SUPPORTED
+    ):
+        fail("secure Access build-input descriptor traversal is unsupported")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    return flags | (os.O_DIRECTORY if directory else os.O_NONBLOCK)
+
+
+def open_access_root(
+    access_root: Path, require_root_owner: bool
+) -> tuple[int, list[tuple[int, str, int]], list[int]]:
+    components = access_root.parts[1:]
+    if (
+        not access_root.is_absolute()
+        or access_root.anchor != "/"
+        or not components
+        or os.path.normpath(os.fspath(access_root)) != os.fspath(access_root)
+    ):
+        fail(f"unsafe binding root: {access_root}")
+    directory_flags = secure_open_flags(directory=True)
+    descriptors: list[int] = []
+    links: list[tuple[int, str, int]] = []
+    try:
+        root_descriptor = os.open("/", directory_flags)
+        descriptors.append(root_descriptor)
+        require_stable_directory(
+            os.fstat(root_descriptor), "/", require_root_owner
+        )
+        for index, component in enumerate(components):
+            parent_descriptor = descriptors[-1]
+            try:
+                before = os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                fail(f"Access build input directory is absent: {access_root}")
+            if stat.S_ISLNK(before.st_mode):
+                fail(f"Access build input contains a symlink: {access_root}")
+            is_access_root = index == len(components) - 1
+            require_stable_directory(
+                before,
+                str(access_root),
+                require_root_owner,
+                allow_shared_ancestor=not is_access_root,
+            )
+            try:
+                descriptor = os.open(
+                    component, directory_flags, dir_fd=parent_descriptor
+                )
+            except OSError as error:
+                fail(f"cannot securely open Access build input directory: {error}")
+            descriptors.append(descriptor)
+            after = os.fstat(descriptor)
+            if stable_stat_identity(before) != stable_stat_identity(after):
+                fail(
+                    "Access build input directory changed while opening: "
+                    f"{access_root}"
+                )
+            require_stable_directory(
+                after,
+                str(access_root),
+                require_root_owner,
+                allow_shared_ancestor=not is_access_root,
+            )
+            links.append((parent_descriptor, component, descriptor))
+        return descriptors[-1], links, descriptors
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def read_descriptor_sha256(descriptor: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    value = hashlib.sha256()
+    while True:
+        block = os.read(descriptor, 1024 * 1024)
+        if not block:
+            return value.hexdigest()
+        value.update(block)
+
+
+def acquire_stable_read_lease(descriptor: int, label: str) -> os.stat_result:
+    if not SECURE_FILE_LEASES_SUPPORTED:
+        fail("secure Access build-input file leases are unsupported")
+    try:
+        fcntl.fcntl(descriptor, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+        lease = fcntl.fcntl(descriptor, fcntl.F_GETLEASE)
+    except OSError as error:
+        fail(f"cannot establish stable Access read lease for {label}: {error}")
+    if lease != fcntl.F_RDLCK:
+        fail(f"Access build input read lease is not stable: {label}")
+    return os.fstat(descriptor)
+
+
+def collect_access_tree_files(
+    descriptor: int,
+    relative_parts: tuple[str, ...],
+    require_root_owner: bool,
+    descriptors: list[int],
+    files: list[tuple[str, int, tuple[int, ...]]],
+    entries: list[tuple[int, str, tuple[int, ...], bool]],
+    directories: list[tuple[str, int, tuple[str, ...], tuple[int, ...]]],
+) -> None:
+    label = "/".join(relative_parts) or "."
+    before_directory = os.fstat(descriptor)
+    require_stable_directory(before_directory, label, require_root_owner)
+    before_names = sorted(os.listdir(descriptor))
+    ignored_directories = {".git", ".workflow", "target", "__pycache__"}
+    for name in before_names:
+        relative = (*relative_parts, name)
+        relative_label = "/".join(relative)
+        try:
+            before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            fail(f"Access build input changed during traversal: {relative_label}")
+        if stat.S_ISLNK(before.st_mode):
+            fail(f"Access build input contains a symlink: {relative_label}")
+        if stat.S_ISDIR(before.st_mode):
+            require_stable_directory(before, relative_label, require_root_owner)
+            if name in ignored_directories:
+                expected_identity = stable_stat_identity(before)
+                compare_full_snapshot = False
+            else:
+                child_descriptor = os.open(
+                    name, secure_open_flags(directory=True), dir_fd=descriptor
+                )
+                descriptors.append(child_descriptor)
+                opened = os.fstat(child_descriptor)
+                if stable_stat_snapshot(before) != stable_stat_snapshot(opened):
+                    fail(
+                        "Access build input directory changed while opening: "
+                        f"{relative_label}"
+                    )
+                require_stable_directory(opened, relative_label, require_root_owner)
+                collect_access_tree_files(
+                    child_descriptor,
+                    relative,
+                    require_root_owner,
+                    descriptors,
+                    files,
+                    entries,
+                    directories,
+                )
+                expected_identity = stable_stat_snapshot(opened)
+                compare_full_snapshot = True
+        elif name.endswith(".pyc") or fnmatch.fnmatch(name, "*.log"):
+            if require_root_owner:
+                require_stable_file(before, relative_label, True)
+            expected_identity = stable_stat_identity(before)
+            compare_full_snapshot = False
+        else:
+            require_stable_file(before, relative_label, require_root_owner)
+            file_descriptor = os.open(
+                name, secure_open_flags(directory=False), dir_fd=descriptor
+            )
+            descriptors.append(file_descriptor)
+            opened = os.fstat(file_descriptor)
+            if stable_stat_snapshot(before) != stable_stat_snapshot(opened):
+                fail(
+                    "Access build input file changed while opening: "
+                    f"{relative_label}"
+                )
+            require_stable_file(opened, relative_label, require_root_owner)
+            stable_file = (
+                acquire_stable_read_lease(file_descriptor, relative_label)
+                if require_root_owner
+                else opened
+            )
+            require_stable_file(stable_file, relative_label, require_root_owner)
+            expected_identity = stable_stat_snapshot(stable_file)
+            compare_full_snapshot = True
+            files.append((relative_label, file_descriptor, expected_identity))
+        try:
+            mapped = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            fail(f"Access build input changed during traversal: {relative_label}")
+        observed_identity = (
+            stable_stat_snapshot(mapped)
+            if compare_full_snapshot
+            else stable_stat_identity(mapped)
+        )
+        if observed_identity != expected_identity:
+            fail(f"Access build input changed during traversal: {relative_label}")
+        entries.append(
+            (descriptor, name, expected_identity, compare_full_snapshot)
+        )
+    if sorted(os.listdir(descriptor)) != before_names:
+        fail(f"Access build input directory entries changed: {label}")
+    after_directory = os.fstat(descriptor)
+    if stable_stat_snapshot(before_directory) != stable_stat_snapshot(
+        after_directory
+    ):
+        fail(f"Access build input directory changed during traversal: {label}")
+    directories.append(
+        (
+            label,
+            descriptor,
+            tuple(before_names),
+            stable_stat_snapshot(before_directory),
+        )
+    )
+
+
+def validate_access_tree_snapshot(
+    files: list[tuple[str, int, tuple[int, ...]]],
+    entries: list[tuple[int, str, tuple[int, ...], bool]],
+    directories: list[tuple[str, int, tuple[str, ...], tuple[int, ...]]],
+    require_root_owner: bool,
+) -> None:
+    for relative, descriptor, expected in files:
+        observed = os.fstat(descriptor)
+        require_stable_file(observed, relative, require_root_owner)
+        if stable_stat_snapshot(observed) != expected:
+            fail(f"Access build input file changed during snapshot: {relative}")
+        if require_root_owner and fcntl.fcntl(
+            descriptor, fcntl.F_GETLEASE
+        ) != fcntl.F_RDLCK:
+            fail(f"Access build input read lease changed: {relative}")
+    for parent_descriptor, name, expected, compare_full_snapshot in entries:
+        try:
+            mapped = os.stat(
+                name, dir_fd=parent_descriptor, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            fail(f"Access build input changed during snapshot: {name}")
+        observed = (
+            stable_stat_snapshot(mapped)
+            if compare_full_snapshot
+            else stable_stat_identity(mapped)
+        )
+        if observed != expected:
+            fail(f"Access build input changed during snapshot: {name}")
+    for label, descriptor, expected_names, expected in directories:
+        if tuple(sorted(os.listdir(descriptor))) != expected_names:
+            fail(f"Access build input directory entries changed: {label}")
+        if stable_stat_snapshot(os.fstat(descriptor)) != expected:
+            fail(f"Access build input directory changed during snapshot: {label}")
+
+
+def read_access_tree_digests(
+    files: list[tuple[str, int, tuple[int, ...]]],
+    require_root_owner: bool,
+) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    for relative, descriptor, expected in files:
+        before = os.fstat(descriptor)
+        if stable_stat_snapshot(before) != expected:
+            fail(f"Access build input file changed before reading: {relative}")
+        if require_root_owner and fcntl.fcntl(
+            descriptor, fcntl.F_GETLEASE
+        ) != fcntl.F_RDLCK:
+            fail(f"Access build input read lease changed: {relative}")
+        file_sha256 = read_descriptor_sha256(descriptor)
+        after = os.fstat(descriptor)
+        if stable_stat_snapshot(after) != expected:
+            fail(f"Access build input file changed while reading: {relative}")
+        result.append((relative, file_sha256))
+    return result
+
+
 def access_tree_build_input_sha_v2(
     access_root: Path, require_root_owner: bool = False
 ) -> str:
     """Hash one exact Docker-relevant Access tree without workflow/runtime debris."""
-    base = require_directory(access_root, require_root_owner)
-    value = hashlib.sha256()
-    files: list[Path] = []
-    ignored_directories = {".git", ".workflow", "target", "__pycache__"}
-    for current_root, directories, names in os.walk(base, followlinks=False):
-        current = Path(current_root)
-        for name in [*directories, *names]:
-            candidate = current / name
-            if candidate.is_symlink():
-                fail(f"Access build input contains a symlink: {candidate}")
-        directories[:] = sorted(
-            name for name in directories if name not in ignored_directories
+    descriptor, links, descriptors = open_access_root(
+        access_root, require_root_owner
+    )
+    files: list[tuple[str, int, tuple[int, ...]]] = []
+    entries: list[tuple[int, str, tuple[int, ...], bool]] = []
+    directories: list[tuple[str, int, tuple[str, ...], tuple[int, ...]]] = []
+    try:
+        collect_access_tree_files(
+            descriptor,
+            (),
+            require_root_owner,
+            descriptors,
+            files,
+            entries,
+            directories,
         )
-        for name in sorted(names):
-            path = current / name
-            if name.endswith(".pyc") or fnmatch.fnmatch(name, "*.log"):
-                continue
-            require_regular(path, require_root_owner)
-            files.append(path)
-    for path in sorted(files, key=lambda item: item.relative_to(base).as_posix()):
-        relative = path.relative_to(base).as_posix()
+        validate_access_tree_snapshot(
+            files, entries, directories, require_root_owner
+        )
+        first_digests = read_access_tree_digests(files, require_root_owner)
+        second_digests = read_access_tree_digests(files, require_root_owner)
+        if first_digests != second_digests:
+            fail("Access build input file digest changed during snapshot")
+        validate_access_tree_snapshot(
+            files, entries, directories, require_root_owner
+        )
+        for parent_descriptor, component, child_descriptor in links:
+            mapped = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(child_descriptor)
+            if stable_stat_identity(mapped) != stable_stat_identity(opened):
+                fail(
+                    "Access build input path changed during traversal: "
+                    f"{access_root}"
+                )
+            require_stable_directory(
+                opened,
+                str(access_root),
+                require_root_owner,
+                allow_shared_ancestor=child_descriptor != descriptor,
+            )
+    finally:
+        for open_descriptor in reversed(descriptors):
+            os.close(open_descriptor)
+    value = hashlib.sha256()
+    for relative, file_sha256 in sorted(first_digests):
         value.update(relative.encode("utf-8"))
         value.update(b"\0")
-        value.update(digest(path).encode("ascii"))
+        value.update(file_sha256.encode("ascii"))
         value.update(b"\n")
     return value.hexdigest()
 
@@ -331,6 +708,16 @@ def access_build_input_sha_v2(
     return access_tree_build_input_sha_v2(
         stage_root / "access-governance", require_root_owner
     )
+
+
+def access_build_input_sha_for_schema(
+    stage_root: Path, schema: object, require_root_owner: bool = False
+) -> str:
+    if schema == ACCESS_BUILD_INPUT_SCHEMA_V1:
+        return access_build_input_sha(stage_root, require_root_owner)
+    if schema == ACCESS_BUILD_INPUT_SCHEMA_V2:
+        return access_build_input_sha_v2(stage_root, require_root_owner)
+    fail("unsupported Access build-input schema")
 
 
 def write_binding(ops_root: Path, output: Path, successor: bool = False) -> None:
@@ -404,7 +791,7 @@ def verify_apply_binding(
         if (
             evidence.get("release_mode") != "successor"
             or evidence.get("access_governance_build_input_schema")
-            != "access-build-input/2"
+            != ACCESS_BUILD_INPUT_SCHEMA_V2
             or not isinstance(evidence.get("holdfast_release_tool_revision"), str)
             or not re.fullmatch(
                 r"[0-9a-f]{40}", str(evidence["holdfast_release_tool_revision"])
@@ -489,13 +876,21 @@ def verify_apply_binding(
         ):
             fail("successor tokenizer or epoch contract differs")
         policy = load_object(root / "successor-policy.json", require_root_owner)
-        if set(policy) != {
-            "schema_version",
-            "ceremony",
-            "predecessor",
-            "successor",
-            "overlay",
-        } or type(policy.get("schema_version")) is not int:
+        policy_version = policy.get("schema_version")
+        if (
+            set(policy)
+            != {
+                "schema_version",
+                "ceremony",
+                "predecessor",
+                "successor",
+                "overlay",
+            }
+            or type(policy_version) is not int
+            or policy_version not in SUCCESSOR_POLICY_CEREMONIES
+            or policy.get("ceremony")
+            != SUCCESSOR_POLICY_CEREMONIES[policy_version]
+        ):
             fail("successor policy field set or schema differs")
         predecessor = policy.get("predecessor")
         policy_successor = policy.get("successor")
@@ -504,11 +899,21 @@ def verify_apply_binding(
             not isinstance(predecessor, dict)
             or set(predecessor) != PREDECESSOR_FIELDS
             or evidence.get("predecessor_binding") != predecessor
+            or predecessor.get("access_build_input_schema")
+            not in {
+                ACCESS_BUILD_INPUT_SCHEMA_V1,
+                ACCESS_BUILD_INPUT_SCHEMA_V2,
+            }
+            or (
+                policy_version == 1
+                and predecessor.get("access_build_input_schema")
+                != ACCESS_BUILD_INPUT_SCHEMA_V1
+            )
             or not isinstance(policy_successor, dict)
             or set(policy_successor) != SUCCESSOR_POLICY_FIELDS
             or policy_successor.get("generator") != evidence.get("generator")
             or policy_successor.get("access_build_input_schema")
-            != "access-build-input/2"
+            != ACCESS_BUILD_INPUT_SCHEMA_V2
             or not isinstance(
                 policy_successor.get("source_access_build_input_sha256"), str
             )
@@ -523,12 +928,18 @@ def verify_apply_binding(
             or predecessor.get("package_catalog_sha256")
             != frozen.get("package_catalog_sha256")
             or frozen.get("access_governance_build_input_schema")
-            != "access-build-input/2"
+            != ACCESS_BUILD_INPUT_SCHEMA_V2
         ):
             fail("successor policy, frozen target and evidence bindings differ")
-        if not isinstance(overlay, list) or len(overlay) != 7:
+        if not isinstance(overlay, list) or (
+            policy_version == 1 and len(overlay) != 7
+        ) or (
+            policy_version == 2
+            and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
+        ):
             fail("successor overlay field set differs")
         seen_overlay: set[str] = set()
+        overlay_paths: list[str] = []
         for item in overlay:
             if not isinstance(item, dict) or set(item) != {
                 "path",
@@ -541,9 +952,12 @@ def verify_apply_binding(
             after = item.get("after_sha256")
             if (
                 not isinstance(relative, str)
+                or not re.fullmatch(r"[A-Za-z0-9._/-]+", relative)
                 or not relative.startswith("access-governance/")
+                or len(Path(relative).parts) < 2
                 or relative.startswith("/")
                 or ".." in Path(relative).parts
+                or Path(relative).as_posix() != relative
                 or relative in seen_overlay
                 or (before is not None and not isinstance(before, str))
                 or (isinstance(before, str) and not re.fullmatch(r"[0-9a-f]{64}", before))
@@ -551,13 +965,18 @@ def verify_apply_binding(
                 or not re.fullmatch(r"[0-9a-f]{64}", after)
             ):
                 fail("successor overlay entry is invalid")
+            if digest(rooted_regular(stage, relative, require_root_owner)) != after:
+                fail(f"stage successor overlay differs: {relative}")
             seen_overlay.add(relative)
+            overlay_paths.append(relative)
+        if policy_version == 2 and overlay_paths != sorted(overlay_paths):
+            fail("successor overlay path order differs")
         if source_estate_root is not None:
             source_estate = require_directory(
                 source_estate_root.absolute(), require_root_owner
             )
             observed_source_build_input = access_tree_build_input_sha_v2(
-                source_estate / "access-governance"
+                source_estate / "access-governance", require_root_owner
             )
             if observed_source_build_input != policy_successor.get(
                 "source_access_build_input_sha256"
