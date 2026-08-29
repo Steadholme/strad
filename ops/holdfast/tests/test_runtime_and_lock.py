@@ -366,11 +366,14 @@ class RuntimeAndLockTests(unittest.TestCase):
         apply_source = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
         function_names = (
             "require_root_control_file",
+            "require_private_root_control_file",
+            "require_canonical_root_directory",
             "commit_atomic_file",
             "runtime_product_was_running",
             "validate_runtime_stop_authority",
             "load_prior_running_services",
             "resume_prior_running_products",
+            "runtime_backup_caller_release_mode",
             "validate_runtime_backup_caller_authority",
             "record_runtime_backup_cleanup",
             "archive_runtime_backup_state",
@@ -458,6 +461,8 @@ class RuntimeAndLockTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        caller.chmod(0o600)
+        state_file.chmod(0o600)
         fake_path = self.root / "fake-path"
         fake_path.mkdir()
         (fake_path / "docker").symlink_to(self.fake_docker)
@@ -1733,6 +1738,154 @@ class RuntimeAndLockTests(unittest.TestCase):
         self.assertNotEqual(live.returncode, 0)
         self.assertIn("FAILED", live.stdout + live.stderr)
 
+    def test_successor_verify_rejects_wrong_or_missing_source_estate(self) -> None:
+        script_root = self.root / "verify-ops"
+        script_root.mkdir()
+        verify = script_root / "verify.sh"
+        verify.write_text(
+            (OPS_ROOT / "verify.sh").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        verify.chmod(0o755)
+        (script_root / "validate_release_evidence.py").write_text(
+            "raise SystemExit(0)\n", encoding="utf-8"
+        )
+        (script_root / "render_input_binding.py").write_text(
+            "import os\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "flag = '--source-estate-root'\n"
+            "if args.count(flag) != 1:\n"
+            "    raise SystemExit('source estate argument is absent')\n"
+            "source = Path(args[args.index(flag) + 1])\n"
+            "expected = Path(os.environ['EXPECTED_SOURCE_ESTATE'])\n"
+            "if source != expected:\n"
+            "    raise SystemExit('source estate argument differs')\n"
+            "if not source.is_dir():\n"
+            "    raise SystemExit('source estate is absent')\n",
+            encoding="utf-8",
+        )
+
+        estate = self.root / "source-estate"
+        wrong_estate = self.root / "wrong-source-estate"
+        estate.mkdir()
+        wrong_estate.mkdir()
+        dry_run = self.root / "successor-verify-dry-run"
+        stage = dry_run / "stage"
+        (stage / "access-governance/catalog").mkdir(parents=True)
+        (stage / "access-governance/scripts").mkdir(parents=True)
+        (stage / "deploy").mkdir(parents=True)
+        (stage / "deploy/.env").write_text("SAFE=1\n", encoding="utf-8")
+        (stage / "deploy/docker-compose.yml").write_text(
+            "name: test\n", encoding="utf-8"
+        )
+        marker = stage / "marker.txt"
+        marker.write_text("staged\n", encoding="utf-8")
+        (stage / "TARGETS.sha256").write_text(
+            f"{hashlib.sha256(marker.read_bytes()).hexdigest()}  marker.txt\n",
+            encoding="utf-8",
+        )
+        (stage / "RENDER-INPUTS.sha256").write_text(
+            "fixture\n", encoding="utf-8"
+        )
+        (stage / "RELEASE-EVIDENCE.json").write_text(
+            json.dumps({"release_mode": "successor"}) + "\n",
+            encoding="utf-8",
+        )
+        packages = {
+            "requestable_package_count": 8,
+            "packages": [{"package_id": f"filler-{index}"} for index in range(8)]
+            + [
+                {
+                    "package_id": "pkg_rikune_analyst",
+                    "membership_digest": "16b3b01187d066ce7a2e3b4b8c13185cae93bc9b64ee680ccf7c62b501df4b6c",
+                    "policy_digest": "6cb61051c0fdfea360a3fedc9b938a63581e4358d992bb418408eaeb024cdffa",
+                }
+            ],
+        }
+        permissions = {
+            "entries": [{"key": f"rikune.permission.{index}"} for index in range(7)]
+            + [{"key": "cistern.console.enter", "risk": "high"}],
+            "generated_from": [
+                {"source": "rikune-authz"},
+                {"source": "cistern-authz"},
+            ],
+        }
+        routes = {
+            "routes": [
+                {
+                    "name": "cistern-dash",
+                    "protected": False,
+                    "auth": "sso",
+                    "internal_only": False,
+                    "require_group": "",
+                    "require_permission": "",
+                    "permission_resource": "",
+                    "risk": "",
+                    "require_scope": "",
+                }
+            ]
+        }
+        (stage / "access-governance/catalog/packages.snapshot.json").write_text(
+            json.dumps(packages), encoding="utf-8"
+        )
+        (stage / "access-governance/catalog/permissions.snapshot.json").write_text(
+            json.dumps(permissions), encoding="utf-8"
+        )
+        repository = stage / "access-governance/src/repository/postgres.rs"
+        repository.parent.mkdir(parents=True)
+        repository.write_text(
+            "        if snapshot.packages.len() != 9\n"
+            "            || snapshot.requestable_package_count != 8\n",
+            encoding="utf-8",
+        )
+        (stage / "deploy/routes.seed.json").write_text(
+            json.dumps(routes), encoding="utf-8"
+        )
+        generator = stage / "access-governance/scripts/generate_permission_catalog.sh"
+        generator.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+        generator.chmod(0o755)
+        (stage / "access-governance/scripts/validate_authz_manifests.py").write_text(
+            "pass\n", encoding="utf-8"
+        )
+        fake_bin = self.root / "verify-bin"
+        fake_bin.mkdir()
+        for name in ("cargo", "docker"):
+            executable = fake_bin / name
+            executable.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+        base_env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+        def run(source: Path, expected: Path) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    "bash",
+                    str(verify),
+                    "--estate-root",
+                    str(source),
+                    "--dry-run-dir",
+                    str(dry_run),
+                    "--phase",
+                    "staged",
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={**base_env, "EXPECTED_SOURCE_ESTATE": str(expected)},
+            )
+
+        valid = run(estate, estate)
+        self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+        wrong = run(wrong_estate, estate)
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertIn("source estate argument differs", wrong.stderr)
+        missing_estate = self.root / "missing-source-estate"
+        missing = run(missing_estate, missing_estate)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("source estate is absent", missing.stderr)
+
     def test_successor_apply_cross_checks_all_dry_run_downgrade_fields(self) -> None:
         script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
         verify_start = script.index("verify_release_bindings()")
@@ -1783,6 +1936,72 @@ class RuntimeAndLockTests(unittest.TestCase):
         self.assertIn('elif [[ "$existing_state" == "successor_armed" ]]', script)
         self.assertIn("recover_existing_successor_arm_state", script)
         self.assertIn("successor apply requires --activate-services", script)
+
+    def test_schema3_successor_sigkill_reentry_uses_only_frozen_backup_bundle(
+        self,
+    ) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        persisted = script[
+            script.index("validate_persisted_recovery_completion_authority() {") :
+            script.index("persist_recovery_completion_authority() {")
+        ]
+        self.assertIn(
+            'policy="$backup/successor-authority/successor-policy.json"',
+            persisted,
+        )
+        self.assertIn('"$backup" "$policy"', persisted)
+        self.assertIn('evidence="$backup/RELEASE-EVIDENCE.json"', persisted)
+        self.assertNotIn("recovery_completion_root", persisted)
+        self.assertNotIn('"$stage/RECOVERY-COMPLETION', persisted)
+        signed_anchor = script[
+            script.index("validate_persisted_schema3_signed_anchor() {") :
+            script.index("persist_schema3_partial_recovery_authority() {")
+        ]
+        self.assertIn('"$backup/SUPPLY-CHAIN.json"', signed_anchor)
+        self.assertIn('"$backup/DRY-RUN.receipt"', signed_anchor)
+        self.assertNotIn('"$stage/', signed_anchor)
+
+        recovery = script[
+            script.index("recover_existing_successor_arm_state() {") :
+            script.index("record_caller_receipt_only_abort() {")
+        ]
+        self.assertIn('validate_persisted_successor_authority "$state_file"', recovery)
+        recovery_dispatch = script.index(
+            "recover_existing_successor_arm_state", script.index('existing_state=$(jq')
+        )
+        live_policy_load = script.index(
+            'load_successor_policy_authority "$script_dir/successor-policy.json"',
+            recovery_dispatch,
+        )
+        self.assertLess(recovery_dispatch, live_policy_load)
+        validator = script[
+            script.index("validate_persisted_successor_authority() {") :
+            script.index("append_successor_receipt_fields() {")
+        ]
+        self.assertIn(
+            "validate_persisted_recovery_completion_authority false", validator
+        )
+
+        completion = script.index("\npersist_recovery_completion_authority\n")
+        partial = script.index("persist_schema3_partial_recovery_authority", completion)
+        successor_arm = script.index("\npersist_successor_authority\n", completion)
+        runtime_backup = script.index(
+            '"$script_dir/runtime-backup.sh" --compose-root "$stage"'
+        )
+        arm_function = script[
+            script.index("persist_successor_authority() {") :
+            script.index("verify_database_absent() {")
+        ]
+        self.assertIn("HOLDFAST_TEST_SIGKILL_AFTER_SUCCESSOR_ARM", arm_function)
+        self.assertLess(
+            arm_function.index("validate_persisted_recovery_completion_authority false"),
+            arm_function.index(
+                'commit_atomic_file "$successor_state_tmp" "$state_file"'
+            ),
+        )
+        self.assertLess(completion, successor_arm)
+        self.assertLess(partial, successor_arm)
+        self.assertLess(successor_arm, runtime_backup)
 
 
 if __name__ == "__main__":

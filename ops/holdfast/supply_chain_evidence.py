@@ -76,10 +76,15 @@ def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    mode = path.lstat()
-    if not stat.S_ISREG(mode.st_mode) or path.is_symlink() or mode.st_nlink != 1:
-        fail(f"unsafe JSON evidence: {path}")
-    value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    value = load_json_bytes(read_safe_bytes(path, "JSON evidence"), "JSON evidence")
+    return value
+
+
+def load_json_bytes(raw: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"invalid {label}: {error}")
     if not isinstance(value, dict):
         fail("evidence root must be an object")
     return value
@@ -110,14 +115,16 @@ def open_canonical_readonly(path: Path) -> int:
             directory = next_directory
         return os.open(
             components[-1],
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=directory,
         )
     finally:
         os.close(directory)
 
 
-def release_env(path: Path) -> tuple[dict[str, str], str]:
+def read_safe_bytes(
+    path: Path, label: str, *, maximum_size: int = 2 * 1024 * 1024
+) -> bytes:
     descriptor = open_canonical_readonly(path)
     try:
         metadata = os.fstat(descriptor)
@@ -125,12 +132,22 @@ def release_env(path: Path) -> tuple[dict[str, str], str]:
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
             or metadata.st_uid != 0
+            or metadata.st_mode & 0o022
+            or metadata.st_size < 1
+            or metadata.st_size > maximum_size
         ):
-            fail("release env must be a root-owned single-link regular file")
+            fail(f"{label} must be a safe root-owned single-link regular file")
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            raw = handle.read()
+            raw = handle.read(maximum_size + 1)
+        if len(raw) > maximum_size:
+            fail(f"{label} exceeds the maximum safe size")
+        return raw
     finally:
         os.close(descriptor)
+
+
+def release_env(path: Path) -> tuple[dict[str, str], str]:
+    raw = read_safe_bytes(path, "release env")
     text_value = raw.decode("utf-8")
     result: dict[str, str] = {}
     for line in text_value.splitlines():
@@ -587,27 +604,79 @@ def validate_local_binding(
                     fail(f"supply chain and RELEASE-EVIDENCE differ: {field}")
 
 
-def verify_signature(evidence: Path, signature: Path, public_key: Path) -> None:
-    if sha256(public_key) == "0" * 64:
+def verify_signature_bytes(
+    evidence: bytes, signature: bytes, public_key: bytes
+) -> None:
+    if hashlib.sha256(public_key).hexdigest() == "0" * 64:
         fail("public key digest is invalid")
-    completed = subprocess.run(
-        [
-            "openssl",
-            "dgst",
-            "-sha256",
-            "-verify",
-            str(public_key),
-            "-signature",
-            str(signature),
-            str(evidence),
-        ],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    public_descriptor = os.memfd_create("holdfast-supply-public", os.MFD_CLOEXEC)
+    signature_descriptor = os.memfd_create(
+        "holdfast-supply-signature", os.MFD_CLOEXEC
     )
-    if completed.returncode != 0 or "Verified OK" not in completed.stdout:
+    try:
+        for descriptor, content in (
+            (public_descriptor, public_key),
+            (signature_descriptor, signature),
+        ):
+            offset = 0
+            while offset < len(content):
+                offset += os.write(descriptor, content[offset:])
+            os.lseek(descriptor, 0, os.SEEK_SET)
+        completed = subprocess.run(
+            [
+                "openssl",
+                "dgst",
+                "-sha256",
+                "-verify",
+                f"/proc/self/fd/{public_descriptor}",
+                "-signature",
+                f"/proc/self/fd/{signature_descriptor}",
+            ],
+            input=evidence,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            pass_fds=(public_descriptor, signature_descriptor),
+        )
+    finally:
+        os.close(public_descriptor)
+        os.close(signature_descriptor)
+    if completed.returncode != 0 or b"Verified OK" not in completed.stdout:
         fail("detached supply-chain signature verification failed")
+
+
+def read_verified_supply_chain_bundle(
+    evidence_path: Path,
+    signature_path: Path,
+    public_key_path: Path,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    evidence = read_safe_bytes(evidence_path, "supply-chain evidence")
+    signature = read_safe_bytes(
+        signature_path, "supply-chain signature", maximum_size=65_536
+    )
+    public_key = read_safe_bytes(
+        public_key_path, "supply-chain public key", maximum_size=65_536
+    )
+    pins = {
+        "SUPPLY_CHAIN_EVIDENCE_SHA256": hashlib.sha256(evidence).hexdigest(),
+        "SUPPLY_CHAIN_SIGNATURE_SHA256": hashlib.sha256(signature).hexdigest(),
+        "SUPPLY_CHAIN_PUBLIC_KEY_SHA256": hashlib.sha256(public_key).hexdigest(),
+    }
+    verify_signature_bytes(evidence, signature, public_key)
+    return load_json_bytes(evidence, "supply-chain evidence"), pins
+
+
+def verify_signature(evidence: Path, signature: Path, public_key: Path) -> None:
+    """Compatibility wrapper for direct callers; main uses one bundle snapshot."""
+
+    evidence_raw = read_safe_bytes(evidence, "supply-chain evidence")
+    signature_raw = read_safe_bytes(
+        signature, "supply-chain signature", maximum_size=65_536
+    )
+    public_key_raw = read_safe_bytes(
+        public_key, "supply-chain public key", maximum_size=65_536
+    )
+    verify_signature_bytes(evidence_raw, signature_raw, public_key_raw)
 
 
 def main() -> int:
@@ -623,16 +692,12 @@ def main() -> int:
     args = parser.parse_args()
     try:
         release, release_sha = release_env(args.release_env)
-        pins = {
-            "SUPPLY_CHAIN_EVIDENCE_SHA256": sha256(args.evidence),
-            "SUPPLY_CHAIN_SIGNATURE_SHA256": sha256(args.signature),
-            "SUPPLY_CHAIN_PUBLIC_KEY_SHA256": sha256(args.public_key),
-        }
+        document, pins = read_verified_supply_chain_bundle(
+            args.evidence, args.signature, args.public_key
+        )
         for key, observed in pins.items():
             if release.get(key) != observed:
                 fail(f"{key} differs from the release pin")
-        verify_signature(args.evidence, args.signature, args.public_key)
-        document = load_json(args.evidence)
         successor_policy = None
         if document.get("schema_version") == 3:
             if args.successor_policy is None:

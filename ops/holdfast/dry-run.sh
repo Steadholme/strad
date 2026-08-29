@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --estate-root PATH --release-env FILE --secret-env FILE --supply-chain-evidence FILE --supply-chain-signature FILE --supply-chain-public-key FILE --output NEW_PATH [--successor --current-state FILE --predecessor-candidate PATH --predecessor-stage PATH]" >&2
+  echo "usage: $0 --estate-root PATH --release-env FILE --secret-env FILE --supply-chain-evidence FILE --supply-chain-signature FILE --supply-chain-public-key FILE --output NEW_PATH [--successor --current-state FILE --predecessor-candidate PATH --predecessor-stage PATH --recovery-completion-root PATH]" >&2
   exit 2
 }
 
@@ -17,6 +17,7 @@ successor=false
 current_state=""
 predecessor_candidate=""
 predecessor_stage=""
+recovery_completion_root=""
 while (($#)); do
   case "$1" in
     --estate-root) [[ $# -ge 2 ]] || usage; estate_root=$2; shift 2 ;;
@@ -30,6 +31,7 @@ while (($#)); do
     --current-state) [[ $# -ge 2 ]] || usage; current_state=$2; shift 2 ;;
     --predecessor-candidate) [[ $# -ge 2 ]] || usage; predecessor_candidate=$2; shift 2 ;;
     --predecessor-stage) [[ $# -ge 2 ]] || usage; predecessor_stage=$2; shift 2 ;;
+    --recovery-completion-root) [[ $# -ge 2 ]] || usage; recovery_completion_root=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -61,15 +63,62 @@ if [[ "$successor" == true ]]; then
   for path in "$current_state" "$predecessor_candidate" "$predecessor_stage"; do
     [[ "$path" = /* && "$path" != "/" ]] || usage
   done
-elif [[ -n "$current_state" || -n "$predecessor_candidate" || -n "$predecessor_stage" ]]; then
+  if [[ -n "$recovery_completion_root" ]]; then
+    [[ "$recovery_completion_root" = /* && "$recovery_completion_root" != "/" ]] || usage
+  fi
+elif [[ -n "$current_state" || -n "$predecessor_candidate" || -n "$predecessor_stage" || -n "$recovery_completion_root" ]]; then
   usage
 fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+successor_policy_schema=0
+if [[ "$successor" == true ]]; then
+  successor_policy_schema=$(jq -er '.schema_version | select(. == 1 or . == 2 or . == 3)' \
+    "$script_dir/successor-policy.json")
+  predecessor_validation_args=(
+    --policy "$script_dir/successor-policy.json"
+    --current-state "$current_state"
+    --estate-root "$estate_root"
+    --predecessor-candidate "$predecessor_candidate"
+    --predecessor-stage "$predecessor_stage"
+    --successor-preimages "$script_dir/successor-preimages.sha256"
+  )
+  if [[ -n "$recovery_completion_root" ]]; then
+    predecessor_validation_args+=(--recovery-completion-root "$recovery_completion_root")
+  fi
+  # This complete validation is deliberately before the first output write.
+  python3 "$script_dir/successor_binding.py" "${predecessor_validation_args[@]}"
+fi
 umask 077
 mkdir -m 0700 -- "$output"
 python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY|os.O_DIRECTORY); os.fsync(fd); os.close(fd)' "$output_parent"
 mkdir -m 0700 -- "$output/inputs"
+if [[ "$successor_policy_schema" == "3" ]]; then
+  recovery_completion_snapshot="$output/inputs/recovery-completion"
+  mkdir -m 0700 -- "$recovery_completion_snapshot"
+  python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY|os.O_DIRECTORY); os.fsync(fd); os.close(fd)' "$output/inputs"
+  python3 - "$script_dir" "$script_dir/successor-policy.json" \
+    "$recovery_completion_root" "$recovery_completion_snapshot" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from successor_binding import (  # noqa: E402
+    read_recovery_completion_bundle,
+    require_same_recovery_completion_snapshot,
+    validate_policy,
+    write_recovery_completion_bundle,
+)
+
+policy = validate_policy(Path(sys.argv[2]))
+completion = policy["predecessor"]["completion"]
+source = read_recovery_completion_bundle(Path(sys.argv[3]), completion)
+write_recovery_completion_bundle(Path(sys.argv[4]), completion, source)
+snapshot = read_recovery_completion_bundle(Path(sys.argv[4]), completion)
+require_same_recovery_completion_snapshot(source, snapshot)
+PY
+  recovery_completion_root="$recovery_completion_snapshot"
+fi
 install -m 0600 -- "$release_env" "$output/inputs/release.env"
 install -m 0600 -- "$secret_env" "$output/inputs/secret.env"
 install -m 0600 -- "$supply_chain_evidence" "$output/inputs/SUPPLY-CHAIN.json"
@@ -105,6 +154,9 @@ if [[ "$successor" == true ]]; then
     --predecessor-candidate "$predecessor_candidate"
     --predecessor-stage "$predecessor_stage"
   )
+  if [[ "$successor_policy_schema" == "3" ]]; then
+    render_args+=(--recovery-completion-root "$recovery_completion_root")
+  fi
 fi
 python3 "$script_dir/render.py" "${render_args[@]}"
 python3 "$script_dir/validate_release_evidence.py" \
@@ -183,6 +235,7 @@ python3 -m py_compile \
   "$script_dir/render.py" \
   "$script_dir/render_input_binding.py" \
   "$script_dir/successor_binding.py" \
+  "$script_dir/recovery_completion_attestation.py" \
   "$script_dir/redact_env_diff.py" \
   "$script_dir/authority_evidence.py" \
   "$script_dir/edge_evidence.py" \
@@ -200,6 +253,12 @@ release_env_digest=$(sha256sum "$release_env" | cut -d' ' -f1)
     printf 'predecessor_current_sha256=%s\n' "$(sha256sum "$current_state" | cut -d' ' -f1)"
     printf 'successor_delta_sha256=%s\n' "$(sha256sum "$output/stage/SUCCESSOR-DELTA.sha256" | cut -d' ' -f1)"
     printf 'holdfast_release_tool_revision=%s\n' "$(awk -F= '$1 == "HOLDFAST_RELEASE_TOOL_REVISION" {print $2}' "$release_env")"
+    if [[ "$successor_policy_schema" == "3" ]]; then
+      printf 'predecessor_completion_kind=%s\n' "$(jq -er '.predecessor_binding.completion.kind' "$output/stage/RELEASE-EVIDENCE.json")"
+      printf 'predecessor_completion_attestation_sha256=%s\n' "$(jq -er '.predecessor_binding.completion.attestation_sha256' "$output/stage/RELEASE-EVIDENCE.json")"
+      printf 'predecessor_completion_signature_sha256=%s\n' "$(jq -er '.predecessor_binding.completion.signature_sha256' "$output/stage/RELEASE-EVIDENCE.json")"
+      printf 'predecessor_completion_public_key_sha256=%s\n' "$(jq -er '.predecessor_binding.completion.public_key_sha256' "$output/stage/RELEASE-EVIDENCE.json")"
+    fi
   else
     printf 'generator=%s\n' "$(tr -d '\n' <"$script_dir/GENERATOR_VERSION")"
   fi

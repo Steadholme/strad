@@ -145,7 +145,17 @@ ignored_entry=$(find "$snapshot_candidate" \
   exit 1
 }
 find "$snapshot_candidate" -type f -exec chmod 0400 -- {} +
-find "$snapshot_candidate" -type d -exec chmod 0500 -- {} +
+for recovery_file in RECOVERY-COMPLETION-ATTESTATION.json \
+  RECOVERY-COMPLETION-ATTESTATION.sig RECOVERY-COMPLETION-ATTESTATION.pub; do
+  if [[ -e "$snapshot_candidate/$recovery_file" || \
+    -L "$snapshot_candidate/$recovery_file" ]]; then
+    require_control_file \
+      "$snapshot_candidate/$recovery_file" "snapshotted recovery completion authority"
+    chmod 0600 -- "$snapshot_candidate/$recovery_file"
+  fi
+done
+find "$snapshot_candidate" -mindepth 1 -type d -exec chmod 0500 -- {} +
+chmod 0700 -- "$snapshot_candidate"
 
 candidate_root="$snapshot_candidate"
 candidate_access="$candidate_root/access-governance"

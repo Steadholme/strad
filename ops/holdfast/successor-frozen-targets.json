@@ -5,7 +5,7 @@
   "permission_catalog_sha256": "92e7ed1dd9aa2369b18c2aae7d05b3f829a8d1750f5569c9ff9536f7ace0ebc9",
   "package_catalog_sha256": "6a2343c04c0d2cf7c1cbb40414d0be3f91bcb4637499fbc78037f3cb0543d340",
   "access_governance_build_input_schema": "access-build-input/2",
-  "access_governance_build_input_sha256": "58681a40a3c374b4350a6d011ec3cf920b5343ecdee93684f201d5433f00344f",
+  "access_governance_build_input_sha256": "df93abbadb9ef4b26cfcef33b6362efdcc6e77e9a5c32c5999327b4743e5abdc",
   "authz_manifest_sha256": "71d114b4aeb3d469920057e4df399bfd302e532914e8741390ff16789909c450",
   "route_up_sha256": "b311effdce00a91e31b22679494fb017a0db5323a95e2cb7a9839b385a8161c2",
   "route_down_sha256": "f8c3a928008a7672ebd8c4da9fe792625ed30ebfb89268dee4623b4551d52edb",

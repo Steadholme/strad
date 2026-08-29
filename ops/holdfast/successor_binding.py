@@ -14,6 +14,17 @@ import sys
 from pathlib import Path
 from typing import Any, NoReturn
 
+from recovery_completion_attestation import (
+    ATTESTATION_NAME as RECOVERY_ATTESTATION_NAME,
+    KIND as RECOVERY_COMPLETION_KIND,
+    PUBLIC_KEY_NAME as RECOVERY_PUBLIC_KEY_NAME,
+    SIGNATURE_NAME as RECOVERY_SIGNATURE_NAME,
+    artifact_result as recovery_artifact_result,
+    open_private_directory,
+    read_direct_child,
+    read_safe_regular,
+    verify_raw_bundle,
+)
 from render_input_binding import (
     ACCESS_BUILD_INPUT_SCHEMA_V1,
     ACCESS_BUILD_INPUT_SCHEMA_V2,
@@ -29,11 +40,40 @@ SAFE_RELATIVE = re.compile(r"^[A-Za-z0-9._/-]+$")
 POLICY_CEREMONIES = {
     1: "holdfast-rikune-successor-v1",
     2: "holdfast-rikune-successor-v2",
+    3: "holdfast-rikune-successor-v3",
 }
 POLICY_CEREMONY = POLICY_CEREMONIES[1]
 BUILD_INPUT_V1 = ACCESS_BUILD_INPUT_SCHEMA_V1
 BUILD_INPUT_V2 = ACCESS_BUILD_INPUT_SCHEMA_V2
 MAX_SUCCESSOR_OVERLAY_PATHS = 64
+RECOVERY_COMPLETION_FIELDS = {
+    "kind",
+    "attestation_sha256",
+    "signature_sha256",
+    "public_key_sha256",
+}
+LEGACY_PREDECESSOR_FIELDS = {
+    "current_state_sha256",
+    "control_sha256",
+    "apply_receipt_sha256",
+    "release_evidence_sha256",
+    "runtime_manifest_sha256",
+    "candidate_evidence_sha256",
+    "candidate_targets_sha256",
+    "access_image",
+    "access_build_input_schema",
+    "access_build_input_sha256",
+    "permission_catalog_sha256",
+    "package_catalog_sha256",
+}
+RECOVERED_PREDECESSOR_FIELDS = (
+    LEGACY_PREDECESSOR_FIELDS - {"apply_receipt_sha256"}
+) | {"completion"}
+RECOVERY_COMPLETION_NAMES = (
+    RECOVERY_ATTESTATION_NAME,
+    RECOVERY_SIGNATURE_NAME,
+    RECOVERY_PUBLIC_KEY_NAME,
+)
 IGNORED_DIRECTORIES = frozenset({".git", ".workflow", "target", "__pycache__"})
 SUPPORTING_RELAY_PATHS = frozenset(
     {
@@ -59,6 +99,10 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             value.update(block)
     return value.hexdigest()
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
 def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -106,12 +150,16 @@ def require_directory(path: Path, *, private: bool = False) -> Path:
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    require_regular(path)
+    raw = read_safe_regular(path, "JSON authority")
+    return load_json_bytes(raw, path)
+
+
+def load_json_bytes(raw: bytes, path: Path) -> dict[str, Any]:
     try:
         value = json.loads(
-            path.read_text(encoding="utf-8"), object_pairs_hook=unique_object
+            raw.decode("utf-8"), object_pairs_hook=unique_object
         )
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    except (UnicodeError, json.JSONDecodeError) as error:
         fail(f"cannot read JSON authority {path}: {error}")
     if not isinstance(value, dict):
         fail(f"JSON authority root must be an object: {path}")
@@ -130,6 +178,141 @@ def require_hex(value: object, label: str) -> str:
     return value
 
 
+def validate_completion_binding(value: object) -> dict[str, Any]:
+    completion = exact_object(
+        value, RECOVERY_COMPLETION_FIELDS, "recovery completion binding"
+    )
+    if completion["kind"] != RECOVERY_COMPLETION_KIND:
+        fail("recovery completion kind differs")
+    for field in (
+        "attestation_sha256",
+        "signature_sha256",
+        "public_key_sha256",
+    ):
+        require_hex(completion[field], f"recovery completion {field}")
+    return completion
+
+
+def read_recovery_completion_bundle(
+    root: Path,
+    completion: dict[str, Any],
+    *,
+    exact_namespace: bool = True,
+) -> dict[str, Any]:
+    """Read each signed completion artifact once and verify those exact bytes."""
+
+    validated = validate_completion_binding(completion)
+    directory = open_private_directory(root)
+    try:
+        if stat.S_IMODE(os.fstat(directory).st_mode) != 0o700:
+            fail("recovery completion root must have mode 0700")
+        names = set(os.listdir(directory))
+        expected_names = set(RECOVERY_COMPLETION_NAMES)
+        if exact_namespace and names != expected_names:
+            fail("recovery completion root file set is not exact")
+        if not expected_names.issubset(names):
+            fail("recovery completion bundle is incomplete")
+        attestation = read_direct_child(
+            directory, RECOVERY_ATTESTATION_NAME, "recovery completion attestation"
+        )
+        signature = read_direct_child(
+            directory,
+            RECOVERY_SIGNATURE_NAME,
+            "recovery completion signature",
+            maximum_size=65_536,
+        )
+        public_key = read_direct_child(
+            directory,
+            RECOVERY_PUBLIC_KEY_NAME,
+            "recovery completion public key",
+            maximum_size=65_536,
+        )
+    finally:
+        os.close(directory)
+    observed = recovery_artifact_result(attestation, signature, public_key)
+    expected_hashes = {
+        "attestation_sha256": validated["attestation_sha256"],
+        "signature_sha256": validated["signature_sha256"],
+        "public_key_sha256": validated["public_key_sha256"],
+    }
+    for field, expected in expected_hashes.items():
+        if observed[field] != expected:
+            fail(f"recovery completion artifact differs: {field}")
+    document = verify_raw_bundle(
+        attestation,
+        signature,
+        public_key,
+        validated["public_key_sha256"],
+    )
+    return {
+        "document": document,
+        "artifacts": observed,
+        "bytes": {
+            RECOVERY_ATTESTATION_NAME: attestation,
+            RECOVERY_SIGNATURE_NAME: signature,
+            RECOVERY_PUBLIC_KEY_NAME: public_key,
+        },
+    }
+
+
+def require_same_recovery_completion_snapshot(
+    before: dict[str, Any], after: dict[str, Any]
+) -> None:
+    if (
+        before.get("artifacts") != after.get("artifacts")
+        or before.get("bytes") != after.get("bytes")
+        or before.get("document") != after.get("document")
+    ):
+        fail("recovery completion source changed during render")
+
+
+def write_recovery_completion_bundle(
+    stage_root: Path,
+    completion: dict[str, Any],
+    bundle: dict[str, Any],
+) -> None:
+    """Copy the already-verified bytes into one private successor stage."""
+
+    stage = require_directory(stage_root, private=True)
+    raw = bundle.get("bytes")
+    if not isinstance(raw, dict) or set(raw) != set(RECOVERY_COMPLETION_NAMES):
+        fail("verified recovery completion bytes are unavailable")
+    directory = os.open(
+        stage, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        for name in RECOVERY_COMPLETION_NAMES:
+            content = raw[name]
+            if not isinstance(content, bytes) or not content:
+                fail("verified recovery completion bytes are invalid")
+            descriptor = os.open(
+                name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory,
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                offset = 0
+                while offset < len(content):
+                    offset += os.write(descriptor, content[offset:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        os.fsync(directory)
+    except FileExistsError:
+        fail("recovery completion stage output already exists")
+    finally:
+        os.close(directory)
+    staged = read_recovery_completion_bundle(
+        stage, completion, exact_namespace=False
+    )
+    require_same_recovery_completion_snapshot(bundle, staged)
+
+
 def safe_relative(value: object, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -143,11 +326,17 @@ def safe_relative(value: object, label: str) -> str:
 
 
 def parse_checksum_manifest(path: Path) -> dict[str, str]:
-    require_regular(path)
+    raw = read_safe_regular(path, "checksum manifest")
+    return parse_checksum_manifest_bytes(raw, path)
+
+
+def parse_checksum_manifest_bytes(raw: bytes, path: Path) -> dict[str, str]:
     result: dict[str, str] = {}
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), 1
-    ):
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        fail(f"checksum manifest is not UTF-8: {path}: {error}")
+    for line_number, line in enumerate(lines, 1):
         match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._/-]+)", line)
         if (
             not match
@@ -202,7 +391,7 @@ def validate_static_asset_transition(
     }
     if policy_version == 1:
         valid_transition = changed_paths == set(sources)
-    elif policy_version == 2:
+    elif policy_version in (2, 3):
         valid_transition = changed_paths.issubset(sources)
     else:
         valid_transition = False
@@ -225,9 +414,16 @@ def validate_static_asset_transition(
     return changed_sources
 
 
-def verify_checksum_manifest(root: Path, manifest: Path) -> None:
+def verify_checksum_manifest(
+    root: Path, manifest: Path, manifest_raw: bytes | None = None
+) -> None:
     base = require_directory(root)
-    for relative, expected in parse_checksum_manifest(manifest).items():
+    expected_files = (
+        parse_checksum_manifest(manifest)
+        if manifest_raw is None
+        else parse_checksum_manifest_bytes(manifest_raw, manifest)
+    )
+    for relative, expected in expected_files.items():
         target = require_regular(base / relative)
         if target.resolve() != target or base not in target.resolve().parents:
             fail(f"checksum path escapes authority root: {relative}")
@@ -268,28 +464,17 @@ def validate_policy(path: Path) -> dict[str, Any]:
         or policy["ceremony"] != POLICY_CEREMONIES[policy_version]
     ):
         fail("successor policy version or ceremony differs")
-    predecessor = exact_object(
-        policy["predecessor"],
-        {
-            "current_state_sha256",
-            "control_sha256",
-            "apply_receipt_sha256",
-            "release_evidence_sha256",
-            "runtime_manifest_sha256",
-            "candidate_evidence_sha256",
-            "candidate_targets_sha256",
-            "access_image",
-            "access_build_input_schema",
-            "access_build_input_sha256",
-            "permission_catalog_sha256",
-            "package_catalog_sha256",
-        },
-        "predecessor policy",
+    predecessor_fields = (
+        RECOVERED_PREDECESSOR_FIELDS
+        if policy_version == 3
+        else LEGACY_PREDECESSOR_FIELDS
     )
-    for key in (
+    predecessor = exact_object(
+        policy["predecessor"], predecessor_fields, "predecessor policy"
+    )
+    predecessor_hash_fields = [
         "current_state_sha256",
         "control_sha256",
-        "apply_receipt_sha256",
         "release_evidence_sha256",
         "runtime_manifest_sha256",
         "candidate_evidence_sha256",
@@ -297,7 +482,12 @@ def validate_policy(path: Path) -> dict[str, Any]:
         "access_build_input_sha256",
         "permission_catalog_sha256",
         "package_catalog_sha256",
-    ):
+    ]
+    if policy_version < 3:
+        predecessor_hash_fields.append("apply_receipt_sha256")
+    else:
+        validate_completion_binding(predecessor["completion"])
+    for key in predecessor_hash_fields:
         require_hex(predecessor[key], f"predecessor {key}")
     if predecessor["access_build_input_schema"] not in {
         BUILD_INPUT_V1,
@@ -309,6 +499,11 @@ def validate_policy(path: Path) -> dict[str, Any]:
         and predecessor["access_build_input_schema"] != BUILD_INPUT_V1
     ):
         fail("legacy successor policy cannot bind a v2 predecessor")
+    if (
+        policy_version == 3
+        and predecessor["access_build_input_schema"] != BUILD_INPUT_V2
+    ):
+        fail("recovered successor policy requires a v2 predecessor")
     if not isinstance(predecessor["access_image"], str) or not IMAGE.fullmatch(
         predecessor["access_image"]
     ):
@@ -360,7 +555,7 @@ def validate_policy(path: Path) -> dict[str, Any]:
     if not isinstance(overlay, list) or (
         policy_version == 1 and len(overlay) != 7
     ) or (
-        policy_version == 2
+        policy_version in (2, 3)
         and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
     ):
         fail("successor overlay size differs from its policy version")
@@ -384,7 +579,7 @@ def validate_policy(path: Path) -> dict[str, Any]:
         if entry["before_sha256"] is not None:
             require_hex(entry["before_sha256"], f"overlay {relative} before")
         require_hex(entry["after_sha256"], f"overlay {relative} after")
-    if policy_version == 2 and paths != sorted(paths):
+    if policy_version in (2, 3) and paths != sorted(paths):
         fail("successor overlay paths must be sorted")
     return policy
 
@@ -460,6 +655,8 @@ def validate_predecessor_access_identity(
     candidate_root: Path,
     stage_root: Path,
     predecessor: dict[str, Any],
+    *,
+    bind_evidence_hashes: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     candidate = require_directory(candidate_root)
     stage = require_directory(stage_root, private=True)
@@ -475,7 +672,19 @@ def validate_predecessor_access_identity(
     expected_evidence_schema = 1 if schema == BUILD_INPUT_V1 else 2
     evidence_values: list[dict[str, Any]] = []
     for label, root in (("candidate", candidate), ("stage", stage)):
-        evidence = load_json(root / "RELEASE-EVIDENCE.json")
+        evidence_path = root / "RELEASE-EVIDENCE.json"
+        evidence_raw = read_safe_regular(
+            evidence_path, f"predecessor {label} release evidence"
+        )
+        if bind_evidence_hashes:
+            expected_evidence_sha = predecessor[
+                "candidate_evidence_sha256"
+                if label == "candidate"
+                else "release_evidence_sha256"
+            ]
+            if sha256_bytes(evidence_raw) != expected_evidence_sha:
+                fail(f"sealed predecessor {label} evidence differs")
+        evidence = load_json_bytes(evidence_raw, evidence_path)
         if (
             type(evidence.get("schema_version")) is not int
             or evidence.get("schema_version") != expected_evidence_schema
@@ -520,6 +729,88 @@ def validate_predecessor_generation(
     return release_generation
 
 
+def validate_recovered_predecessor(
+    *,
+    completion_root: Path,
+    predecessor: dict[str, Any],
+    state_path: Path,
+    state: dict[str, Any],
+    state_raw: bytes | None = None,
+    estate: Path,
+    backup: Path,
+    authority_bytes: dict[str, bytes] | None = None,
+) -> dict[str, Any]:
+    completion = predecessor.get("completion")
+    if not isinstance(completion, dict):
+        fail("recovered predecessor lacks completion authority")
+    bundle = read_recovery_completion_bundle(
+        completion_root, completion, exact_namespace=True
+    )
+    document = bundle["document"]
+    current_raw = (
+        read_safe_regular(state_path, "CURRENT authority")
+        if state_raw is None
+        else state_raw
+    )
+    parsed_state = load_json_bytes(current_raw, state_path)
+    if parsed_state != state:
+        fail("recovered CURRENT parsed state differs from its byte snapshot")
+    state_sha256 = sha256_bytes(current_raw)
+    expected_document_bindings = {
+        "current_sha256": predecessor["current_state_sha256"],
+        "control_sha256": predecessor["control_sha256"],
+        "release_evidence_sha256": predecessor["release_evidence_sha256"],
+        "runtime_manifest_sha256": predecessor["runtime_manifest_sha256"],
+        "estate_root": str(estate),
+        "backup_dir": str(backup),
+        "predecessor_release_generation": 2,
+        "release_generation": 3,
+    }
+    for field, expected in expected_document_bindings.items():
+        if document.get(field) != expected:
+            fail(f"recovery completion predecessor binding differs: {field}")
+    if state_sha256 != document["current_sha256"]:
+        fail("recovery completion CURRENT bytes differ")
+    if (
+        state.get("successor") is not True
+        or state.get("predecessor_release_generation") != 2
+        or state.get("release_generation") != 3
+    ):
+        fail("recovered CURRENT generation linkage must be exactly 2 -> 3")
+    if state.get("control_sha256") != predecessor["control_sha256"]:
+        fail("recovered CURRENT control binding differs")
+    if (
+        state.get("release_evidence_sha256")
+        != predecessor["release_evidence_sha256"]
+    ):
+        fail("recovered CURRENT release evidence binding differs")
+    apply_receipt = backup / "APPLY.receipt"
+    if apply_receipt.exists() or apply_receipt.is_symlink():
+        fail("recovered predecessor backup must not contain APPLY.receipt")
+
+    artifact_bindings = {
+        "control_sha256": backup / "CONTROL.sha256",
+        "release_env_sha256": backup / "release.env",
+        "release_evidence_sha256": backup / "RELEASE-EVIDENCE.json",
+        "transaction_sha256": backup / "estate/TRANSACTION.json",
+        "applied_targets_sha256": backup / "estate/APPLIED-TARGETS.sha256",
+        "runtime_receipt_sha256": backup / "runtime/BACKUP.receipt",
+        "runtime_manifest_sha256": backup / "runtime/SHA256SUMS",
+    }
+    for field, path in artifact_bindings.items():
+        require_regular(path)
+        raw = (
+            authority_bytes.get(field)
+            if authority_bytes is not None
+            else None
+        )
+        if raw is None:
+            raw = read_safe_regular(path, f"recovery completion artifact {field}")
+        if sha256_bytes(raw) != document[field]:
+            fail(f"recovery completion backup artifact differs: {field}")
+    return bundle
+
+
 def validate_overlay_static_separation(
     policy: dict[str, Any],
     preimages: dict[str, str],
@@ -544,8 +835,10 @@ def validate_predecessor(
     predecessor_candidate: Path,
     predecessor_stage: Path,
     successor_preimages: Path,
+    recovery_completion_root: Path | None = None,
 ) -> dict[str, Any]:
     policy = validate_policy(policy_path)
+    policy_version = policy["schema_version"]
     predecessor = policy["predecessor"]
     successor = policy["successor"]
     authority_root = require_directory(policy_path.parent)
@@ -588,22 +881,47 @@ def validate_predecessor(
     ):
         fail("successor policy and frozen semantic authority differ")
     state_path = require_regular(current_state_path)
-    if sha256(state_path) != predecessor["current_state_sha256"]:
+    state_raw = read_safe_regular(state_path, "CURRENT authority")
+    if sha256_bytes(state_raw) != predecessor["current_state_sha256"]:
         fail("CURRENT authority differs from the successor policy")
-    state = load_json(state_path)
+    state = load_json_bytes(state_raw, state_path)
     if (
         state.get("schema_version") != 2
         or state.get("state") != "applied_ingress_closed"
-        or state.get("route_database_state") != "absent"
-        or state.get("public_ipv4_ipv6_closed_status") != 404
         or state.get("ingress_opened") is not False
         or state.get("services_activated") is not True
         or state.get("runtime_verified") is not True
     ):
         fail("CURRENT is not a verified applied_ingress_closed predecessor")
-    validate_predecessor_generation(
-        state, predecessor["access_build_input_schema"]
-    )
+    if policy_version == 3:
+        if recovery_completion_root is None:
+            fail("schema 3 successor policy requires --recovery-completion-root")
+        if any(
+            field in state
+            for field in (
+                "apply_receipt_sha256",
+                "route_database_state",
+                "public_ipv4_ipv6_closed_status",
+            )
+        ):
+            fail("recovered CURRENT contains legacy completion authority")
+        if (
+            state.get("successor") is not True
+            or state.get("predecessor_release_generation") != 2
+            or state.get("release_generation") != 3
+        ):
+            fail("recovered CURRENT generation linkage must be exactly 2 -> 3")
+    else:
+        if recovery_completion_root is not None:
+            fail("recovery completion root is forbidden for legacy successor policy")
+        if (
+            state.get("route_database_state") != "absent"
+            or state.get("public_ipv4_ipv6_closed_status") != 404
+        ):
+            fail("CURRENT is not a verified applied_ingress_closed predecessor")
+        validate_predecessor_generation(
+            state, predecessor["access_build_input_schema"]
+        )
     estate = require_directory(estate_root)
     if Path(str(state.get("estate_root"))).resolve() != estate:
         fail("CURRENT estate root differs")
@@ -612,42 +930,72 @@ def validate_predecessor(
         "holdfast-rikune-"
     ):
         fail("CURRENT predecessor backup location is outside the release authority")
-    authority_files = {
-        "control_sha256": backup / "CONTROL.sha256",
-        "apply_receipt_sha256": backup / "APPLY.receipt",
-        "release_evidence_sha256": backup / "RELEASE-EVIDENCE.json",
-        "runtime_manifest_sha256": backup / "runtime/SHA256SUMS",
-    }
+    authority_files = (
+        {
+            "control_sha256": backup / "CONTROL.sha256",
+            "release_evidence_sha256": backup / "RELEASE-EVIDENCE.json",
+            "runtime_manifest_sha256": backup / "runtime/SHA256SUMS",
+        }
+        if policy_version == 3
+        else {
+            "control_sha256": backup / "CONTROL.sha256",
+            "apply_receipt_sha256": backup / "APPLY.receipt",
+            "release_evidence_sha256": backup / "RELEASE-EVIDENCE.json",
+            "runtime_manifest_sha256": backup / "runtime/SHA256SUMS",
+        }
+    )
+    authority_bytes: dict[str, bytes] = {}
     for key, path in authority_files.items():
         require_regular(path)
-        if sha256(path) != predecessor[key]:
+        raw = read_safe_regular(path, f"predecessor authority {key}")
+        authority_bytes[key] = raw
+        if sha256_bytes(raw) != predecessor[key]:
             fail(f"predecessor authority differs: {key}")
     if state.get("control_sha256") != predecessor["control_sha256"]:
         fail("CURRENT control binding differs")
-    if state.get("apply_receipt_sha256") != predecessor["apply_receipt_sha256"]:
+    if policy_version < 3 and (
+        state.get("apply_receipt_sha256") != predecessor["apply_receipt_sha256"]
+    ):
         fail("CURRENT apply receipt binding differs")
     if state.get("release_evidence_sha256") != predecessor["release_evidence_sha256"]:
         fail("CURRENT release evidence binding differs")
-    verify_checksum_manifest(backup, backup / "CONTROL.sha256")
-    verify_checksum_manifest(backup / "runtime", backup / "runtime/SHA256SUMS")
+    verify_checksum_manifest(
+        backup,
+        backup / "CONTROL.sha256",
+        authority_bytes["control_sha256"],
+    )
+    verify_checksum_manifest(
+        backup / "runtime",
+        backup / "runtime/SHA256SUMS",
+        authority_bytes["runtime_manifest_sha256"],
+    )
+    recovery_completion: dict[str, Any] | None = None
+    if policy_version == 3:
+        assert recovery_completion_root is not None
+        recovery_completion = validate_recovered_predecessor(
+            completion_root=recovery_completion_root,
+            predecessor=predecessor,
+            state_path=state_path,
+            state=state,
+            state_raw=state_raw,
+            estate=estate,
+            backup=backup,
+            authority_bytes=authority_bytes,
+        )
 
     candidate = require_directory(predecessor_candidate)
     stage = require_directory(predecessor_stage, private=True)
-    if sha256(require_regular(candidate / "RELEASE-EVIDENCE.json")) != predecessor[
-        "candidate_evidence_sha256"
-    ]:
-        fail("sealed predecessor candidate evidence differs")
-    if sha256(require_regular(candidate / "TARGETS.sha256")) != predecessor[
-        "candidate_targets_sha256"
-    ]:
+    candidate_targets_path = require_regular(candidate / "TARGETS.sha256")
+    candidate_targets_raw = read_safe_regular(
+        candidate_targets_path, "sealed predecessor candidate targets"
+    )
+    if sha256_bytes(candidate_targets_raw) != predecessor["candidate_targets_sha256"]:
         fail("sealed predecessor candidate targets differ")
-    verify_checksum_manifest(candidate, candidate / "TARGETS.sha256")
-    if sha256(require_regular(stage / "RELEASE-EVIDENCE.json")) != predecessor[
-        "release_evidence_sha256"
-    ]:
-        fail("sealed predecessor stage differs from live release evidence")
+    verify_checksum_manifest(
+        candidate, candidate_targets_path, candidate_targets_raw
+    )
     _, release_evidence = validate_predecessor_access_identity(
-        candidate, stage, predecessor
+        candidate, stage, predecessor, bind_evidence_hashes=True
     )
     validate_supporting_snapshot(candidate, supporting_targets)
     release = release_evidence.get("release")
@@ -679,7 +1027,7 @@ def validate_predecessor(
     )
     if observed_build_input != successor["source_access_build_input_sha256"]:
         fail("live exact successor Access source build input differs")
-    return {
+    result = {
         "policy": policy,
         "state": state,
         "backup": backup,
@@ -689,6 +1037,9 @@ def validate_predecessor(
         "successor_static_targets": static_targets,
         "successor_supporting_targets": supporting_targets,
     }
+    if recovery_completion is not None:
+        result["recovery_completion"] = recovery_completion
+    return result
 
 
 def write_delta_manifest(stage_root: Path, policy: dict[str, Any]) -> Path:
@@ -736,6 +1087,7 @@ def main() -> int:
     parser.add_argument("--predecessor-candidate", required=True, type=Path)
     parser.add_argument("--predecessor-stage", required=True, type=Path)
     parser.add_argument("--successor-preimages", required=True, type=Path)
+    parser.add_argument("--recovery-completion-root", type=Path)
     args = parser.parse_args()
     try:
         validate_predecessor(
@@ -745,6 +1097,11 @@ def main() -> int:
             predecessor_candidate=args.predecessor_candidate.absolute(),
             predecessor_stage=args.predecessor_stage.absolute(),
             successor_preimages=args.successor_preimages.absolute(),
+            recovery_completion_root=(
+                args.recovery_completion_root.absolute()
+                if args.recovery_completion_root is not None
+                else None
+            ),
         )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"holdfast successor binding: {error}", file=sys.stderr)

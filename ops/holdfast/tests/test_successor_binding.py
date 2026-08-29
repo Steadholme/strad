@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import argparse
+import copy
 import hashlib
 import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +20,7 @@ sys.path.insert(0, str(OPS_ROOT))
 
 import render  # noqa: E402
 import render_input_binding  # noqa: E402
+import recovery_completion_attestation  # noqa: E402
 import successor_binding  # noqa: E402
 
 
@@ -24,6 +28,7 @@ class SuccessorBindingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="holdfast-successor-")
         self.root = Path(self.temp.name)
+        self.completion_index = 0
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -37,6 +42,832 @@ class SuccessorBindingTests(unittest.TestCase):
         return json.loads(
             (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
         )
+
+    def legacy_policy(
+        self,
+        schema_version: int,
+        policy: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        self.assertIn(schema_version, (1, 2))
+        legacy = copy.deepcopy(
+            self.current_policy() if policy is None else policy
+        )
+        legacy["schema_version"] = schema_version
+        legacy["ceremony"] = f"holdfast-rikune-successor-v{schema_version}"
+        predecessor = legacy["predecessor"]
+        assert isinstance(predecessor, dict)
+        predecessor.pop("completion", None)
+        predecessor["apply_receipt_sha256"] = hashlib.sha256(
+            b"holdfast-test-legacy-apply-receipt"
+        ).hexdigest()
+        if schema_version == 1:
+            predecessor["access_build_input_schema"] = (
+                successor_binding.BUILD_INPUT_V1
+            )
+        return legacy
+
+    def synthetic_access_overlay(
+        self, count: int = 7
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "path": f"access-governance/src/legacy_overlay_{index:02d}.rs",
+                "before_sha256": None,
+                "after_sha256": f"{index + 1:064x}",
+            }
+            for index in range(count)
+        ]
+
+    def copy_successor_authority(self, name: str) -> Path:
+        authority = self.root / name
+        authority.mkdir()
+        for relative in render_input_binding.SUCCESSOR_BOUND_INPUTS:
+            shutil.copyfile(OPS_ROOT / relative, authority / relative)
+        for _, relative in successor_binding.SUCCESSOR_STATIC_ASSET_SOURCES:
+            destination = authority / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(OPS_ROOT / relative, destination)
+        return authority
+
+    def invoke_render_authority_seam(
+        self, name: str, mutation: str | None
+    ) -> tuple[int | SystemExit, list[object]]:
+        authority = self.copy_successor_authority(f"{name}-authority")
+        policy_path = authority / "successor-policy.json"
+        original_policy = policy_path.read_bytes()
+        policy = json.loads(original_policy)
+        reordered_policy = (
+            json.dumps(
+                {key: policy[key] for key in reversed(tuple(policy))},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        self.assertEqual(json.loads(original_policy), json.loads(reordered_policy))
+        self.assertNotEqual(original_policy, reordered_policy)
+        replacement_authority = (
+            self.copy_successor_authority(f"{name}-replacement-authority")
+            if mutation == "replace-authority"
+            else None
+        )
+
+        estate = self.root / f"{name}-estate"
+        (estate / "access-governance").mkdir(parents=True)
+        stage_parent = self.root / f"{name}-output"
+        stage_parent.mkdir()
+        stage = stage_parent / "stage"
+        current_state = self.root / f"{name}-CURRENT.json"
+        predecessor_candidate = self.root / f"{name}-candidate"
+        predecessor_stage = self.root / f"{name}-predecessor-stage"
+        context = {
+            "policy": policy,
+            "predecessor_candidate": predecessor_candidate,
+            "successor_preimages": {},
+            "successor_static_targets": {},
+            "successor_supporting_targets": {},
+        }
+        full_render = mutation == "full-stable"
+        argv = [
+            "render.py",
+            "--estate-root",
+            str(estate),
+            "--stage-root",
+            str(stage),
+            "--successor",
+            "--current-state",
+            str(current_state),
+            "--predecessor-candidate",
+            str(predecessor_candidate),
+            "--predecessor-stage",
+            str(predecessor_stage),
+        ]
+        if full_render:
+            argv.extend(
+                (
+                    "--release-env",
+                    str(self.root / f"{name}-release.env"),
+                    "--secret-env",
+                    str(self.root / f"{name}-secret.env"),
+                )
+            )
+        else:
+            argv.extend(("--catalog-only", "--release-tool-revision", "a" * 40))
+
+        def copy_stage(*args: object, **_kwargs: object) -> None:
+            rendered_stage = args[2]
+            assert isinstance(rendered_stage, Path)
+            rendered_stage.mkdir(mode=0o700)
+
+        def validate_predecessor(**_kwargs: object) -> dict[str, object]:
+            if mutation == "validator-transient-reorder":
+                pinned_policy = _kwargs["policy_path"]
+                assert isinstance(pinned_policy, Path)
+                self.assertNotEqual(pinned_policy, policy_path)
+                self.assertEqual(pinned_policy.read_bytes(), original_policy)
+                policy_path.write_bytes(reordered_policy)
+                self.assertEqual(json.loads(policy_path.read_bytes()), policy)
+                self.assertEqual(pinned_policy.read_bytes(), original_policy)
+                policy_path.write_bytes(original_policy)
+            return context
+
+        def read_private_env_snapshot(
+            _path: Path,
+            label: str,
+            _allow_empty: bool = False,
+        ) -> tuple[dict[str, str], str]:
+            if label == "release":
+                return {"HOLDFAST_RELEASE_TOOL_REVISION": "a" * 40}, "b" * 64
+            return {}, "c" * 64
+
+        def validate_render(*args: object, **_kwargs: object) -> None:
+            if mutation != "validator-replace-stage":
+                return
+            rendered_stage = args[0]
+            assert isinstance(rendered_stage, Path)
+            rendered_stage.rename(self.root / f"{name}-validated-stage")
+            rendered_stage.mkdir(mode=0o700)
+
+        def write_evidence(*args: object, **_kwargs: object) -> None:
+            rendered_stage = args[0]
+            assert isinstance(rendered_stage, Path)
+            if mutation == "transient-reorder":
+                policy_path.write_bytes(reordered_policy)
+            render_input_binding.write_binding(
+                authority,
+                rendered_stage / "RENDER-INPUTS.sha256",
+                successor=True,
+            )
+            if mutation == "transient-reorder":
+                policy_path.write_bytes(original_policy)
+            elif mutation == "whitespace":
+                policy_path.write_bytes(original_policy.rstrip() + b" \n")
+            elif mutation == "replace-authority":
+                assert replacement_authority is not None
+                authority.rename(self.root / f"{name}-original-authority")
+                replacement_authority.rename(authority)
+            elif mutation == "replace-stage":
+                original_stage = self.root / f"{name}-original-stage"
+                rendered_stage.rename(original_stage)
+                rendered_stage.mkdir(mode=0o700)
+                shutil.copyfile(
+                    original_stage / "RENDER-INPUTS.sha256",
+                    rendered_stage / "RENDER-INPUTS.sha256",
+                )
+
+        snapshot_validator = mock.Mock()
+        full_renderer = mock.Mock()
+
+        with mock.patch.object(render, "OPS_ROOT", authority), mock.patch.object(
+            sys, "argv", argv
+        ), mock.patch.object(
+            render, "validate_predecessor", side_effect=validate_predecessor
+        ), mock.patch.object(
+            render, "validate_release"
+        ), mock.patch.object(
+            render, "validate_successor_release"
+        ), mock.patch.object(
+            render, "validate_tool_revision"
+        ), mock.patch.object(
+            render, "copy_successor_stage", side_effect=copy_stage
+        ), mock.patch.object(
+            render,
+            "validate_successor_snapshot",
+            snapshot_validator,
+        ), mock.patch.object(
+            render,
+            "read_private_env_snapshot",
+            side_effect=read_private_env_snapshot,
+        ), mock.patch.object(
+            render,
+            "render_full_env",
+            full_renderer,
+        ), mock.patch.object(
+            render, "validate_render", side_effect=validate_render
+        ), mock.patch.object(
+            render, "write_evidence", side_effect=write_evidence
+        ), mock.patch.object(
+            render, "run_checked"
+        ), mock.patch(
+            "builtins.print"
+        ) as printer:
+            try:
+                outcome: int | SystemExit = render.main()
+            except SystemExit as error:
+                outcome = error
+            calls = list(printer.call_args_list)
+        if full_render:
+            self.assertEqual(snapshot_validator.call_count, 1)
+            self.assertEqual(full_renderer.call_count, 1)
+        return outcome, calls
+
+    def v3_policy(
+        self, completion: dict[str, object] | None = None
+    ) -> dict[str, object]:
+        policy = self.current_policy()
+        policy["schema_version"] = 3
+        policy["ceremony"] = "holdfast-rikune-successor-v3"
+        predecessor = policy["predecessor"]
+        assert isinstance(predecessor, dict)
+        predecessor.pop("apply_receipt_sha256", None)
+        predecessor["access_build_input_schema"] = successor_binding.BUILD_INPUT_V2
+        predecessor["completion"] = completion or {
+            "kind": recovery_completion_attestation.KIND,
+            "attestation_sha256": "a" * 64,
+            "signature_sha256": "b" * 64,
+            "public_key_sha256": "c" * 64,
+        }
+        return policy
+
+    def issue_recovery_completion(
+        self,
+        predecessor: dict[str, object],
+        estate_root: Path,
+        backup_dir: Path,
+        name: str,
+        artifact_hashes: dict[str, str] | None = None,
+    ) -> tuple[Path, dict[str, object], dict[str, object]]:
+        artifact_hashes = artifact_hashes or {}
+        release = self.root / name
+        release.mkdir(mode=0o700)
+        private_key = self.root / f"{name}.key"
+        public_key = self.root / f"{name}.pub"
+        subprocess.run(
+            [
+                "openssl",
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-out",
+                str(private_key),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "pkey",
+                "-in",
+                str(private_key),
+                "-pubout",
+                "-out",
+                str(public_key),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        private_key.chmod(0o600)
+        public_key.chmod(0o600)
+        public_key_sha256 = hashlib.sha256(public_key.read_bytes()).hexdigest()
+        args = argparse.Namespace(
+            release_root=release,
+            private_key=private_key,
+            source_public_key=public_key,
+            public_key_sha256=public_key_sha256,
+            recovery_attempt_id="20260828T120000Z-4242",
+            prior_failure_receipt=(
+                "APPLY-ACTIVATION-FAILED-20260828T115900Z-123.receipt"
+            ),
+            prior_failure_receipt_sha256="1" * 64,
+            apply_armed_at="2026-08-28T11:58:00Z",
+            recovery_armed_at="2026-08-28T12:00:00Z",
+            recovery_completed_at="2026-08-28T12:00:30Z",
+            estate_root=estate_root,
+            backup_dir=backup_dir,
+            current_sha256=predecessor["current_state_sha256"],
+            completion_receipt=(
+                "APPLY-RECOVERY-COMPLETE-20260828T120000Z-4242.receipt"
+            ),
+            completion_receipt_sha256="2" * 64,
+            completion_archive=(
+                "APPLY-RECOVERY-COMPLETE-20260828T120000Z-4242.json"
+            ),
+            completion_archive_sha256="3" * 64,
+            recovery_armed_receipt=(
+                "APPLY-RECOVERY-ARMED-20260828T120000Z-4242.receipt"
+            ),
+            recovery_armed_receipt_sha256="4" * 64,
+            control_sha256=predecessor["control_sha256"],
+            release_env_sha256=artifact_hashes.get(
+                "release_env_sha256", "5" * 64
+            ),
+            release_evidence_sha256=predecessor["release_evidence_sha256"],
+            transaction_sha256=artifact_hashes.get(
+                "transaction_sha256", "6" * 64
+            ),
+            applied_targets_sha256=artifact_hashes.get(
+                "applied_targets_sha256", "7" * 64
+            ),
+            runtime_receipt_sha256=artifact_hashes.get(
+                "runtime_receipt_sha256", "8" * 64
+            ),
+            runtime_manifest_sha256=predecessor["runtime_manifest_sha256"],
+            predecessor_release_generation=2,
+            release_generation=3,
+        )
+        artifact = recovery_completion_attestation.issue(args)
+        completion: dict[str, object] = {
+            "kind": recovery_completion_attestation.KIND,
+            "attestation_sha256": artifact["attestation_sha256"],
+            "signature_sha256": artifact["signature_sha256"],
+            "public_key_sha256": artifact["public_key_sha256"],
+        }
+        document = json.loads(
+            (release / recovery_completion_attestation.ATTESTATION_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        return release, completion, document
+
+    def make_recovered_predecessor_fixture(
+        self,
+    ) -> tuple[
+        Path,
+        Path,
+        Path,
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+    ]:
+        self.completion_index += 1
+        suffix = str(self.completion_index)
+        estate = self.root / f"recovered-estate-{suffix}"
+        backup = self.root / f"recovered-backup-{suffix}"
+        state_root = self.root / f"recovered-state-{suffix}"
+        estate.mkdir(mode=0o700)
+        (backup / "runtime").mkdir(parents=True, mode=0o700)
+        (backup / "estate").mkdir(mode=0o700)
+        state_root.mkdir(mode=0o700)
+        artifacts = {
+            "control_sha256": backup / "CONTROL.sha256",
+            "release_env_sha256": backup / "release.env",
+            "release_evidence_sha256": backup / "RELEASE-EVIDENCE.json",
+            "transaction_sha256": backup / "estate/TRANSACTION.json",
+            "applied_targets_sha256": backup / "estate/APPLIED-TARGETS.sha256",
+            "runtime_receipt_sha256": backup / "runtime/BACKUP.receipt",
+            "runtime_manifest_sha256": backup / "runtime/SHA256SUMS",
+        }
+        for index, path in enumerate(artifacts.values(), 1):
+            path.write_text(f"recovered artifact {index}\n", encoding="utf-8")
+            path.chmod(0o600)
+        predecessor = copy.deepcopy(self.current_policy()["predecessor"])
+        assert isinstance(predecessor, dict)
+        predecessor.pop("apply_receipt_sha256", None)
+        predecessor["access_build_input_schema"] = successor_binding.BUILD_INPUT_V2
+        for field in (
+            "control_sha256",
+            "release_evidence_sha256",
+            "runtime_manifest_sha256",
+        ):
+            predecessor[field] = successor_binding.sha256(artifacts[field])
+        state = {
+            "schema_version": 2,
+            "state": "applied_ingress_closed",
+            "successor": True,
+            "predecessor_release_generation": 2,
+            "release_generation": 3,
+            "estate_root": str(estate),
+            "backup_dir": str(backup),
+            "control_sha256": predecessor["control_sha256"],
+            "release_evidence_sha256": predecessor["release_evidence_sha256"],
+            "services_activated": True,
+            "runtime_verified": True,
+            "ingress_opened": False,
+        }
+        state_path = state_root / "CURRENT.json"
+        state_path.write_text(json.dumps(state, sort_keys=True) + "\n")
+        predecessor["current_state_sha256"] = successor_binding.sha256(state_path)
+        artifact_hashes = {
+            field: successor_binding.sha256(path)
+            for field, path in artifacts.items()
+        }
+        completion_root, completion, document = self.issue_recovery_completion(
+            predecessor,
+            estate,
+            backup,
+            f"recovery-completion-{suffix}",
+            artifact_hashes,
+        )
+        predecessor["completion"] = completion
+        return state_path, estate, backup, state, predecessor, {
+            "root": completion_root,
+            "document": document,
+            "artifacts": artifacts,
+        }
+
+    def test_schema_v3_policy_uses_exact_nested_recovery_completion(self) -> None:
+        policy = self.v3_policy()
+        validated = successor_binding.validate_policy(
+            self.write_policy(policy, "successor-v3.json")
+        )
+        self.assertEqual(validated["schema_version"], 3)
+        self.assertNotIn("apply_receipt_sha256", validated["predecessor"])
+        self.assertEqual(
+            set(validated["predecessor"]["completion"]),
+            successor_binding.RECOVERY_COMPLETION_FIELDS,
+        )
+
+        cases: list[tuple[str, dict[str, object], str]] = []
+        missing = self.v3_policy()
+        del missing["predecessor"]["completion"]["signature_sha256"]
+        cases.append(("missing", missing, "field set"))
+        extra = self.v3_policy()
+        extra["predecessor"]["completion"]["extra"] = True
+        cases.append(("extra", extra, "field set"))
+        null_hash = self.v3_policy()
+        null_hash["predecessor"]["completion"]["attestation_sha256"] = None
+        cases.append(("null", null_hash, "lowercase SHA-256"))
+        wrong_kind = self.v3_policy()
+        wrong_kind["predecessor"]["completion"]["kind"] = "recovery-v2"
+        cases.append(("kind", wrong_kind, "kind differs"))
+        malformed_hash = self.v3_policy()
+        malformed_hash["predecessor"]["completion"]["public_key_sha256"] = (
+            "F" * 64
+        )
+        cases.append(("hash", malformed_hash, "lowercase SHA-256"))
+        hybrid = self.v3_policy()
+        hybrid["predecessor"]["apply_receipt_sha256"] = "d" * 64
+        cases.append(("hybrid", hybrid, "predecessor policy field set"))
+        unknown = self.v3_policy()
+        unknown["schema_version"] = 4
+        unknown["ceremony"] = "holdfast-rikune-successor-v4"
+        cases.append(("unknown-v4", unknown, "version or ceremony"))
+        for name, candidate, error in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                successor_binding.validate_policy(
+                    self.write_policy(candidate, f"v3-{name}.json")
+                )
+
+    def test_recovery_completion_rejects_signature_and_key_tamper(self) -> None:
+        _, _, _, _, predecessor, recovery = (
+            self.make_recovered_predecessor_fixture()
+        )
+        completion = predecessor["completion"]
+        root = recovery["root"]
+        successor_binding.read_recovery_completion_bundle(root, completion)
+
+        signature_path = root / recovery_completion_attestation.SIGNATURE_NAME
+        tampered_signature = bytearray(signature_path.read_bytes())
+        tampered_signature[0] ^= 0x01
+        signature_path.write_bytes(tampered_signature)
+        signature_path.chmod(0o600)
+        signature_binding = copy.deepcopy(completion)
+        signature_binding["signature_sha256"] = hashlib.sha256(
+            signature_path.read_bytes()
+        ).hexdigest()
+        with self.assertRaisesRegex(
+            ValueError, "OpenSSL ceremony failed|signature verification failed"
+        ):
+            successor_binding.read_recovery_completion_bundle(
+                root, signature_binding
+            )
+
+        _, _, _, _, predecessor, recovery = (
+            self.make_recovered_predecessor_fixture()
+        )
+        root = recovery["root"]
+        completion = predecessor["completion"]
+        alternate_private = self.root / "alternate.key"
+        alternate_public = self.root / "alternate.pub"
+        subprocess.run(
+            [
+                "openssl",
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-out",
+                str(alternate_private),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "pkey",
+                "-in",
+                str(alternate_private),
+                "-pubout",
+                "-out",
+                str(alternate_public),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        public_path = root / recovery_completion_attestation.PUBLIC_KEY_NAME
+        public_path.write_bytes(alternate_public.read_bytes())
+        public_path.chmod(0o600)
+        key_binding = copy.deepcopy(completion)
+        key_binding["public_key_sha256"] = hashlib.sha256(
+            public_path.read_bytes()
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "attestation public key pin differs"):
+            successor_binding.read_recovery_completion_bundle(root, key_binding)
+
+    def test_recovered_predecessor_cross_checks_current_backup_and_generation(
+        self,
+    ) -> None:
+        state_path, estate, backup, state, predecessor, recovery = (
+            self.make_recovered_predecessor_fixture()
+        )
+        successor_binding.validate_recovered_predecessor(
+            completion_root=recovery["root"],
+            predecessor=predecessor,
+            state_path=state_path,
+            state=state,
+            estate=estate,
+            backup=backup,
+        )
+
+        original_current = state_path.read_bytes()
+        state_path.write_bytes(original_current + b" ")
+        with self.assertRaisesRegex(ValueError, "CURRENT bytes differ"):
+            successor_binding.validate_recovered_predecessor(
+                completion_root=recovery["root"],
+                predecessor=predecessor,
+                state_path=state_path,
+                state=state,
+                estate=estate,
+                backup=backup,
+            )
+        state_path.write_bytes(original_current)
+
+        release_env = recovery["artifacts"]["release_env_sha256"]
+        release_env.write_text("tampered release env\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "backup artifact differs"):
+            successor_binding.validate_recovered_predecessor(
+                completion_root=recovery["root"],
+                predecessor=predecessor,
+                state_path=state_path,
+                state=state,
+                estate=estate,
+                backup=backup,
+            )
+        release_env.write_text("recovered artifact 2\n", encoding="utf-8")
+
+        wrong_generation = dict(state)
+        wrong_generation["release_generation"] = 4
+        state_path.write_text(
+            json.dumps(wrong_generation, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        wrong_predecessor = copy.deepcopy(predecessor)
+        wrong_predecessor["current_state_sha256"] = successor_binding.sha256(
+            state_path
+        )
+        artifact_hashes = {
+            field: successor_binding.sha256(path)
+            for field, path in recovery["artifacts"].items()
+        }
+        wrong_root, wrong_completion, _ = self.issue_recovery_completion(
+            wrong_predecessor,
+            estate,
+            backup,
+            "wrong-generation-completion",
+            artifact_hashes,
+        )
+        wrong_predecessor["completion"] = wrong_completion
+        with self.assertRaisesRegex(ValueError, "exactly 2 -> 3"):
+            successor_binding.validate_recovered_predecessor(
+                completion_root=wrong_root,
+                predecessor=wrong_predecessor,
+                state_path=state_path,
+                state=wrong_generation,
+                estate=estate,
+                backup=backup,
+            )
+
+        state_path.write_bytes(original_current)
+
+        (backup / "APPLY.receipt").write_text("legacy\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "must not contain APPLY.receipt"):
+            successor_binding.validate_recovered_predecessor(
+                completion_root=recovery["root"],
+                predecessor=predecessor,
+                state_path=state_path,
+                state=state,
+                estate=estate,
+                backup=backup,
+            )
+
+    def test_recovery_completion_copies_identical_bytes_and_is_not_render_bound(
+        self,
+    ) -> None:
+        _, estate, backup, _, predecessor, recovery = (
+            self.make_recovered_predecessor_fixture()
+        )
+        completion = predecessor["completion"]
+        source = successor_binding.read_recovery_completion_bundle(
+            recovery["root"], completion
+        )
+        recovery["root"].chmod(0o500)
+        with self.assertRaisesRegex(ValueError, "mode 0700"):
+            successor_binding.read_recovery_completion_bundle(
+                recovery["root"], completion
+            )
+        recovery["root"].chmod(0o700)
+        candidate = self.root / "candidate-stage"
+        full = self.root / "full-stage"
+        candidate.mkdir(mode=0o700)
+        full.mkdir(mode=0o700)
+        successor_binding.write_recovery_completion_bundle(
+            candidate, completion, source
+        )
+        successor_binding.write_recovery_completion_bundle(full, completion, source)
+        render.validate_final_recovery_completion(
+            full, completion, source, copy.deepcopy(source)
+        )
+        for name in successor_binding.RECOVERY_COMPLETION_NAMES:
+            self.assertEqual((candidate / name).read_bytes(), (full / name).read_bytes())
+            self.assertEqual(stat.S_IMODE((candidate / name).stat().st_mode), 0o600)
+
+        inputs = self.root / "render-inputs.sha256"
+        render_input_binding.write_binding(OPS_ROOT, inputs, successor=True)
+        bound_names = {
+            line.split("  ", 1)[1]
+            for line in inputs.read_text(encoding="utf-8").splitlines()
+        }
+        self.assertTrue(
+            set(successor_binding.RECOVERY_COMPLETION_NAMES).isdisjoint(bound_names)
+        )
+        self.assertEqual(recovery["document"]["estate_root"], str(estate))
+        self.assertEqual(recovery["document"]["backup_dir"], str(backup))
+
+        signature = full / recovery_completion_attestation.SIGNATURE_NAME
+        signature.write_bytes(b"tampered after initial stage validation")
+        signature.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "artifact differs"):
+            render.validate_final_recovery_completion(
+                full, completion, source, copy.deepcopy(source)
+            )
+
+    def test_render_rejects_invalid_completion_before_creating_stage(self) -> None:
+        estate = self.root / "render-order-estate"
+        (estate / "access-governance").mkdir(parents=True)
+        stage = self.root / "render-order-stage"
+        argv = [
+            "render.py",
+            "--estate-root",
+            str(estate),
+            "--stage-root",
+            str(stage),
+            "--catalog-only",
+            "--successor",
+            "--current-state",
+            str(self.root / "CURRENT.json"),
+            "--predecessor-candidate",
+            str(self.root / "candidate"),
+            "--predecessor-stage",
+            str(self.root / "predecessor-stage"),
+            "--recovery-completion-root",
+            str(self.root / "invalid-completion"),
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            render,
+            "validate_predecessor",
+            side_effect=ValueError("invalid recovery completion"),
+        ), mock.patch.object(render, "copy_successor_stage") as copier:
+            with self.assertRaisesRegex(ValueError, "invalid recovery completion"):
+                render.main()
+        copier.assert_not_called()
+        self.assertFalse(stage.exists())
+
+    def test_render_final_authority_gate_accepts_stable_bytes(self) -> None:
+        outcome, prints = self.invoke_render_authority_seam("stable", None)
+        self.assertEqual(outcome, 0)
+        self.assertEqual(len(prints), 2)
+
+    def test_render_final_authority_gate_preserves_full_render_contract(
+        self,
+    ) -> None:
+        outcome, prints = self.invoke_render_authority_seam(
+            "full-stable",
+            "full-stable",
+        )
+        self.assertEqual(outcome, 0)
+        self.assertEqual(len(prints), 2)
+
+    def test_render_final_authority_gate_rejects_policy_whitespace_drift(
+        self,
+    ) -> None:
+        outcome, prints = self.invoke_render_authority_seam(
+            "whitespace-drift", "whitespace"
+        )
+        self.assertIsInstance(outcome, SystemExit)
+        self.assertIn(
+            "successor authority raw bytes changed during render: "
+            "successor-policy.json",
+            str(outcome),
+        )
+        self.assertEqual(prints, [])
+
+    def test_render_final_authority_gate_rejects_transient_policy_reorder(
+        self,
+    ) -> None:
+        outcome, prints = self.invoke_render_authority_seam(
+            "transient-reorder", "transient-reorder"
+        )
+        self.assertIsInstance(outcome, SystemExit)
+        self.assertIn(
+            "RENDER-INPUTS differs from initial successor authority: "
+            "successor-policy.json",
+            str(outcome),
+        )
+        self.assertEqual(prints, [])
+
+    def test_render_final_authority_gate_rejects_authority_root_replacement(
+        self,
+    ) -> None:
+        outcome, prints = self.invoke_render_authority_seam(
+            "replace-authority", "replace-authority"
+        )
+        self.assertIsInstance(outcome, SystemExit)
+        self.assertIn(
+            "successor authority root identity changed during render",
+            str(outcome),
+        )
+        self.assertEqual(prints, [])
+
+    def test_render_final_authority_gate_rejects_stage_root_replacement(
+        self,
+    ) -> None:
+        outcome, prints = self.invoke_render_authority_seam(
+            "replace-stage", "replace-stage"
+        )
+        self.assertIsInstance(outcome, SystemExit)
+        self.assertIn(
+            "successor stage root identity changed during render",
+            str(outcome),
+        )
+        self.assertEqual(prints, [])
+
+    def test_render_validator_uses_pinned_authority_during_transient_reorder(
+        self,
+    ) -> None:
+        outcome, prints = self.invoke_render_authority_seam(
+            "validator-transient-reorder",
+            "validator-transient-reorder",
+        )
+        self.assertEqual(outcome, 0)
+        self.assertEqual(len(prints), 2)
+
+    def test_render_rejects_stage_replacement_at_validator_return(
+        self,
+    ) -> None:
+        outcome, prints = self.invoke_render_authority_seam(
+            "validator-replace-stage",
+            "validator-replace-stage",
+        )
+        self.assertIsInstance(outcome, SystemExit)
+        self.assertIn(
+            "successor stage root identity changed during render",
+            str(outcome),
+        )
+        self.assertEqual(prints, [])
+
+    def test_authority_snapshot_rejects_directory_replacement_mid_read(
+        self,
+    ) -> None:
+        authority = self.copy_successor_authority("mid-read-authority")
+        replacement = self.copy_successor_authority("mid-read-replacement")
+        displaced = self.root / "mid-read-displaced"
+        identity = render.stable_directory_path_identity(
+            authority,
+            "successor authority",
+        )
+        real_reader = render.read_successor_authority_bytes
+        replaced = False
+
+        def replacing_reader(
+            directory: int,
+            name: str,
+            label: str = "successor authority",
+        ) -> bytes:
+            nonlocal replaced
+            raw = real_reader(directory, name, label)
+            if not replaced:
+                authority.rename(displaced)
+                replacement.rename(authority)
+                replaced = True
+            return raw
+
+        with mock.patch.object(
+            render,
+            "read_successor_authority_bytes",
+            side_effect=replacing_reader,
+        ), self.assertRaisesRegex(
+            SystemExit,
+            "root (changed during snapshot|path mapping changed)",
+        ):
+            render.snapshot_successor_authority(authority, identity)
+        self.assertTrue(replaced)
 
     def test_v2_build_identity_excludes_only_declared_runtime_debris(self) -> None:
         stage = self.root / "stage"
@@ -395,13 +1226,8 @@ class SuccessorBindingTests(unittest.TestCase):
             successor_binding.validate_source_delta(policy, predecessor, live)
 
     def test_legacy_seven_path_policy_remains_valid(self) -> None:
-        legacy = self.current_policy()
-        legacy["schema_version"] = 1
-        legacy["ceremony"] = "holdfast-rikune-successor-v1"
-        legacy["predecessor"]["access_build_input_schema"] = (
-            successor_binding.BUILD_INPUT_V1
-        )
-        legacy["overlay"] = legacy["overlay"][:7]
+        legacy = self.legacy_policy(1)
+        legacy["overlay"] = self.synthetic_access_overlay()
         validated = successor_binding.validate_policy(
             self.write_policy(legacy, "legacy-seven-path.json")
         )
@@ -414,7 +1240,7 @@ class SuccessorBindingTests(unittest.TestCase):
     def test_policy_overlay_is_nonempty_sorted_unique_bounded_and_scoped(
         self,
     ) -> None:
-        original = list(self.current_policy()["overlay"])
+        original = list(self.legacy_policy(2)["overlay"])
 
         cases: list[tuple[str, list[dict[str, object]], str]] = [
             ("empty", [], "size differs"),
@@ -442,9 +1268,7 @@ class SuccessorBindingTests(unittest.TestCase):
 
         for name, overlay, message in cases:
             with self.subTest(name=name):
-                policy = self.current_policy()
-                policy["schema_version"] = 2
-                policy["ceremony"] = "holdfast-rikune-successor-v2"
+                policy = self.legacy_policy(2)
                 policy["overlay"] = overlay
                 path = self.write_policy(policy, f"{name}.json")
                 with self.assertRaisesRegex(ValueError, message):
@@ -516,9 +1340,7 @@ class SuccessorBindingTests(unittest.TestCase):
                 "after_sha256": successor_binding.sha256(new_after),
             },
         ]
-        policy = self.current_policy()
-        policy["schema_version"] = 2
-        policy["ceremony"] = "holdfast-rikune-successor-v2"
+        policy = self.legacy_policy(2)
         predecessor = policy["predecessor"]
         predecessor["access_build_input_schema"] = successor_binding.BUILD_INPUT_V2
         predecessor["access_build_input_sha256"] = build_input
@@ -552,13 +1374,11 @@ class SuccessorBindingTests(unittest.TestCase):
                 candidate, stage, validated["predecessor"]
             )
 
-        downgrade = self.current_policy()
-        downgrade["schema_version"] = 1
-        downgrade["ceremony"] = "holdfast-rikune-successor-v1"
+        downgrade = self.legacy_policy(1)
         downgrade["predecessor"]["access_build_input_schema"] = (
             successor_binding.BUILD_INPUT_V2
         )
-        downgrade["overlay"] = downgrade["overlay"][:7]
+        downgrade["overlay"] = self.synthetic_access_overlay()
         downgrade_path = self.write_policy(
             downgrade, "legacy-policy-v2-predecessor.json"
         )
@@ -860,6 +1680,52 @@ class SuccessorBindingTests(unittest.TestCase):
             ),
             {},
         )
+
+    def test_schema_v3_successor_stage_copies_verified_completion_bytes(self) -> None:
+        (
+            authority,
+            estate,
+            predecessor_candidate,
+            policy,
+            preimages,
+            static_targets,
+            supporting_targets,
+        ) = self.make_successor_copy_fixture(
+            overlay_count=2, promote_static_asset=False
+        )
+        policy["schema_version"] = 3
+        policy["ceremony"] = "holdfast-rikune-successor-v3"
+        predecessor = copy.deepcopy(self.current_policy()["predecessor"])
+        predecessor.pop("apply_receipt_sha256", None)
+        predecessor["access_build_input_schema"] = successor_binding.BUILD_INPUT_V2
+        completion_root, completion, _ = self.issue_recovery_completion(
+            predecessor,
+            estate,
+            self.root / "stage-v3-backup",
+            "stage-v3-completion",
+        )
+        predecessor["completion"] = completion
+        policy["predecessor"] = predecessor
+        source = successor_binding.read_recovery_completion_bundle(
+            completion_root, completion
+        )
+        stage = self.root / "stage-v3"
+        render.copy_successor_stage(
+            estate,
+            predecessor_candidate,
+            stage,
+            True,
+            policy,
+            preimages,
+            static_targets,
+            authority,
+            source,
+        )
+        render.validate_successor_snapshot(
+            stage, policy, preimages, supporting_targets, True
+        )
+        for name in successor_binding.RECOVERY_COMPLETION_NAMES:
+            self.assertEqual(stage.joinpath(name).read_bytes(), source["bytes"][name])
 
     def test_schema_v1_static_transition_requires_the_exact_legacy_change(
         self,
@@ -1175,6 +2041,118 @@ class SuccessorBindingTests(unittest.TestCase):
                 ops, binding, stage, evidence, "successor"
             )
 
+    def test_apply_binding_v3_requires_and_verifies_adjacent_completion_trio(
+        self,
+    ) -> None:
+        ops, stage, evidence, binding, source_estate = self.make_apply_fixture()
+        policy_path = ops / "successor-policy.json"
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["schema_version"] = 3
+        policy["ceremony"] = "holdfast-rikune-successor-v3"
+        predecessor = policy["predecessor"]
+        predecessor.pop("apply_receipt_sha256")
+        predecessor["access_build_input_schema"] = successor_binding.BUILD_INPUT_V2
+        backup = self.root / "apply-v3-backup"
+        completion_root, completion, _ = self.issue_recovery_completion(
+            predecessor, source_estate, backup, "apply-v3-completion"
+        )
+        predecessor["completion"] = completion
+        policy_path.write_text(json.dumps(policy) + "\n", encoding="utf-8")
+        evidence_value = json.loads(evidence.read_text(encoding="utf-8"))
+        evidence_value["predecessor_binding"] = copy.deepcopy(predecessor)
+        evidence.write_text(json.dumps(evidence_value) + "\n", encoding="utf-8")
+        binding.unlink()
+        render_input_binding.write_binding(ops, binding, successor=True)
+
+        with self.assertRaisesRegex(RuntimeError, "lacks the exact"):
+            render_input_binding.verify_apply_binding(
+                ops,
+                binding,
+                stage,
+                evidence,
+                "successor",
+                source_estate_root=source_estate,
+            )
+        source = successor_binding.read_recovery_completion_bundle(
+            completion_root, completion
+        )
+        successor_binding.write_recovery_completion_bundle(stage, completion, source)
+        render_input_binding.verify_apply_binding(
+            ops,
+            binding,
+            stage,
+            evidence,
+            "successor",
+            source_estate_root=source_estate,
+        )
+
+        (stage / recovery_completion_attestation.SIGNATURE_NAME).write_bytes(
+            b"tampered"
+        )
+        with self.assertRaisesRegex(RuntimeError, "differs: signature_sha256"):
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "successor"
+            )
+        policy["predecessor"]["completion"]["signature_sha256"] = hashlib.sha256(
+            (stage / recovery_completion_attestation.SIGNATURE_NAME).read_bytes()
+        ).hexdigest()
+        policy_path.write_text(json.dumps(policy) + "\n", encoding="utf-8")
+        evidence_value["predecessor_binding"] = copy.deepcopy(
+            policy["predecessor"]
+        )
+        evidence.write_text(json.dumps(evidence_value) + "\n", encoding="utf-8")
+        binding.unlink()
+        render_input_binding.write_binding(ops, binding, successor=True)
+        with self.assertRaisesRegex(ValueError, "OpenSSL ceremony failed"):
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "successor"
+            )
+
+    def test_apply_binding_v2_forbids_recovery_completion_trio(self) -> None:
+        ops, stage, evidence, binding, source_estate = self.make_apply_fixture(
+            overlay_count=2
+        )
+        policy = json.loads(
+            (ops / "successor-policy.json").read_text(encoding="utf-8")
+        )
+        predecessor = policy["predecessor"]
+        completion_root, completion, _ = self.issue_recovery_completion(
+            predecessor,
+            source_estate,
+            self.root / "legacy-backup",
+            "legacy-extra-completion",
+        )
+        source = successor_binding.read_recovery_completion_bundle(
+            completion_root, completion
+        )
+        successor_binding.write_recovery_completion_bundle(stage, completion, source)
+        with self.assertRaisesRegex(RuntimeError, "legacy successor stage"):
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "successor"
+            )
+
+    def test_apply_binding_v1_forbids_recovery_completion_trio(self) -> None:
+        ops, stage, evidence, binding, source_estate = self.make_apply_fixture(
+            overlay_count=7
+        )
+        predecessor = json.loads(
+            (ops / "successor-policy.json").read_text(encoding="utf-8")
+        )["predecessor"]
+        completion_root, completion, _ = self.issue_recovery_completion(
+            predecessor,
+            source_estate,
+            self.root / "legacy-v1-backup",
+            "legacy-v1-extra-completion",
+        )
+        source = successor_binding.read_recovery_completion_bundle(
+            completion_root, completion
+        )
+        successor_binding.write_recovery_completion_bundle(stage, completion, source)
+        with self.assertRaisesRegex(RuntimeError, "legacy successor stage"):
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "successor"
+            )
+
     def test_apply_binding_accepts_non_legacy_exact_overlay_size(self) -> None:
         ops, stage, evidence, binding, source_estate = self.make_apply_fixture(
             overlay_count=2
@@ -1187,6 +2165,22 @@ class SuccessorBindingTests(unittest.TestCase):
             "successor",
             require_root_owner=True,
             source_estate_root=source_estate,
+        )
+
+    def test_legacy_apply_binding_preserves_non_root_offline_stage_semantics(
+        self,
+    ) -> None:
+        ops, stage, evidence, binding, _ = self.make_apply_fixture(
+            overlay_count=2
+        )
+        stage.chmod(0o500)
+        render_input_binding.verify_apply_binding(
+            ops, binding, stage, evidence, "successor", require_root_owner=False
+        )
+        stage.chmod(0o700)
+        os.chown(stage, 65534, -1)
+        render_input_binding.verify_apply_binding(
+            ops, binding, stage, evidence, "successor", require_root_owner=False
         )
 
     def test_apply_binding_rejects_writable_live_source_tree(self) -> None:

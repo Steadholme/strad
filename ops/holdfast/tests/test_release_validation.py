@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -308,6 +309,31 @@ class AnalyzerImageBindingTests(unittest.TestCase):
         for label, evidence, error in cases:
             with self.subTest(label=label), self.assertRaisesRegex(ValueError, error):
                 validate_release_evidence.validate_evidence(evidence)
+
+    def test_successor_evidence_preserves_nested_v3_completion_exactly(self) -> None:
+        policy = json.loads(
+            (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
+        )
+        predecessor = policy["predecessor"]
+        predecessor["completion"] = {
+            "kind": "recovery-completion-attestation-v1",
+            "attestation_sha256": "a" * 64,
+            "signature_sha256": "b" * 64,
+            "public_key_sha256": "c" * 64,
+        }
+        with tempfile.TemporaryDirectory(prefix="holdfast-evidence-v3-") as temp:
+            policy_path = Path(temp) / "successor-policy.json"
+            policy_path.write_text(json.dumps(policy) + "\n", encoding="utf-8")
+            evidence = self.successor_evidence()
+            evidence["predecessor_binding"] = copy.deepcopy(predecessor)
+            validate_release_evidence.validate_evidence(evidence, policy_path)
+
+            tampered = copy.deepcopy(evidence)
+            tampered["predecessor_binding"]["completion"][
+                "attestation_sha256"
+            ] = "d" * 64
+            with self.assertRaisesRegex(ValueError, "frozen policy"):
+                validate_release_evidence.validate_evidence(tampered, policy_path)
 
 
 if __name__ == "__main__":

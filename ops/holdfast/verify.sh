@@ -33,8 +33,29 @@ for path in "$estate_root" "$dry_run_dir"; do
   [[ "$path" = /* && "$path" != "/" ]] || { echo "unsafe path: $path" >&2; exit 1; }
 done
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+release_mode=$(jq -er '.release_mode // "base"' "$dry_run_dir/stage/RELEASE-EVIDENCE.json")
+release_validator_args=()
+render_expected_mode="base"
+if [[ "$release_mode" == "successor" ]]; then
+  release_validator_args=(--successor-policy "$script_dir/successor-policy.json")
+  render_expected_mode="successor"
+elif [[ "$release_mode" != "base" ]]; then
+  echo "unsupported release mode: $release_mode" >&2
+  exit 1
+fi
 python3 "$script_dir/validate_release_evidence.py" \
-  --evidence "$dry_run_dir/stage/RELEASE-EVIDENCE.json"
+  --evidence "$dry_run_dir/stage/RELEASE-EVIDENCE.json" \
+  "${release_validator_args[@]}"
+if [[ "$release_mode" == "successor" ]]; then
+  python3 "$script_dir/render_input_binding.py" verify \
+    --ops-root "$script_dir" \
+    --manifest "$dry_run_dir/stage/RENDER-INPUTS.sha256" \
+    --stage-root "$dry_run_dir/stage" \
+    --release-evidence "$dry_run_dir/stage/RELEASE-EVIDENCE.json" \
+    --expected-mode "$render_expected_mode" \
+    --source-estate-root "$estate_root" \
+    --require-root-owner
+fi
 if [[ "$phase" == "staged" ]]; then
   target_root="$dry_run_dir/stage"
 else

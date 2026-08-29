@@ -15,6 +15,16 @@ import sys
 from pathlib import Path
 from typing import Any, NoReturn
 
+from recovery_completion_attestation import (
+    ATTESTATION_NAME as RECOVERY_ATTESTATION_NAME,
+    KIND as RECOVERY_COMPLETION_KIND,
+    PUBLIC_KEY_NAME as RECOVERY_PUBLIC_KEY_NAME,
+    SIGNATURE_NAME as RECOVERY_SIGNATURE_NAME,
+    artifact_result as recovery_artifact_result,
+    open_private_directory,
+    read_direct_child,
+    verify_raw_bundle,
+)
 
 LINE = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9._-]+)$")
 STATIC_LINE = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9._/-]+)$")
@@ -24,6 +34,7 @@ MAX_SUCCESSOR_OVERLAY_PATHS = 64
 SUCCESSOR_POLICY_CEREMONIES = {
     1: "holdfast-rikune-successor-v1",
     2: "holdfast-rikune-successor-v2",
+    3: "holdfast-rikune-successor-v3",
 }
 SECURE_DESCRIPTOR_TRAVERSAL_SUPPORTED = (
     all(
@@ -117,7 +128,7 @@ SUCCESSOR_CATALOG_EVIDENCE_FIELDS = SUCCESSOR_EVIDENCE_FIELDS - {
     "supply_chain_binding",
     "analyzer_image_binding",
 }
-PREDECESSOR_FIELDS = {
+LEGACY_PREDECESSOR_FIELDS = {
     "current_state_sha256",
     "control_sha256",
     "apply_receipt_sha256",
@@ -130,6 +141,22 @@ PREDECESSOR_FIELDS = {
     "access_build_input_sha256",
     "permission_catalog_sha256",
     "package_catalog_sha256",
+}
+RECOVERY_COMPLETION_FIELDS = {
+    "kind",
+    "attestation_sha256",
+    "signature_sha256",
+    "public_key_sha256",
+}
+RECOVERED_PREDECESSOR_FIELDS = (
+    LEGACY_PREDECESSOR_FIELDS - {"apply_receipt_sha256"}
+) | {"completion"}
+# Compatibility alias for callers that bind the current v1/v2 schema exactly.
+PREDECESSOR_FIELDS = LEGACY_PREDECESSOR_FIELDS
+RECOVERY_COMPLETION_NAMES = {
+    RECOVERY_ATTESTATION_NAME,
+    RECOVERY_SIGNATURE_NAME,
+    RECOVERY_PUBLIC_KEY_NAME,
 }
 SUCCESSOR_POLICY_FIELDS = {
     "generator",
@@ -179,6 +206,88 @@ SUCCESSOR_UNRESOLVED_INPUTS = (
 
 def fail(message: str) -> NoReturn:
     raise RuntimeError(message)
+
+
+def validate_completion_binding(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != RECOVERY_COMPLETION_FIELDS:
+        fail("recovery completion binding field set differs")
+    if value.get("kind") != RECOVERY_COMPLETION_KIND:
+        fail("recovery completion kind differs")
+    for field in (
+        "attestation_sha256",
+        "signature_sha256",
+        "public_key_sha256",
+    ):
+        raw = value.get(field)
+        if not isinstance(raw, str) or not re.fullmatch(r"[0-9a-f]{64}", raw):
+            fail(f"recovery completion checksum is invalid: {field}")
+    return value
+
+
+def validate_adjacent_recovery_completion(
+    stage_root: Path,
+    predecessor: dict[str, Any],
+    policy_version: int,
+    source_estate_root: Path | None,
+    require_root_owner: bool,
+) -> None:
+    if policy_version < 3:
+        present = set(os.listdir(stage_root)) & RECOVERY_COMPLETION_NAMES
+        if present:
+            fail("legacy successor stage contains recovery completion authority")
+        return
+    directory = open_private_directory(stage_root)
+    try:
+        if stat.S_IMODE(os.fstat(directory).st_mode) != 0o700:
+            fail("successor stage must have mode 0700")
+        names = set(os.listdir(directory))
+        present = names & RECOVERY_COMPLETION_NAMES
+        if present != RECOVERY_COMPLETION_NAMES:
+            fail("schema 3 successor stage lacks the exact recovery completion trio")
+        completion = validate_completion_binding(predecessor.get("completion"))
+        attestation = read_direct_child(
+            directory, RECOVERY_ATTESTATION_NAME, "staged recovery attestation"
+        )
+        signature = read_direct_child(
+            directory,
+            RECOVERY_SIGNATURE_NAME,
+            "staged recovery signature",
+            maximum_size=65_536,
+        )
+        public_key = read_direct_child(
+            directory,
+            RECOVERY_PUBLIC_KEY_NAME,
+            "staged recovery public key",
+            maximum_size=65_536,
+        )
+    finally:
+        os.close(directory)
+    observed = recovery_artifact_result(attestation, signature, public_key)
+    for field in (
+        "attestation_sha256",
+        "signature_sha256",
+        "public_key_sha256",
+    ):
+        if observed[field] != completion[field]:
+            fail(f"staged recovery completion differs: {field}")
+    document = verify_raw_bundle(
+        attestation, signature, public_key, completion["public_key_sha256"]
+    )
+    expected = {
+        "current_sha256": predecessor.get("current_state_sha256"),
+        "control_sha256": predecessor.get("control_sha256"),
+        "release_evidence_sha256": predecessor.get("release_evidence_sha256"),
+        "runtime_manifest_sha256": predecessor.get("runtime_manifest_sha256"),
+        "predecessor_release_generation": 2,
+        "release_generation": 3,
+    }
+    for field, wanted in expected.items():
+        if document.get(field) != wanted:
+            fail(f"staged recovery completion predecessor differs: {field}")
+    if source_estate_root is not None and document.get("estate_root") != str(
+        source_estate_root.absolute()
+    ):
+        fail("staged recovery completion estate root differs")
 
 
 def digest(path: Path) -> str:
@@ -895,9 +1004,14 @@ def verify_apply_binding(
         predecessor = policy.get("predecessor")
         policy_successor = policy.get("successor")
         overlay = policy.get("overlay")
+        expected_predecessor_fields = (
+            RECOVERED_PREDECESSOR_FIELDS
+            if policy_version == 3
+            else LEGACY_PREDECESSOR_FIELDS
+        )
         if (
             not isinstance(predecessor, dict)
-            or set(predecessor) != PREDECESSOR_FIELDS
+            or set(predecessor) != expected_predecessor_fields
             or evidence.get("predecessor_binding") != predecessor
             or predecessor.get("access_build_input_schema")
             not in {
@@ -908,6 +1022,11 @@ def verify_apply_binding(
                 policy_version == 1
                 and predecessor.get("access_build_input_schema")
                 != ACCESS_BUILD_INPUT_SCHEMA_V1
+            )
+            or (
+                policy_version == 3
+                and predecessor.get("access_build_input_schema")
+                != ACCESS_BUILD_INPUT_SCHEMA_V2
             )
             or not isinstance(policy_successor, dict)
             or set(policy_successor) != SUCCESSOR_POLICY_FIELDS
@@ -931,10 +1050,12 @@ def verify_apply_binding(
             != ACCESS_BUILD_INPUT_SCHEMA_V2
         ):
             fail("successor policy, frozen target and evidence bindings differ")
+        if policy_version == 3:
+            validate_completion_binding(predecessor.get("completion"))
         if not isinstance(overlay, list) or (
             policy_version == 1 and len(overlay) != 7
         ) or (
-            policy_version == 2
+            policy_version in (2, 3)
             and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
         ):
             fail("successor overlay field set differs")
@@ -969,8 +1090,15 @@ def verify_apply_binding(
                 fail(f"stage successor overlay differs: {relative}")
             seen_overlay.add(relative)
             overlay_paths.append(relative)
-        if policy_version == 2 and overlay_paths != sorted(overlay_paths):
+        if policy_version in (2, 3) and overlay_paths != sorted(overlay_paths):
             fail("successor overlay path order differs")
+        validate_adjacent_recovery_completion(
+            stage,
+            predecessor,
+            policy_version,
+            source_estate_root,
+            require_root_owner,
+        )
         if source_estate_root is not None:
             source_estate = require_directory(
                 source_estate_root.absolute(), require_root_owner

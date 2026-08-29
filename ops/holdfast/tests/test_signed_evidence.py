@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +71,60 @@ class SignedEvidenceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_supply_bundle_uses_one_safe_byte_snapshot(self) -> None:
+        evidence = self.root / "snapshot-a.json"
+        evidence.write_text('{"schema_version":1,"value":"a"}\n', encoding="utf-8")
+        signature = self.sign(evidence)
+        document, pins = supply_chain_evidence.read_verified_supply_chain_bundle(
+            evidence, signature, self.public_key
+        )
+        self.assertEqual(document["value"], "a")
+        self.assertEqual(
+            pins["SUPPLY_CHAIN_EVIDENCE_SHA256"], sha256(evidence)
+        )
+
+        replacement_evidence = self.root / "snapshot-b.json"
+        replacement_evidence.write_text(
+            '{"schema_version":1,"value":"b"}\n', encoding="utf-8"
+        )
+        replacement_signature = self.sign(replacement_evidence)
+        real_reader = supply_chain_evidence.read_safe_bytes
+        swapped = False
+
+        def racing_reader(
+            path: Path, label: str, *, maximum_size: int = 2 * 1024 * 1024
+        ) -> bytes:
+            nonlocal swapped
+            raw = real_reader(path, label, maximum_size=maximum_size)
+            if path == evidence and not swapped:
+                replacement_evidence.replace(evidence)
+                replacement_signature.replace(signature)
+                swapped = True
+            return raw
+
+        with mock.patch.object(
+            supply_chain_evidence,
+            "read_safe_bytes",
+            side_effect=racing_reader,
+        ), self.assertRaisesRegex(ValueError, "signature verification failed"):
+            supply_chain_evidence.read_verified_supply_chain_bundle(
+                evidence, signature, self.public_key
+            )
+        self.assertTrue(swapped)
+
+    def test_supply_safe_reader_rejects_fifo_and_oversized_input(self) -> None:
+        fifo = self.root / "supply.fifo"
+        os.mkfifo(fifo, 0o600)
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            supply_chain_evidence.read_safe_bytes(fifo, "supply FIFO")
+
+        oversized = self.root / "oversized.json"
+        oversized.write_bytes(b"x" * 9)
+        with self.assertRaisesRegex(ValueError, "maximum safe size|regular file"):
+            supply_chain_evidence.read_safe_bytes(
+                oversized, "oversized supply input", maximum_size=8
+            )
 
     def sign(self, document: Path) -> Path:
         signature = document.with_suffix(document.suffix + ".sig")
@@ -741,6 +796,46 @@ class SignedEvidenceTests(unittest.TestCase):
             release["STRAD_REVISION"],
         )
         self.assertNotIn("source_revision", evidence["access_candidate"])
+
+        recovered_policy = json.loads(json.dumps(policy))
+        recovered_predecessor = recovered_policy["predecessor"]
+        recovered_predecessor["completion"] = {
+            "kind": "recovery-completion-attestation-v1",
+            "attestation_sha256": "a" * 64,
+            "signature_sha256": "b" * 64,
+            "public_key_sha256": "c" * 64,
+        }
+        recovered_policy_path = self.root / "successor-policy-v3.json"
+        recovered_policy_path.write_text(
+            json.dumps(recovered_policy) + "\n", encoding="utf-8"
+        )
+        recovered_evidence = json.loads(json.dumps(evidence))
+        recovered_evidence["successor_binding"] = json.loads(
+            json.dumps(recovered_predecessor)
+        )
+        recovered_valid = self.run_supply_fixture(
+            release,
+            recovered_evidence,
+            "v3-recovered-valid",
+            successor_policy=recovered_policy_path,
+        )
+        self.assertEqual(
+            recovered_valid.returncode,
+            0,
+            recovered_valid.stdout + recovered_valid.stderr,
+        )
+        recovered_tamper = json.loads(json.dumps(recovered_evidence))
+        recovered_tamper["successor_binding"]["completion"][
+            "signature_sha256"
+        ] = "d" * 64
+        recovered_invalid = self.run_supply_fixture(
+            release,
+            recovered_tamper,
+            "v3-recovered-tamper",
+            successor_policy=recovered_policy_path,
+        )
+        self.assertNotEqual(recovered_invalid.returncode, 0)
+        self.assertIn("immediate predecessor", recovered_invalid.stderr)
 
         missing_policy = self.run_supply_fixture(
             release,

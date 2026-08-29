@@ -12,10 +12,13 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from render_input_binding import (
     FROZEN_STATIC_PATHS,
+    LINE as RENDER_INPUT_LINE,
+    SUCCESSOR_BOUND_INPUTS,
     access_build_input_sha,
     access_build_input_sha_v2,
     write_binding,
@@ -24,9 +27,12 @@ from successor_binding import (
     MAX_SUCCESSOR_OVERLAY_PATHS,
     POLICY_CEREMONIES,
     SUCCESSOR_STATIC_ASSET_SOURCES,
+    read_recovery_completion_bundle,
+    require_same_recovery_completion_snapshot,
     validate_predecessor,
     validate_static_asset_transition,
     validate_supporting_snapshot,
+    write_recovery_completion_bundle,
     write_delta_manifest,
 )
 
@@ -98,6 +104,7 @@ RELEASE_KEYS = (
     "SUPPLY_CHAIN_SIGNATURE_SHA256",
 )
 SUCCESSOR_RELEASE_KEYS = RELEASE_KEYS + ("HOLDFAST_RELEASE_TOOL_REVISION",)
+MAX_SUCCESSOR_AUTHORITY_BYTES = 4 * 1024 * 1024
 
 
 def fail(message: str) -> "NoReturn":
@@ -425,6 +432,7 @@ def copy_successor_stage(
     preimages: dict[str, str],
     static_targets: dict[str, str],
     authority_root: Path,
+    recovery_completion: dict[str, object] | None = None,
 ) -> None:
     if stage_root.exists() or stage_root.is_symlink():
         fail(f"stage root must not already exist: {stage_root}")
@@ -445,7 +453,7 @@ def copy_successor_stage(
         or not isinstance(overlay, list)
         or (policy_version == 1 and len(overlay) != 7)
         or (
-            policy_version == 2
+            policy_version in (2, 3)
             and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
         )
     ):
@@ -474,7 +482,7 @@ def copy_successor_stage(
         shutil.copy2(source, destination)
         if sha256_file(destination) != raw.get("after_sha256"):
             fail(f"successor overlay copy differs: {relative}")
-    if policy_version == 2 and overlay_paths != sorted(overlay_paths):
+    if policy_version in (2, 3) and overlay_paths != sorted(overlay_paths):
         fail("successor overlay path order differs")
 
     static_asset_sources = validate_static_asset_transition(
@@ -522,6 +530,19 @@ def copy_successor_stage(
         shutil.copy2(source, deploy / name)
     if not catalog_only:
         os.chmod(deploy / ".env", 0o600)
+    if policy_version == 3:
+        if recovery_completion is None:
+            fail("schema 3 successor stage lacks recovery completion authority")
+        predecessor = policy.get("predecessor")
+        if not isinstance(predecessor, dict) or not isinstance(
+            predecessor.get("completion"), dict
+        ):
+            fail("schema 3 successor policy lacks recovery completion binding")
+        write_recovery_completion_bundle(
+            stage_root, predecessor["completion"], recovery_completion
+        )
+    elif recovery_completion is not None:
+        fail("legacy successor stage must not contain recovery completion authority")
 
 
 def validate_tool_revision(revision: str) -> None:
@@ -1563,6 +1584,324 @@ def validate_successor_release(
             fail(f"successor release pin differs from its policy: {key}")
 
 
+def stable_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def stable_directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+    )
+
+
+def open_stable_directory(
+    root: Path,
+    label: str,
+    expected_identity: tuple[int, ...] | None = None,
+) -> tuple[int, tuple[int, ...]]:
+    canonical = root.absolute()
+    try:
+        before = canonical.lstat()
+    except FileNotFoundError:
+        fail(f"{label} root is absent: {canonical}")
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or canonical.is_symlink()
+        or canonical.resolve() != canonical
+    ):
+        fail(f"{label} root is not canonical: {canonical}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(canonical, flags)
+    except OSError as error:
+        fail(f"cannot securely open {label} root: {error}")
+    try:
+        opened = os.fstat(descriptor)
+        identity = stable_directory_identity(opened)
+        if stable_directory_identity(before) != identity:
+            fail(f"{label} root changed while opening")
+        if expected_identity is not None and identity != expected_identity:
+            fail(f"{label} root identity changed during render")
+        return descriptor, stable_file_identity(opened)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def validate_directory_mapping(
+    root: Path,
+    descriptor: int,
+    opened_snapshot: tuple[int, ...],
+    label: str,
+) -> None:
+    observed = os.fstat(descriptor)
+    if stable_file_identity(observed) != opened_snapshot:
+        fail(f"{label} root changed during snapshot")
+    canonical = root.absolute()
+    try:
+        mapped = canonical.lstat()
+    except FileNotFoundError:
+        fail(f"{label} root disappeared during snapshot")
+    if (
+        canonical.is_symlink()
+        or canonical.resolve() != canonical
+        or stable_directory_identity(mapped)
+        != stable_directory_identity(observed)
+    ):
+        fail(f"{label} root path mapping changed during snapshot")
+
+
+def stable_directory_path_snapshot(
+    root: Path,
+    label: str,
+    expected_identity: tuple[int, ...] | None = None,
+) -> tuple[int, ...]:
+    descriptor, opened_snapshot = open_stable_directory(
+        root,
+        label,
+        expected_identity,
+    )
+    try:
+        validate_directory_mapping(root, descriptor, opened_snapshot, label)
+        return opened_snapshot
+    finally:
+        os.close(descriptor)
+
+
+def stable_directory_path_identity(root: Path, label: str) -> tuple[int, ...]:
+    return stable_directory_path_snapshot(root, label)[:7]
+
+
+def read_successor_authority_bytes(
+    directory: int,
+    name: str,
+    label: str = "successor authority",
+) -> bytes:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory)
+    except OSError as error:
+        fail(f"cannot securely open {label} input {name}: {error}")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            fail(f"{label} input is not a single-link file: {name}")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            read_size = min(
+                1024 * 1024,
+                MAX_SUCCESSOR_AUTHORITY_BYTES + 1 - size,
+            )
+            chunk = os.read(descriptor, read_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_SUCCESSOR_AUTHORITY_BYTES:
+                fail(f"{label} input exceeds its size limit: {name}")
+        after = os.fstat(descriptor)
+        if stable_file_identity(before) != stable_file_identity(after):
+            fail(f"{label} input changed while reading: {name}")
+        try:
+            mapped = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            fail(f"{label} input disappeared while reading: {name}")
+        if stable_file_identity(after) != stable_file_identity(mapped):
+            fail(f"{label} input path mapping changed while reading: {name}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def snapshot_successor_authority(
+    authority_root: Path,
+    expected_root_identity: tuple[int, ...] | None = None,
+) -> dict[str, tuple[bytes, str]]:
+    root = authority_root.absolute()
+    directory, opened_snapshot = open_stable_directory(
+        root,
+        "successor authority",
+        expected_root_identity,
+    )
+    try:
+        snapshot: dict[str, tuple[bytes, str]] = {}
+        for name in SUCCESSOR_BOUND_INPUTS:
+            raw = read_successor_authority_bytes(directory, name)
+            snapshot[name] = (raw, hashlib.sha256(raw).hexdigest())
+        validate_directory_mapping(
+            root,
+            directory,
+            opened_snapshot,
+            "successor authority",
+        )
+        return snapshot
+    finally:
+        os.close(directory)
+
+
+def require_same_successor_authority_snapshot(
+    initial: dict[str, tuple[bytes, str]],
+    final: dict[str, tuple[bytes, str]],
+) -> None:
+    if (
+        tuple(initial) != SUCCESSOR_BOUND_INPUTS
+        or tuple(final) != SUCCESSOR_BOUND_INPUTS
+    ):
+        fail("successor authority snapshot field set or order differs")
+    for name in SUCCESSOR_BOUND_INPUTS:
+        initial_raw, initial_sha256 = initial[name]
+        final_raw, final_sha256 = final[name]
+        if final_raw != initial_raw:
+            fail(f"successor authority raw bytes changed during render: {name}")
+        if final_sha256 != initial_sha256:
+            fail(f"successor authority digest changed during render: {name}")
+
+
+def validate_predecessor_from_authority_snapshot(
+    authority_root: Path,
+    authority_snapshot: dict[str, tuple[bytes, str]],
+    *,
+    current_state_path: Path,
+    estate_root: Path,
+    predecessor_candidate: Path,
+    predecessor_stage: Path,
+    recovery_completion_root: Path | None,
+) -> dict[str, object]:
+    if tuple(authority_snapshot) != SUCCESSOR_BOUND_INPUTS:
+        fail("successor authority snapshot field set or order differs")
+    with tempfile.TemporaryDirectory(
+        prefix="holdfast-successor-authority-"
+    ) as temporary:
+        snapshot_root = Path(temporary)
+        snapshot_root.chmod(0o700)
+        for name in SUCCESSOR_BOUND_INPUTS:
+            raw, expected_sha256 = authority_snapshot[name]
+            if hashlib.sha256(raw).hexdigest() != expected_sha256:
+                fail(f"successor authority snapshot digest is inconsistent: {name}")
+            destination = snapshot_root / name
+            destination.write_bytes(raw)
+            destination.chmod(0o600)
+        for _, source_relative in SUCCESSOR_STATIC_ASSET_SOURCES:
+            source = authority_root / source_relative
+            require_regular(source)
+            destination = snapshot_root / source_relative
+            destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+            destination.chmod(0o600)
+        return validate_predecessor(
+            policy_path=snapshot_root / "successor-policy.json",
+            current_state_path=current_state_path,
+            estate_root=estate_root,
+            predecessor_candidate=predecessor_candidate,
+            predecessor_stage=predecessor_stage,
+            successor_preimages=snapshot_root / "successor-preimages.sha256",
+            recovery_completion_root=recovery_completion_root,
+        )
+
+
+def parse_successor_render_inputs(raw: bytes) -> dict[str, str]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"RENDER-INPUTS.sha256 is not UTF-8: {error}")
+    values: dict[str, str] = {}
+    for line_number, line in enumerate(text.splitlines(), 1):
+        match = RENDER_INPUT_LINE.fullmatch(line)
+        if not match or match.group(2) in values:
+            fail(f"invalid or duplicate RENDER-INPUTS line {line_number}")
+        values[match.group(2)] = match.group(1)
+    if tuple(values) != SUCCESSOR_BOUND_INPUTS:
+        fail("RENDER-INPUTS field set or order differs from successor authority")
+    return values
+
+
+def validate_final_successor_authority(
+    authority_root: Path,
+    stage_root: Path,
+    initial: dict[str, tuple[bytes, str]],
+    authority_root_identity: tuple[int, ...],
+    stage_root_identity: tuple[int, ...],
+) -> None:
+    final = snapshot_successor_authority(
+        authority_root,
+        authority_root_identity,
+    )
+    require_same_successor_authority_snapshot(initial, final)
+    stage_directory, opened_snapshot = open_stable_directory(
+        stage_root,
+        "successor stage",
+        stage_root_identity,
+    )
+    try:
+        render_inputs = parse_successor_render_inputs(
+            read_successor_authority_bytes(
+                stage_directory,
+                "RENDER-INPUTS.sha256",
+                "successor stage",
+            )
+        )
+        validate_directory_mapping(
+            stage_root,
+            stage_directory,
+            opened_snapshot,
+            "successor stage",
+        )
+    finally:
+        os.close(stage_directory)
+    for name in SUCCESSOR_BOUND_INPUTS:
+        initial_raw, initial_sha256 = initial[name]
+        final_raw, final_sha256 = final[name]
+        if render_inputs[name] != initial_sha256:
+            fail(f"RENDER-INPUTS differs from initial successor authority: {name}")
+        if render_inputs[name] != final_sha256:
+            fail(f"RENDER-INPUTS differs from final successor authority: {name}")
+        if hashlib.sha256(initial_raw).hexdigest() != initial_sha256:
+            fail(f"initial successor authority digest is inconsistent: {name}")
+        if hashlib.sha256(final_raw).hexdigest() != final_sha256:
+            fail(f"final successor authority digest is inconsistent: {name}")
+
+
+def validate_final_recovery_completion(
+    stage_root: Path,
+    completion: dict[str, object],
+    initial: dict[str, object],
+    final: dict[str, object],
+) -> None:
+    require_same_recovery_completion_snapshot(initial, final)
+    staged = read_recovery_completion_bundle(
+        stage_root, completion, exact_namespace=False
+    )
+    require_same_recovery_completion_snapshot(initial, staged)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--estate-root", required=True, type=Path)
@@ -1574,6 +1913,7 @@ def main() -> int:
     parser.add_argument("--current-state", type=Path)
     parser.add_argument("--predecessor-candidate", type=Path)
     parser.add_argument("--predecessor-stage", type=Path)
+    parser.add_argument("--recovery-completion-root", type=Path)
     parser.add_argument("--release-tool-revision")
     args = parser.parse_args()
 
@@ -1608,19 +1948,43 @@ def main() -> int:
         )
     if not args.successor and (
         any(value is not None for value in successor_args)
+        or args.recovery_completion_root is not None
         or args.release_tool_revision is not None
     ):
         fail("successor-only arguments require --successor")
 
     successor_context: dict[str, object] | None = None
+    successor_authority_snapshot: dict[str, tuple[bytes, str]] | None = None
+    successor_authority_root_identity: tuple[int, ...] | None = None
+    successor_stage_root_identity: tuple[int, ...] | None = None
     if args.successor:
-        successor_context = validate_predecessor(
-            policy_path=OPS_ROOT / "successor-policy.json",
+        successor_authority_root_identity = stable_directory_path_identity(
+            OPS_ROOT,
+            "successor authority",
+        )
+        successor_authority_snapshot = snapshot_successor_authority(
+            OPS_ROOT,
+            successor_authority_root_identity,
+        )
+        successor_context = validate_predecessor_from_authority_snapshot(
+            OPS_ROOT,
+            successor_authority_snapshot,
             current_state_path=args.current_state.absolute(),
             estate_root=estate_root,
             predecessor_candidate=args.predecessor_candidate.absolute(),
             predecessor_stage=args.predecessor_stage.absolute(),
-            successor_preimages=OPS_ROOT / "successor-preimages.sha256",
+            recovery_completion_root=(
+                args.recovery_completion_root.absolute()
+                if args.recovery_completion_root is not None
+                else None
+            ),
+        )
+        require_same_successor_authority_snapshot(
+            successor_authority_snapshot,
+            snapshot_successor_authority(
+                OPS_ROOT,
+                successor_authority_root_identity,
+            ),
         )
     else:
         verify_preimages(estate_root)
@@ -1692,6 +2056,11 @@ def main() -> int:
             successor_preimages,
             static_targets,
             OPS_ROOT,
+            successor_context.get("recovery_completion"),
+        )
+        successor_stage_root_identity = stable_directory_path_identity(
+            stage_root,
+            "successor stage",
         )
         validate_successor_snapshot(
             stage_root,
@@ -1699,14 +2068,6 @@ def main() -> int:
             successor_preimages,
             supporting_targets,
             args.catalog_only,
-        )
-        validate_predecessor(
-            policy_path=OPS_ROOT / "successor-policy.json",
-            current_state_path=args.current_state.absolute(),
-            estate_root=estate_root,
-            predecessor_candidate=args.predecessor_candidate.absolute(),
-            predecessor_stage=args.predecessor_stage.absolute(),
-            successor_preimages=OPS_ROOT / "successor-preimages.sha256",
         )
         if not args.catalog_only:
             render_full_env(stage_root, release, secrets)
@@ -1742,6 +2103,54 @@ def main() -> int:
         ],
         OPS_ROOT,
     )
+    if args.successor:
+        assert successor_context is not None
+        assert successor_authority_snapshot is not None
+        assert successor_authority_root_identity is not None
+        assert successor_stage_root_identity is not None
+        final_context = validate_predecessor_from_authority_snapshot(
+            OPS_ROOT,
+            successor_authority_snapshot,
+            current_state_path=args.current_state.absolute(),
+            estate_root=estate_root,
+            predecessor_candidate=args.predecessor_candidate.absolute(),
+            predecessor_stage=args.predecessor_stage.absolute(),
+            recovery_completion_root=(
+                args.recovery_completion_root.absolute()
+                if args.recovery_completion_root is not None
+                else None
+            ),
+        )
+        initial_completion = successor_context.get("recovery_completion")
+        final_completion = final_context.get("recovery_completion")
+        if initial_completion is None and final_completion is None:
+            pass
+        elif not isinstance(initial_completion, dict) or not isinstance(
+            final_completion, dict
+        ):
+            fail("recovery completion snapshot mode changed during render")
+        else:
+            final_policy = final_context.get("policy")
+            if not isinstance(final_policy, dict) or not isinstance(
+                final_policy.get("predecessor"), dict
+            ):
+                fail("final successor policy snapshot is invalid")
+            completion = final_policy["predecessor"].get("completion")
+            if not isinstance(completion, dict):
+                fail("final recovery completion binding is invalid")
+            validate_final_recovery_completion(
+                stage_root,
+                completion,
+                initial_completion,
+                final_completion,
+            )
+        validate_final_successor_authority(
+            OPS_ROOT,
+            stage_root,
+            successor_authority_snapshot,
+            successor_authority_root_identity,
+            successor_stage_root_identity,
+        )
     print(f"rendered immutable staging tree: {stage_root}")
     print(f"release evidence: {stage_root / 'RELEASE-EVIDENCE.json'}")
     return 0

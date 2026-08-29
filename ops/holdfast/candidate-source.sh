@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --estate-root PATH --output NEW_PATH [--successor --current-state FILE --predecessor-candidate PATH --predecessor-stage PATH --release-tool-revision COMMIT]" >&2
+  echo "usage: $0 --estate-root PATH --output NEW_PATH [--successor --current-state FILE --predecessor-candidate PATH --predecessor-stage PATH --recovery-completion-root PATH --release-tool-revision COMMIT]" >&2
   exit 2
 }
 
@@ -12,6 +12,7 @@ successor=false
 current_state=""
 predecessor_candidate=""
 predecessor_stage=""
+recovery_completion_root=""
 release_tool_revision=""
 while (($#)); do
   case "$1" in
@@ -21,6 +22,7 @@ while (($#)); do
     --current-state) [[ $# -ge 2 ]] || usage; current_state=$2; shift 2 ;;
     --predecessor-candidate) [[ $# -ge 2 ]] || usage; predecessor_candidate=$2; shift 2 ;;
     --predecessor-stage) [[ $# -ge 2 ]] || usage; predecessor_stage=$2; shift 2 ;;
+    --recovery-completion-root) [[ $# -ge 2 ]] || usage; recovery_completion_root=$2; shift 2 ;;
     --release-tool-revision) [[ $# -ge 2 ]] || usage; release_tool_revision=$2; shift 2 ;;
     *) usage ;;
   esac
@@ -46,6 +48,9 @@ if [[ "$successor" == true ]]; then
   for path in "$current_state" "$predecessor_candidate" "$predecessor_stage"; do
     [[ "$path" = /* && "$path" != "/" ]] || usage
   done
+  if [[ -n "$recovery_completion_root" ]]; then
+    [[ "$recovery_completion_root" = /* && "$recovery_completion_root" != "/" ]] || usage
+  fi
   [[ "$release_tool_revision" =~ ^[0-9a-f]{40}$ ]] || usage
   render_args+=(
     --successor
@@ -54,7 +59,10 @@ if [[ "$successor" == true ]]; then
     --predecessor-stage "$predecessor_stage"
     --release-tool-revision "$release_tool_revision"
   )
-elif [[ -n "$current_state" || -n "$predecessor_candidate" || -n "$predecessor_stage" || -n "$release_tool_revision" ]]; then
+  if [[ -n "$recovery_completion_root" ]]; then
+    render_args+=(--recovery-completion-root "$recovery_completion_root")
+  fi
+elif [[ -n "$current_state" || -n "$predecessor_candidate" || -n "$predecessor_stage" || -n "$recovery_completion_root" || -n "$release_tool_revision" ]]; then
   usage
 fi
 exec python3 "$script_dir/render.py" "${render_args[@]}"

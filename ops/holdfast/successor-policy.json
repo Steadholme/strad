@@ -1,25 +1,30 @@
 {
-  "schema_version": 2,
-  "ceremony": "holdfast-rikune-successor-v2",
+  "schema_version": 3,
+  "ceremony": "holdfast-rikune-successor-v3",
   "predecessor": {
-    "current_state_sha256": "9124ba37ce67af6005031edde5be848cc3e54a2a9d831579eb04a6488078af84",
-    "control_sha256": "8dedcc39836a01073d3e61ebb06e1bc192db1e903ed216f664a1d0a784c2b602",
-    "apply_receipt_sha256": "2b65992adbcd4fe5b336c7ab3fe76b76b58298510ffa0d78c971b428900dd6fb",
-    "release_evidence_sha256": "c153ab1beb29e01283b44f6c19805b10d06bb9800987212101da5fe3d34ccd06",
-    "runtime_manifest_sha256": "871b1199d517cccac4747d85bfdce7615f506faff55300efb8ca448a13070bbf",
-    "candidate_evidence_sha256": "41869b9e37d76a05496e523032eb1047a38143a2ad454a608a7b88ca9fda018e",
-    "candidate_targets_sha256": "256b013132159d42557caa00d9b2772c666e93cf5809d6294c27aa94276c22c8",
-    "access_image": "registry.w33d.xyz/steadholme/access-governance@sha256:ecf384b515bda56c9901ff06bd1a0e65bc0a2246c2dd7989d7bf4c04260366c0",
+    "current_state_sha256": "fae1c3d679527824036473f0f812c517a6918bbd0347a148a184d4e596c3ec74",
+    "control_sha256": "2d047f4fca65b028a2e62e2f8ab582f41ccf83e19819798c31dc5d1ad6276c4c",
+    "release_evidence_sha256": "a951b0457b51b3afe4ffa965dd48d623c41bd045940aff13c4b3a63e5fda0caa",
+    "runtime_manifest_sha256": "db5a369617e9f09f36711b0fd0e72e9a53d99449f5991dd520f601adbd665e43",
+    "candidate_evidence_sha256": "609f6955e0f15ec55366b7be4b35acd513e0b1e056f6e8fbfd96354a1ec7e6bf",
+    "candidate_targets_sha256": "fdde3d4a2d70207ab85f47b54f7f9223e04dc64524169f4ed85b6875d2c28e8e",
+    "access_image": "registry.w33d.xyz/steadholme/access-governance@sha256:a6b0f3fa15a5fbd4df3ab13bc334284be83d539d4281282d282dd10a545d8fff",
     "access_build_input_schema": "access-build-input/2",
-    "access_build_input_sha256": "587b6792afa3b552e62c542de52c619290a836799c418b17d31a55b68d5f30b2",
+    "access_build_input_sha256": "58681a40a3c374b4350a6d011ec3cf920b5343ecdee93684f201d5433f00344f",
     "permission_catalog_sha256": "92e7ed1dd9aa2369b18c2aae7d05b3f829a8d1750f5569c9ff9536f7ace0ebc9",
-    "package_catalog_sha256": "6a2343c04c0d2cf7c1cbb40414d0be3f91bcb4637499fbc78037f3cb0543d340"
+    "package_catalog_sha256": "6a2343c04c0d2cf7c1cbb40414d0be3f91bcb4637499fbc78037f3cb0543d340",
+    "completion": {
+      "kind": "recovery-completion-attestation-v1",
+      "attestation_sha256": "d8e475b70b482666ea17b627b7e3aeb683231f0ace58135ad18d39e88546b1bf",
+      "signature_sha256": "29148a3caf5ef64d7e391017c446ba3932e545c531bd286bd56e65d8a5ec6139",
+      "public_key_sha256": "fb459cd3cb9ef2a0500fbe7a5f9e3693a2d55f7d12ad260556db95f950a8ca2c"
+    }
   },
   "successor": {
     "generator": "holdfast-rikune-estate/2.0.0",
     "access_build_input_schema": "access-build-input/2",
-    "source_access_build_input_sha256": "58681a40a3c374b4350a6d011ec3cf920b5343ecdee93684f201d5433f00344f",
-    "access_build_input_sha256": "58681a40a3c374b4350a6d011ec3cf920b5343ecdee93684f201d5433f00344f",
+    "source_access_build_input_sha256": "df93abbadb9ef4b26cfcef33b6362efdcc6e77e9a5c32c5999327b4743e5abdc",
+    "access_build_input_sha256": "df93abbadb9ef4b26cfcef33b6362efdcc6e77e9a5c32c5999327b4743e5abdc",
     "preimages_manifest": "successor-preimages.sha256",
     "absent_manifest": "successor-absent.paths",
     "static_targets_manifest": "successor-static-targets.sha256",
@@ -28,69 +33,14 @@
   },
   "overlay": [
     {
-      "path": "access-governance/Cargo.lock",
-      "before_sha256": "1ef06a0bd1e28478f26af82fd58b7f2c07f71e3d464d21c8135f8da9ec74082b",
-      "after_sha256": "bbd12d0410ae0916c718c2fec7e6d4ca957b5ac7a8bf5c13ec5ebcb6cd4987a9"
-    },
-    {
-      "path": "access-governance/Cargo.toml",
-      "before_sha256": "768a0fde686782dcf775579c7c43d8a7e14450975e24bdf9637ba61547cc73ab",
-      "after_sha256": "84e3cfe81323c1ea55a15e37b3e4f469b2b6826e9498b3a1a6f0eceddcfa378c"
-    },
-    {
-      "path": "access-governance/migrations/0015_rikune_system_authority.sql",
-      "before_sha256": null,
-      "after_sha256": "588708c2e54a54916930a51619932489c657525ca5a2da13a44d6377559bdaf1"
-    },
-    {
-      "path": "access-governance/src/handlers/ui.rs",
-      "before_sha256": "36657e597e30f568fd82073f2c6a679458c612ac76690d0312061739f04d2a93",
-      "after_sha256": "e910ef4d1211586539381fc1e20402e655ff76ebb202e36eb50e31a2d08a3a42"
-    },
-    {
-      "path": "access-governance/src/lib.rs",
-      "before_sha256": "780041209d3deaac226b3e1caa505d5464a7c750c13e6da235f0e54754331200",
-      "after_sha256": "cb705ff95768a1b1c2a21d350bd5fa594bd0318ac76d8f53329470da3a252913"
-    },
-    {
-      "path": "access-governance/src/main.rs",
-      "before_sha256": "2a228c46296b96f86eedde0806218b94734a0e02dd06e61697228b6c21a255c2",
-      "after_sha256": "094d94540983407d103a0f1ab835d4faaa26f6b9050b1735d70eb19fc535d3ce"
-    },
-    {
-      "path": "access-governance/src/repository/mod.rs",
-      "before_sha256": "b61a1a4206d2c86a86300762f2ea56afa3364b35fe4e564b5ab8a330cd4414e8",
-      "after_sha256": "d315dec9292564fd3d00d15b753d6df8b918af8c153bdefb578d3995558de96c"
-    },
-    {
       "path": "access-governance/src/repository/postgres.rs",
-      "before_sha256": "ebe944167bdf34f1bd106f134af02ee8569a58326a77302508f85f4be7864130",
-      "after_sha256": "59e019a9cd013c2dd0ce67ab31547a7e40f8772d6146f722053302a615fe0069"
-    },
-    {
-      "path": "access-governance/src/system_authority.rs",
-      "before_sha256": null,
-      "after_sha256": "8cc722aaf6113e4f0235cd8e0a8f4cd022b482b421c49292de0a772f27fb20a1"
-    },
-    {
-      "path": "access-governance/tests/explicit_migration_gate.rs",
-      "before_sha256": "06706b8d9c739e5b94e382fbbfedd65731256687736a36b5082e2b4098c093c5",
-      "after_sha256": "7f0d02ac2a6580b8e617e3f9b4be4df382aeaa29cf22fe322890a09445dee304"
+      "before_sha256": "59e019a9cd013c2dd0ce67ab31547a7e40f8772d6146f722053302a615fe0069",
+      "after_sha256": "4c361fe27be00ad638e97031da1ad18909e2877ae1822e05c7fe3949ccbfc477"
     },
     {
       "path": "access-governance/tests/postgres_operator_package_grant.rs",
-      "before_sha256": "9ade2be1222f158b7b996f116b78bb735b5103f48415b5e62630fdb452d89c7b",
-      "after_sha256": "787b679e00f5957a7873d9ee82898fac663e2ec8db66e8e7e99ac91b3d60711f"
-    },
-    {
-      "path": "access-governance/tests/postgres_package_submit_migration.rs",
-      "before_sha256": "db88e8852ed48e84e316162776d35018c0b68619cee3abcd9a7740858dfbb560",
-      "after_sha256": "c85286e0267278351d6d6a350e1e212acf7b67742a28d6afe7753d3186164842"
-    },
-    {
-      "path": "access-governance/tests/postgres_rikune_system_authority_migration.rs",
-      "before_sha256": null,
-      "after_sha256": "da1cdc12d3591039f5a2f418d8de944a6b9200d27fafc3d3e53bc27f40f128e7"
+      "before_sha256": "787b679e00f5957a7873d9ee82898fac663e2ec8db66e8e7e99ac91b3d60711f",
+      "after_sha256": "a886893bbde0562b118486e0cdfd617166ed3330f607f14625fa5393f29bc56b"
     }
   ]
 }
