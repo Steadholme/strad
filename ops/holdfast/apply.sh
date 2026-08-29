@@ -921,6 +921,7 @@ persist_successor_authority() {
       release_generation:$generation,route_database_state:"absent",
       public_ipv4_ipv6_closed_status:404,predecessor_runtime_verified:true,
       ingress_opened:false}' >"$successor_state_tmp"
+  chmod 0600 -- "$successor_state_tmp"
   validate_persisted_successor_authority "$successor_state_tmp" successor_armed
   commit_atomic_file "$successor_state_tmp" "$state_file"
   validate_persisted_successor_authority "$state_file" successor_armed
@@ -2055,6 +2056,7 @@ jq -n \
   '{schema_version:2,state:"runtime_backup_armed",runtime_backup_armed_at:$armed_at,estate_root:$estate,backup_dir:$backup,dry_run_dir:$dry,runtime_backup_dir:$runtime,runtime_backup_caller_armed_receipt:"RUNTIME-BACKUP-CALLER-ARMED.receipt",runtime_backup_caller_armed_receipt_sha256:$caller_sha,runtime_backup_armed_receipt:"runtime/RUNTIME-BACKUP-ARMED.receipt",release_env_sha256:$release_sha,release_evidence_sha256:$evidence_sha,dry_run_receipt_sha256:$dry_sha,targets_sha256:$targets_sha,apply_preimages_sha256:$preimages_sha,apply_absent_sha256:$absent_sha,render_inputs_sha256:$render_sha,stop_authority_contract:"absence-means-stop-not-started",ingress_opened:false} +
   (if $successor then ({successor:true,successor_armed_receipt:"SUCCESSOR-ARMED.receipt",successor_armed_receipt_sha256:$successor_armed_sha,predecessor_current_file:"PREDECESSOR-CURRENT.json",predecessor_current_sha256:$predecessor_current_sha,predecessor_backup_dir:$predecessor_backup,predecessor_control_sha256:$predecessor_control,predecessor_apply_receipt_sha256:$predecessor_apply,predecessor_release_evidence_sha256:$predecessor_release,predecessor_runtime_backup_receipt_sha256:$predecessor_runtime_receipt,predecessor_runtime_backup_manifest_sha256:$predecessor_runtime_manifest,predecessor_release_generation:$predecessor_generation,release_generation:$generation} | if $successor_policy_schema == 3 then del(.predecessor_apply_receipt_sha256) + {predecessor_completion_kind:$predecessor_completion_kind,predecessor_completion_attestation_sha256:$predecessor_completion_attestation,predecessor_completion_signature_sha256:$predecessor_completion_signature,predecessor_completion_public_key_sha256:$predecessor_completion_public_key} else . end) else {} end)' \
   >"$state_tmp"
+chmod 0600 -- "$state_tmp"
 validate_runtime_backup_caller_authority true "$state_tmp"
 commit_atomic_file "$state_tmp" "$state_file"
 validate_runtime_backup_caller_authority true
@@ -2272,6 +2274,7 @@ jq -n \
   '{schema_version:2,state:"apply_armed",apply_armed_at:$armed_at,estate_root:$estate,backup_dir:$backup,apply_armed_receipt_sha256:$armed_sha,release_evidence_sha256:$release_sha,dry_run_receipt_sha256:$dry_sha,control_sha256:$control_sha,runtime_backup_caller_armed_sha256:$caller_sha,runtime_backup_stop_authority_sha256:$runtime_arm_sha,ingress_opened:false} +
    (if $successor then ({successor:true,successor_armed_receipt:"SUCCESSOR-ARMED.receipt",successor_armed_receipt_sha256:$successor_armed_sha,predecessor_current_file:"PREDECESSOR-CURRENT.json",predecessor_current_sha256:$predecessor_current_sha,predecessor_backup_dir:$predecessor_backup,predecessor_control_sha256:$predecessor_control,predecessor_apply_receipt_sha256:$predecessor_apply,predecessor_release_evidence_sha256:$predecessor_release,predecessor_runtime_backup_receipt_sha256:$predecessor_runtime_receipt,predecessor_runtime_backup_manifest_sha256:$predecessor_runtime_manifest,predecessor_release_generation:$predecessor_generation,release_generation:$generation} | if $successor_policy_schema == 3 then del(.predecessor_apply_receipt_sha256) + {predecessor_completion_kind:$predecessor_completion_kind,predecessor_completion_attestation_sha256:$predecessor_completion_attestation,predecessor_completion_signature_sha256:$predecessor_completion_signature,predecessor_completion_public_key_sha256:$predecessor_completion_public_key} else . end) else {} end)' \
   >"$state_tmp"
+chmod 0600 -- "$state_tmp"
 if [[ "$successor" == "true" ]]; then
   validate_persisted_recovery_completion_authority true
   validate_persisted_successor_authority "$state_tmp" apply_armed
@@ -2372,6 +2375,7 @@ if [[ $estate_status -ne 0 ]]; then
     --arg prior_restore "$prior_running_restore" \
     '.state=$state | .apply_failure_receipt=$receipt | .apply_failure_receipt_sha256=$receipt_sha | .estate_transaction_state=$transaction_state | .estate_transaction_sha256=$transaction_sha | .prior_running_manifest_sha256=$prior_manifest_sha | .prior_running_restore=$prior_restore' \
     "$state_file" >"$state_tmp"
+  chmod 0600 -- "$state_tmp"
   if [[ "$successor" == "true" ]]; then
     validate_persisted_successor_authority "$state_tmp" "$failure_state"
   fi
@@ -2415,6 +2419,7 @@ if [[ "$activate" == "true" ]]; then
     --arg control_sha "$control_sha" \
     '.state="apply_activation_armed" | .control_sha256=$control_sha' \
     "$state_file" >"$state_tmp"
+  chmod 0600 -- "$state_tmp"
   if [[ "$successor" == "true" ]]; then
     validate_persisted_successor_authority "$state_tmp" apply_activation_armed
   fi
@@ -2461,6 +2466,7 @@ if [[ "$activate" == "true" ]]; then
       --arg receipt_sha "$(holdfast_sha256 "$failure_receipt")" \
       '.state="apply_activation_failed" | .apply_failure_receipt=$receipt | .apply_failure_receipt_sha256=$receipt_sha' \
       "$state_file" >"$state_tmp"
+    chmod 0600 -- "$state_tmp"
     if [[ "$successor" == "true" ]]; then
       validate_persisted_successor_authority "$state_tmp" apply_activation_failed
     fi
@@ -2561,6 +2567,7 @@ jq -n \
   '{schema_version:2,state:"apply_finalizing_ingress_closed",estate_root:$estate,backup_dir:$backup,pending_apply_receipt:"APPLY-PENDING.receipt",pending_apply_receipt_sha256:$pending_apply_sha,apply_armed_receipt_sha256:$armed_sha,control_sha256:$control_sha,release_evidence_sha256:$release_sha,transaction_sha256:$transaction_sha,applied_targets_sha256:$applied_targets_sha,closed_verified_at:$closed_at,route_database_state:"absent",public_ipv4_ipv6_closed_status:404,services_activated:$activated,runtime_verified:$activated,ingress_opened:false} +
    (if $successor then ({successor:true,successor_armed_receipt:"SUCCESSOR-ARMED.receipt",successor_armed_receipt_sha256:$successor_armed_sha,predecessor_current_file:"PREDECESSOR-CURRENT.json",predecessor_current_sha256:$predecessor_current_sha,predecessor_backup_dir:$predecessor_backup,predecessor_control_sha256:$predecessor_control,predecessor_apply_receipt_sha256:$predecessor_apply,predecessor_release_evidence_sha256:$predecessor_release,predecessor_runtime_backup_receipt_sha256:$predecessor_runtime_receipt,predecessor_runtime_backup_manifest_sha256:$predecessor_runtime_manifest,predecessor_release_generation:$predecessor_generation,release_generation:$generation,runtime_backup_receipt_sha256:$runtime_receipt_sha,runtime_backup_manifest_sha256:$runtime_manifest_sha} | if $successor_policy_schema == 3 then del(.predecessor_apply_receipt_sha256) + {predecessor_completion_kind:$predecessor_completion_kind,predecessor_completion_attestation_sha256:$predecessor_completion_attestation,predecessor_completion_signature_sha256:$predecessor_completion_signature,predecessor_completion_public_key_sha256:$predecessor_completion_public_key} else . end) else {} end)' \
   >"$state_tmp"
+chmod 0600 -- "$state_tmp"
 if [[ "$successor" == "true" ]]; then
   validate_persisted_successor_authority "$state_tmp" apply_finalizing_ingress_closed
 fi
@@ -2611,6 +2618,7 @@ jq -n \
   '{schema_version:2,state:"applied_ingress_closed",estate_root:$estate,backup_dir:$backup,apply_receipt_sha256:$apply_sha,apply_armed_receipt_sha256:$armed_sha,control_sha256:$control_sha,release_evidence_sha256:$release_sha,transaction_sha256:$transaction_sha,applied_targets_sha256:$applied_targets_sha,closed_verified_at:$closed_at,route_database_state:"absent",public_ipv4_ipv6_closed_status:404,services_activated:$activated,runtime_verified:$activated,ingress_opened:false} +
    (if $successor then ({successor:true,successor_armed_receipt:"SUCCESSOR-ARMED.receipt",successor_armed_receipt_sha256:$successor_armed_sha,predecessor_current_file:"PREDECESSOR-CURRENT.json",predecessor_current_sha256:$predecessor_current_sha,predecessor_backup_dir:$predecessor_backup,predecessor_control_sha256:$predecessor_control,predecessor_apply_receipt_sha256:$predecessor_apply,predecessor_release_evidence_sha256:$predecessor_release,predecessor_runtime_backup_receipt_sha256:$predecessor_runtime_receipt,predecessor_runtime_backup_manifest_sha256:$predecessor_runtime_manifest,predecessor_release_generation:$predecessor_generation,release_generation:$generation,runtime_backup_receipt_sha256:$runtime_receipt_sha,runtime_backup_manifest_sha256:$runtime_manifest_sha} | if $successor_policy_schema == 3 then del(.predecessor_apply_receipt_sha256) + {predecessor_completion_kind:$predecessor_completion_kind,predecessor_completion_attestation_sha256:$predecessor_completion_attestation,predecessor_completion_signature_sha256:$predecessor_completion_signature,predecessor_completion_public_key_sha256:$predecessor_completion_public_key} else . end) else {} end)' \
   >"$state_tmp"
+chmod 0600 -- "$state_tmp"
 if [[ "$successor" == "true" ]]; then
   validate_persisted_successor_authority "$state_tmp" applied_ingress_closed
 fi

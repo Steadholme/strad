@@ -1019,6 +1019,152 @@ class ApplyContractTests(unittest.TestCase):
             self.assertIn(call, script)
         self.assertNotIn('} >"$apply_receipt"', script)
 
+    def test_apply_protects_every_current_candidate_before_validation(self) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        candidates = list(
+            re.finditer(r'>"\$(?P<variable>successor_state_tmp|state_tmp)"', script)
+        )
+        self.assertEqual(len(candidates), 8)
+
+        for candidate in candidates:
+            variable = candidate.group("variable")
+            commit = script.index(
+                f'commit_atomic_file "${variable}"', candidate.end()
+            )
+            pending = script[candidate.end() : commit]
+            references = [
+                line.strip()
+                for line in pending.splitlines()
+                if f'"${variable}"' in line
+            ]
+            self.assertTrue(references)
+            self.assertEqual(
+                references[0],
+                f'chmod 0600 -- "${variable}"',
+            )
+            protection = pending.index(f'chmod 0600 -- "${variable}"')
+            for validation in re.finditer(
+                rf'validate_[^\n]*"\${variable}"', pending
+            ):
+                self.assertLess(protection, validation.start())
+
+    def test_successor_current_candidate_is_private_at_real_validator_seam(
+        self,
+    ) -> None:
+        script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        harness = self.root / "persist-successor-current.sh"
+        harness.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            + shell_function(script, "commit_atomic_file")
+            + "\n"
+            + shell_function(script, "persist_successor_authority")
+            + "\n"
+            + "holdfast_die() { printf '%s\\n' \"$1\" >&2; return 1; }\n"
+            + "holdfast_sha256() { sha256sum -- \"$1\" | cut -d' ' -f1; }\n"
+            + "atomic_copy_authority() {\n"
+            + "  [[ ! -e \"$2\" && ! -L \"$2\" ]] || holdfast_die \"authority target exists\"\n"
+            + "  cp -- \"$1\" \"$2\"\n"
+            + "  chmod 0600 -- \"$2\"\n"
+            + "}\n"
+            + "validate_persisted_recovery_completion_authority() { :; }\n"
+            + "validate_persisted_successor_authority() {\n"
+            + "  local pointer=$1 expected=$2 observed\n"
+            + "  observed=$(stat -c '%a' -- \"$pointer\")\n"
+            + "  printf '%s:%s\\n' \"$expected\" \"$observed\" >>\"$validation_log\"\n"
+            + "  [[ \"$observed\" == 600 ]] || return 91\n"
+            + "  if [[ \"$mode\" == reject && ! -e \"$root/validation-rejected\" ]]; then\n"
+            + "    : >\"$root/validation-rejected\"\n"
+            + "    return 92\n"
+            + "  fi\n"
+            + "}\n"
+            + "root=$1\n"
+            + "mode=$2\n"
+            + "state_dir=\"$root/state\"\n"
+            + "state_file=\"$state_dir/CURRENT.json\"\n"
+            + "backup=\"$root/backup\"\n"
+            + "stage=\"$root/stage\"\n"
+            + "release_env=\"$root/release.env\"\n"
+            + "receipt=\"$stage/DRY-RUN.receipt\"\n"
+            + "validation_log=\"$root/validation.log\"\n"
+            + "estate_root=/estate\n"
+            + "dry_run_dir=/dry-run\n"
+            + "successor=true\n"
+            + "successor_policy_schema=2\n"
+            + "predecessor_current_sha=$(holdfast_sha256 \"$state_file\")\n"
+            + "predecessor_backup=/predecessor\n"
+            + "predecessor_control_sha=$(printf control | sha256sum | cut -d' ' -f1)\n"
+            + "predecessor_apply_sha=$(printf apply | sha256sum | cut -d' ' -f1)\n"
+            + "predecessor_completion_kind=\n"
+            + "predecessor_completion_attestation_sha=\n"
+            + "predecessor_completion_signature_sha=\n"
+            + "predecessor_completion_public_key_sha=\n"
+            + "predecessor_release_sha=$(printf release | sha256sum | cut -d' ' -f1)\n"
+            + "predecessor_runtime_receipt_sha=$(printf runtime-receipt | sha256sum | cut -d' ' -f1)\n"
+            + "predecessor_runtime_manifest_sha=$(printf runtime-manifest | sha256sum | cut -d' ' -f1)\n"
+            + "predecessor_generation=3\n"
+            + "release_generation=4\n"
+            + "HOLDFAST_TEST_MODE=0\n"
+            + "umask 0022\n"
+            + ": >\"$root/caller-umask-probe\"\n"
+            + "[[ $(stat -c '%a' -- \"$root/caller-umask-probe\") == 644 ]]\n"
+            + "rm -- \"$root/caller-umask-probe\"\n"
+            + "persist_successor_authority\n",
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+
+        for mode in ("accept", "reject"):
+            with self.subTest(mode=mode):
+                root = self.root / mode
+                state_dir = root / "state"
+                backup = root / "backup"
+                stage = root / "stage"
+                state_dir.mkdir(parents=True)
+                backup.mkdir()
+                stage.mkdir()
+                state = state_dir / "CURRENT.json"
+                original = b'{"state":"applied_ingress_closed","release_generation":3}\n'
+                state.write_bytes(original)
+                state.chmod(0o600)
+                original_inode = state.stat().st_ino
+                (root / "release.env").write_text("SAFE=1\n", encoding="utf-8")
+                (stage / "RELEASE-EVIDENCE.json").write_text("{}\n", encoding="utf-8")
+                (stage / "DRY-RUN.receipt").write_text(
+                    "schema_version=2\n", encoding="utf-8"
+                )
+
+                result = subprocess.run(
+                    ["bash", str(harness), str(root), mode],
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                validations = (root / "validation.log").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if mode == "accept":
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(
+                        validations,
+                        ["successor_armed:600", "successor_armed:600"],
+                    )
+                    self.assertNotEqual(state.stat().st_ino, original_inode)
+                    self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(
+                        json.loads(state.read_text(encoding="utf-8"))["state"],
+                        "successor_armed",
+                    )
+                    self.assertEqual(list(state_dir.glob(".CURRENT.json.*")), [])
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(validations, ["successor_armed:600"])
+                    self.assertEqual(state.stat().st_ino, original_inode)
+                    self.assertEqual(state.read_bytes(), original)
+                    candidates = list(state_dir.glob(".CURRENT.json.*"))
+                    self.assertEqual(len(candidates), 1)
+                    self.assertEqual(candidates[0].stat().st_mode & 0o777, 0o600)
+
     def test_apply_proves_closed_ingress_before_success_receipt_and_state(self) -> None:
         script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
         closed_function = script[
