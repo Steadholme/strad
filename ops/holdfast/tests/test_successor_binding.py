@@ -64,6 +64,10 @@ class SuccessorBindingTests(unittest.TestCase):
             predecessor["access_build_input_schema"] = (
                 successor_binding.BUILD_INPUT_V1
             )
+        if not legacy["overlay"]:
+            legacy["overlay"] = self.synthetic_access_overlay(
+                7 if schema_version == 1 else 2
+            )
         return legacy
 
     def synthetic_access_overlay(
@@ -276,7 +280,70 @@ class SuccessorBindingTests(unittest.TestCase):
             "signature_sha256": "b" * 64,
             "public_key_sha256": "c" * 64,
         }
+        if not policy["overlay"]:
+            policy["overlay"] = self.synthetic_access_overlay(2)
         return policy
+
+    def v4_policy(self) -> dict[str, object]:
+        policy = self.current_policy()
+        policy["schema_version"] = 4
+        policy["ceremony"] = "holdfast-rikune-successor-v4"
+        predecessor = policy["predecessor"]
+        successor = policy["successor"]
+        assert isinstance(predecessor, dict)
+        assert isinstance(successor, dict)
+        predecessor.pop("completion", None)
+        predecessor.setdefault("apply_receipt_sha256", "d" * 64)
+        predecessor["access_build_input_schema"] = successor_binding.BUILD_INPUT_V2
+        if successor["source_access_build_input_sha256"] == predecessor[
+            "access_build_input_sha256"
+        ]:
+            successor["source_access_build_input_sha256"] = "e" * 64
+        if successor["access_build_input_sha256"] == predecessor[
+            "access_build_input_sha256"
+        ]:
+            successor["access_build_input_sha256"] = "f" * 64
+        if not policy["overlay"]:
+            policy["overlay"] = self.synthetic_access_overlay(2)
+        return policy
+
+    def gen4_current(self, estate: Path, backup: Path) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "state": "applied_ingress_closed",
+            "estate_root": str(estate),
+            "backup_dir": str(backup),
+            "apply_receipt_sha256": "1" * 64,
+            "apply_armed_receipt_sha256": "2" * 64,
+            "control_sha256": "3" * 64,
+            "release_evidence_sha256": "4" * 64,
+            "transaction_sha256": "5" * 64,
+            "applied_targets_sha256": "6" * 64,
+            "closed_verified_at": "2026-08-29T20:40:45Z",
+            "route_database_state": "absent",
+            "public_ipv4_ipv6_closed_status": 404,
+            "services_activated": True,
+            "runtime_verified": True,
+            "ingress_opened": False,
+            "successor": True,
+            "successor_armed_receipt": "SUCCESSOR-ARMED.receipt",
+            "successor_armed_receipt_sha256": "7" * 64,
+            "predecessor_current_file": "PREDECESSOR-CURRENT.json",
+            "predecessor_current_sha256": "8" * 64,
+            "predecessor_backup_dir": str(self.root / "gen3-backup"),
+            "predecessor_control_sha256": "9" * 64,
+            "predecessor_completion_kind": recovery_completion_attestation.KIND,
+            "predecessor_completion_attestation_sha256": "a" * 64,
+            "predecessor_completion_signature_sha256": "b" * 64,
+            "predecessor_completion_public_key_sha256": "c" * 64,
+            "predecessor_release_evidence_sha256": "d" * 64,
+            "predecessor_runtime_backup_receipt_sha256": "e" * 64,
+            "predecessor_runtime_backup_manifest_sha256": "f" * 64,
+            "predecessor_release_generation": 3,
+            "release_generation": 4,
+            "runtime_backup_receipt_sha256": "0" * 64,
+            "runtime_backup_manifest_sha256": "1" * 64,
+        }
 
     def issue_recovery_completion(
         self,
@@ -493,13 +560,439 @@ class SuccessorBindingTests(unittest.TestCase):
         hybrid["predecessor"]["apply_receipt_sha256"] = "d" * 64
         cases.append(("hybrid", hybrid, "predecessor policy field set"))
         unknown = self.v3_policy()
-        unknown["schema_version"] = 4
-        unknown["ceremony"] = "holdfast-rikune-successor-v4"
-        cases.append(("unknown-v4", unknown, "version or ceremony"))
+        unknown["schema_version"] = 5
+        unknown["ceremony"] = "holdfast-rikune-successor-v5"
+        cases.append(("unknown-v5", unknown, "version or ceremony"))
         for name, candidate, error in cases:
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
                 successor_binding.validate_policy(
                     self.write_policy(candidate, f"v3-{name}.json")
+                )
+
+    def test_schema_v4_policy_is_exact_bounded_access_delta_with_apply_authority(
+        self,
+    ) -> None:
+        policy = self.v4_policy()
+        validated = successor_binding.validate_policy(
+            self.write_policy(policy, "successor-v4.json")
+        )
+        predecessor = validated["predecessor"]
+        successor = validated["successor"]
+        self.assertEqual(validated["schema_version"], 4)
+        self.assertTrue(validated["overlay"])
+        self.assertLessEqual(
+            len(validated["overlay"]),
+            successor_binding.MAX_SUCCESSOR_OVERLAY_PATHS,
+        )
+        self.assertIn("apply_receipt_sha256", predecessor)
+        self.assertNotIn("completion", predecessor)
+        self.assertNotIn("access_candidate_tool_revision", predecessor)
+        self.assertNotEqual(
+            successor["source_access_build_input_sha256"],
+            predecessor["access_build_input_sha256"],
+        )
+        self.assertNotEqual(
+            successor["access_build_input_sha256"],
+            predecessor["access_build_input_sha256"],
+        )
+
+        cases: list[tuple[str, dict[str, object], str]] = []
+        missing_apply = self.v4_policy()
+        del missing_apply["predecessor"]["apply_receipt_sha256"]
+        cases.append(("missing-apply", missing_apply, "predecessor policy field set"))
+        completion = self.v4_policy()
+        completion["predecessor"]["completion"] = {
+            "kind": recovery_completion_attestation.KIND,
+            "attestation_sha256": "a" * 64,
+            "signature_sha256": "b" * 64,
+            "public_key_sha256": "c" * 64,
+        }
+        cases.append(("completion-hybrid", completion, "predecessor policy field set"))
+        empty_overlay = self.v4_policy()
+        empty_overlay["overlay"] = []
+        cases.append(("empty-overlay", empty_overlay, "overlay size"))
+        malformed_source = self.v4_policy()
+        malformed_source["successor"]["source_access_build_input_sha256"] = "bad"
+        cases.append(("malformed-source", malformed_source, "source build input"))
+        extra_tool = self.v4_policy()
+        extra_tool["predecessor"]["access_candidate_tool_revision"] = "e" * 40
+        cases.append(("extra-tool", extra_tool, "predecessor policy field set"))
+        for name, candidate, error in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                successor_binding.validate_policy(
+                    self.write_policy(candidate, f"v4-{name}.json")
+                )
+
+    def test_schema_v4_apply_receipt_is_completion_and_gen3_trio_is_history(
+        self,
+    ) -> None:
+        estate = self.root / "gen4-estate"
+        backup = self.root / "gen4-backup"
+        (backup / "runtime").mkdir(parents=True)
+        backup.chmod(0o700)
+        estate.mkdir()
+        artifacts = {
+            "release_env_sha256": backup / "release.env",
+            "release_evidence_sha256": backup / "RELEASE-EVIDENCE.json",
+            "render_inputs_sha256": backup / "RENDER-INPUTS.sha256",
+            "apply_armed_receipt_sha256": backup / "APPLY-ARMED.receipt",
+            "control_sha256": backup / "CONTROL.sha256",
+            "transaction_sha256": backup / "estate/TRANSACTION.json",
+            "applied_targets_sha256": backup / "estate/APPLIED-TARGETS.sha256",
+            "successor_armed_receipt_sha256": backup / "SUCCESSOR-ARMED.receipt",
+            "runtime_backup_receipt_sha256": backup / "runtime/BACKUP.receipt",
+            "runtime_backup_manifest_sha256": backup / "runtime/SHA256SUMS",
+        }
+        for index, path in enumerate(artifacts.values(), 1):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"gen4 artifact {index}\n", encoding="utf-8")
+        values = {
+            "schema_version": "2",
+            "completion_state": "applied_ingress_closed",
+            "applied_at": "2026-08-29T20:40:00Z",
+            "closed_verified_at": "2026-08-29T20:40:45Z",
+            "estate_root": str(estate),
+            "backup_dir": str(backup),
+            **{
+                field: successor_binding.sha256(path)
+                for field, path in artifacts.items()
+            },
+            "cargo_gate": "passed",
+            "runtime_backup": "passed",
+            "closed_bracket": "passed",
+            "route_database_state": "absent",
+            "public_ipv4_ipv6_closed_status": "404",
+            "ingress_opened": "false",
+            "services_activated": "true",
+            "runtime_verified": "true",
+            "successor": "true",
+            "successor_armed_receipt": "SUCCESSOR-ARMED.receipt",
+            "predecessor_current_file": "PREDECESSOR-CURRENT.json",
+            "predecessor_current_sha256": "1" * 64,
+            "predecessor_backup_dir": "/secure/backups/holdfast-rikune-gen3",
+            "predecessor_control_sha256": "2" * 64,
+            "predecessor_completion_kind": recovery_completion_attestation.KIND,
+            "predecessor_completion_attestation_sha256": "3" * 64,
+            "predecessor_completion_signature_sha256": "4" * 64,
+            "predecessor_completion_public_key_sha256": "5" * 64,
+            "predecessor_release_evidence_sha256": "6" * 64,
+            "predecessor_runtime_backup_receipt_sha256": "7" * 64,
+            "predecessor_runtime_backup_manifest_sha256": "8" * 64,
+            "predecessor_release_generation": "3",
+            "release_generation": "4",
+        }
+        raw = "".join(f"{key}={value}\n" for key, value in values.items()).encode()
+        predecessor = self.v4_policy()["predecessor"]
+        predecessor["apply_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+        successor_binding.validate_gen4_apply_completion(
+            raw, predecessor, estate, backup
+        )
+
+        for name, mutation, error in (
+            (
+                "missing-field",
+                lambda item: item.pop("closed_bracket"),
+                "field set is not exact",
+            ),
+            (
+                "wrong-generation",
+                lambda item: item.__setitem__("release_generation", "5"),
+                "generation linkage",
+            ),
+            (
+                "extra-completion-history",
+                lambda item: item.__setitem__(
+                    "predecessor_completion_unknown_sha256", "9" * 64
+                ),
+                "field set is not exact",
+            ),
+        ):
+            candidate = dict(values)
+            mutation(candidate)
+            candidate_raw = "".join(
+                f"{key}={value}\n" for key, value in candidate.items()
+            ).encode()
+            candidate_predecessor = dict(predecessor)
+            candidate_predecessor["apply_receipt_sha256"] = hashlib.sha256(
+                candidate_raw
+            ).hexdigest()
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                successor_binding.validate_gen4_apply_completion(
+                    candidate_raw, candidate_predecessor, estate, backup
+                )
+
+        predecessor_backup = self.root / "gen3-lineage-backup"
+        predecessor_runtime = predecessor_backup / "runtime"
+        predecessor_runtime.mkdir(parents=True, mode=0o700)
+        predecessor_backup.chmod(0o700)
+        predecessor_release = predecessor_backup / "RELEASE-EVIDENCE.json"
+        predecessor_release.write_text("gen3 release evidence\n", encoding="utf-8")
+        predecessor_runtime_receipt = predecessor_runtime / "BACKUP.receipt"
+        predecessor_runtime_receipt.write_text(
+            "gen3 runtime receipt\n", encoding="utf-8"
+        )
+        predecessor_runtime_manifest = predecessor_runtime / "SHA256SUMS"
+        predecessor_runtime_manifest.write_text(
+            f"{successor_binding.sha256(predecessor_runtime_receipt)}  BACKUP.receipt\n",
+            encoding="utf-8",
+        )
+        predecessor_control = predecessor_backup / "CONTROL.sha256"
+        predecessor_control.write_text(
+            "".join(
+                (
+                    f"{successor_binding.sha256(predecessor_release)}  RELEASE-EVIDENCE.json\n",
+                    f"{successor_binding.sha256(predecessor_runtime_manifest)}  runtime/SHA256SUMS\n",
+                )
+            ),
+            encoding="utf-8",
+        )
+        predecessor_current = {
+            "schema_version": 2,
+            "state": "applied_ingress_closed",
+            "estate_root": str(estate),
+            "backup_dir": str(predecessor_backup),
+            "control_sha256": successor_binding.sha256(predecessor_control),
+            "release_evidence_sha256": successor_binding.sha256(
+                predecessor_release
+            ),
+            "successor": True,
+            "predecessor_release_generation": 2,
+            "release_generation": 3,
+            "services_activated": True,
+            "runtime_verified": True,
+            "ingress_opened": False,
+        }
+        predecessor_current_path = backup / "PREDECESSOR-CURRENT.json"
+        predecessor_current_path.write_text(
+            json.dumps(predecessor_current, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        completion_paths = {
+            "predecessor_completion_attestation_sha256": (
+                backup / recovery_completion_attestation.ATTESTATION_NAME
+            ),
+            "predecessor_completion_signature_sha256": (
+                backup / recovery_completion_attestation.SIGNATURE_NAME
+            ),
+            "predecessor_completion_public_key_sha256": (
+                backup / recovery_completion_attestation.PUBLIC_KEY_NAME
+            ),
+        }
+        for index, path in enumerate(completion_paths.values(), 1):
+            path.write_text(f"completion artifact {index}\n", encoding="utf-8")
+        values.update(
+            {
+                "predecessor_current_sha256": successor_binding.sha256(
+                    predecessor_current_path
+                ),
+                "predecessor_backup_dir": str(predecessor_backup),
+                "predecessor_control_sha256": successor_binding.sha256(
+                    predecessor_control
+                ),
+                "predecessor_release_evidence_sha256": successor_binding.sha256(
+                    predecessor_release
+                ),
+                "predecessor_runtime_backup_receipt_sha256": (
+                    successor_binding.sha256(predecessor_runtime_receipt)
+                ),
+                "predecessor_runtime_backup_manifest_sha256": (
+                    successor_binding.sha256(predecessor_runtime_manifest)
+                ),
+                **{
+                    field: successor_binding.sha256(path)
+                    for field, path in completion_paths.items()
+                },
+            }
+        )
+        raw = "".join(f"{key}={value}\n" for key, value in values.items()).encode()
+        predecessor["apply_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+        current = self.gen4_current(estate, backup)
+        for field in successor_binding.GEN4_SHARED_COMPLETION_FIELDS:
+            raw_value = values[field]
+            current[field] = (
+                raw_value == "true"
+                if raw_value in {"true", "false"}
+                else int(raw_value)
+                if field in {
+                    "schema_version",
+                    "public_ipv4_ipv6_closed_status",
+                    "predecessor_release_generation",
+                    "release_generation",
+                }
+                else raw_value
+            )
+        current["apply_receipt_sha256"] = predecessor["apply_receipt_sha256"]
+        successor_binding.validate_gen4_apply_completion(
+            raw, predecessor, estate, backup, current
+        )
+
+        original_predecessor_current = predecessor_current_path.read_bytes()
+        predecessor_current_path.write_text("tampered predecessor CURRENT\n")
+        with self.assertRaisesRegex(ValueError, "predecessor_current_sha256"):
+            successor_binding.validate_gen4_apply_completion(
+                raw, predecessor, estate, backup, current
+            )
+        predecessor_current_path.write_bytes(original_predecessor_current)
+
+        for field, mutated in (
+            ("schema_version", 3),
+            ("state", "future_state"),
+            ("estate_root", "/other/estate"),
+            ("backup_dir", "/other/backup"),
+            ("successor", False),
+            ("predecessor_release_generation", 3),
+            ("release_generation", 4),
+            ("services_activated", False),
+            ("runtime_verified", False),
+            ("ingress_opened", True),
+        ):
+            candidate_predecessor_current = dict(predecessor_current)
+            candidate_predecessor_current[field] = mutated
+            predecessor_current_path.write_text(
+                json.dumps(candidate_predecessor_current, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            candidate_values = dict(values)
+            candidate_values["predecessor_current_sha256"] = (
+                successor_binding.sha256(predecessor_current_path)
+            )
+            candidate_raw = "".join(
+                f"{key}={value}\n" for key, value in candidate_values.items()
+            ).encode()
+            candidate_policy = dict(predecessor)
+            candidate_policy["apply_receipt_sha256"] = hashlib.sha256(
+                candidate_raw
+            ).hexdigest()
+            candidate_current = dict(current)
+            candidate_current["predecessor_current_sha256"] = candidate_values[
+                "predecessor_current_sha256"
+            ]
+            candidate_current["apply_receipt_sha256"] = candidate_policy[
+                "apply_receipt_sha256"
+            ]
+            with self.subTest(predecessor_current_field=field), \
+                self.assertRaisesRegex(ValueError, field):
+                successor_binding.validate_gen4_apply_completion(
+                    candidate_raw,
+                    candidate_policy,
+                    estate,
+                    backup,
+                    candidate_current,
+                )
+        predecessor_current_path.write_bytes(original_predecessor_current)
+
+        for artifact in (
+            predecessor_control,
+            predecessor_release,
+            predecessor_runtime_receipt,
+            predecessor_runtime_manifest,
+        ):
+            original = artifact.read_bytes()
+            artifact.write_bytes(original + b"tamper\n")
+            with self.subTest(predecessor_artifact=artifact.name), \
+                self.assertRaisesRegex(ValueError, "predecessor artifact"):
+                successor_binding.validate_gen4_apply_completion(
+                    raw, predecessor, estate, backup, current
+                )
+            artifact.write_bytes(original)
+
+        for artifact in completion_paths.values():
+            original = artifact.read_bytes()
+            artifact.write_bytes(original + b"tamper\n")
+            with self.subTest(completion_artifact=artifact.name), \
+                self.assertRaisesRegex(ValueError, "completion artifact"):
+                successor_binding.validate_gen4_apply_completion(
+                    raw, predecessor, estate, backup, current
+                )
+            artifact.write_bytes(original)
+
+        (backup / "APPLY.receipt").write_bytes(raw)
+        current_path = self.root / "GEN4-CURRENT.json"
+        current_path.write_text(
+            json.dumps(current, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        command = [
+            "python3",
+            str(OPS_ROOT / "successor_binding.py"),
+            "--validate-gen4-lineage",
+            "--current-state",
+            str(current_path),
+            "--estate-root",
+            str(estate),
+        ]
+        accepted = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        current["future_field"] = "must-fail-before-mutation"
+        current_path.write_text(
+            json.dumps(current, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        rejected = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("field set is not exact", rejected.stderr)
+
+    def test_schema_v4_current_contract_is_exact_and_every_shared_apply_field_aligns(
+        self,
+    ) -> None:
+        estate = self.root / "gen4-current-estate"
+        backup = self.root / "gen4-current-backup"
+        current = self.gen4_current(estate, backup)
+        self.assertEqual(
+            set(current), successor_binding.GEN4_CURRENT_FIELDS
+        )
+        successor_binding.validate_gen4_current(
+            current, estate=estate, backup=backup
+        )
+
+        for name, mutation in (
+            (
+                "extra",
+                lambda item: item.__setitem__("future_field", "not-authority"),
+            ),
+            ("missing", lambda item: item.pop("runtime_verified")),
+        ):
+            candidate = dict(current)
+            mutation(candidate)
+            with self.subTest(namespace=name), self.assertRaisesRegex(
+                ValueError, "field set is not exact"
+            ):
+                successor_binding.validate_gen4_current(candidate)
+
+        receipt = {
+            field: (
+                "true"
+                if current[field] is True
+                else "false"
+                if current[field] is False
+                else str(current[field])
+            )
+            for field in successor_binding.GEN4_SHARED_COMPLETION_FIELDS
+        }
+        successor_binding.require_gen4_current_apply_alignment(current, receipt)
+        for field in sorted(successor_binding.GEN4_SHARED_COMPLETION_FIELDS):
+            candidate = dict(receipt)
+            candidate[field] = (
+                "false" if candidate[field] == "true" else
+                "true" if candidate[field] == "false" else
+                "405" if candidate[field] == "404" else
+                "f" * 64 if candidate[field] != "f" * 64 else "e" * 64
+            )
+            with self.subTest(shared_field=field), self.assertRaisesRegex(
+                ValueError, field
+            ):
+                successor_binding.require_gen4_current_apply_alignment(
+                    current, candidate
                 )
 
     def test_recovery_completion_rejects_signature_and_key_tamper(self) -> None:
@@ -2104,6 +2597,44 @@ class SuccessorBindingTests(unittest.TestCase):
         binding.unlink()
         render_input_binding.write_binding(ops, binding, successor=True)
         with self.assertRaisesRegex(ValueError, "OpenSSL ceremony failed"):
+            render_input_binding.verify_apply_binding(
+                ops, binding, stage, evidence, "successor"
+            )
+
+    def test_apply_binding_v4_requires_exact_bounded_delta_and_current_tool_revision(
+        self,
+    ) -> None:
+        ops, stage, evidence, binding, source_estate = self.make_apply_fixture(
+            overlay_count=2
+        )
+        policy_path = ops / "successor-policy.json"
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["schema_version"] = 4
+        policy["ceremony"] = "holdfast-rikune-successor-v4"
+        predecessor = policy["predecessor"]
+        predecessor["access_build_input_schema"] = successor_binding.BUILD_INPUT_V2
+        policy_path.write_text(json.dumps(policy) + "\n", encoding="utf-8")
+
+        delta = stage / "SUCCESSOR-DELTA.sha256"
+        evidence_value = json.loads(evidence.read_text(encoding="utf-8"))
+        evidence_value["predecessor_binding"] = copy.deepcopy(predecessor)
+        evidence.write_text(json.dumps(evidence_value) + "\n", encoding="utf-8")
+        binding.unlink()
+        render_input_binding.write_binding(ops, binding, successor=True)
+
+        render_input_binding.verify_apply_binding(
+            ops,
+            binding,
+            stage,
+            evidence,
+            "successor",
+            source_estate_root=source_estate,
+        )
+
+        delta.write_text("0" * 64 + "  " + "1" * 64 + "  access-governance/x\n")
+        evidence_value["successor_delta_sha256"] = render_input_binding.digest(delta)
+        evidence.write_text(json.dumps(evidence_value) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "delta content"):
             render_input_binding.verify_apply_binding(
                 ops, binding, stage, evidence, "successor"
             )

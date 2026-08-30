@@ -14,12 +14,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
+from successor_binding import validate_policy
+
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-PUBLIC_HOST = "analyze.w33d.xyz"
+PUBLIC_HOST = "rikune.w33d.xyz"
 PUBLIC_URL = f"https://{PUBLIC_HOST}/"
+LEGACY_PUBLIC_HOST = "analyze.w33d.xyz"
+LEGACY_PUBLIC_URL = f"https://{LEGACY_PUBLIC_HOST}/"
 EDGE_OWNER = "existing-w33d-sluice"
 ROUTE_STATE = "absent"
+LEGACY_CONTRACT = "legacy-analyze-v2"
+DUAL_HOST_CONTRACT = "rikune-dual-v3"
 
 
 def fail(message: str) -> NoReturn:
@@ -123,9 +129,31 @@ def verify_signature(evidence: Path, signature: Path, public_key: Path, values: 
         fail("detached edge evidence signature verification failed")
 
 
-def validate_edge_identity(value: dict[str, Any], label: str) -> None:
-    if value.get("host") != PUBLIC_HOST:
-        fail(f"{label} host is not {PUBLIC_HOST}")
+def validate_frozen_contract(args: argparse.Namespace) -> tuple[str, str | None]:
+    release_value = load(args.release_evidence)
+    is_successor = (
+        release_value.get("schema_version") == 2
+        and release_value.get("release_mode") == "successor"
+    )
+    if not is_successor:
+        if args.successor_policy is not None:
+            fail("legacy edge evidence must not claim successor policy authority")
+        return LEGACY_CONTRACT, None
+    if args.successor_policy is None:
+        fail("successor edge evidence requires its frozen successor policy")
+    policy = validate_policy(args.successor_policy)
+    if release_value.get("predecessor_binding") != policy["predecessor"]:
+        fail("release evidence differs from the frozen successor policy")
+    if policy["schema_version"] == 4:
+        return DUAL_HOST_CONTRACT, sha256(args.successor_policy)
+    return LEGACY_CONTRACT, sha256(args.successor_policy)
+
+
+def validate_edge_identity(
+    value: dict[str, Any], label: str, expected_host: str
+) -> None:
+    if value.get("host") != expected_host:
+        fail(f"{label} host is not {expected_host}")
     if value.get("edge_owner") != EDGE_OWNER:
         fail(f"{label} is not attributed to the existing W33D Sluice edge")
     if value.get("route_state") != ROUTE_STATE:
@@ -134,10 +162,20 @@ def validate_edge_identity(value: dict[str, Any], label: str) -> None:
         fail(f"{label} must not claim GitHub Pages, Cloudflare, or DNS mutation")
 
 
-def validate_closed_probes(value: object, not_before: datetime, label: str) -> datetime:
-    if not isinstance(value, list) or len(value) != 2:
-        fail(f"{label} requires exactly one IPv4 and one IPv6 probe")
-    families: set[str] = set()
+def validate_closed_probes(
+    value: object,
+    not_before: datetime,
+    label: str,
+    expected_urls: set[str],
+) -> datetime:
+    expected_pairs = {
+        (url, family)
+        for url in expected_urls
+        for family in ("ipv4", "ipv6")
+    }
+    if not isinstance(value, list) or len(value) != len(expected_pairs):
+        fail(f"{label} requires exactly one IPv4 and one IPv6 probe per host")
+    observed_pairs: set[tuple[str, str]] = set()
     latest = not_before
     for item in value:
         probe = exact(
@@ -154,10 +192,12 @@ def validate_closed_probes(value: object, not_before: datetime, label: str) -> d
             f"{label} public probe",
         )
         family = probe["family"]
-        if family not in {"ipv4", "ipv6"} or family in families:
-            fail(f"{label} public probe family is duplicate or invalid")
-        families.add(family)
-        if probe["url"] != PUBLIC_URL:
+        url = probe["url"]
+        pair = (url, family)
+        if pair not in expected_pairs or pair in observed_pairs:
+            fail(f"{label} public probe host/family is duplicate or invalid")
+        observed_pairs.add(pair)
+        if url not in expected_urls:
             fail(f"{label} public probe targets the wrong host")
         if probe["status"] != 404:
             fail(f"{label} public probe must return exact 404")
@@ -170,12 +210,14 @@ def validate_closed_probes(value: object, not_before: datetime, label: str) -> d
         if observed < not_before:
             fail(f"{label} public probe predates the closed-state receipt")
         latest = max(latest, observed)
-    if families != {"ipv4", "ipv6"}:
-        fail(f"{label} requires both IPv4 and IPv6 probes")
+    if observed_pairs != expected_pairs:
+        fail(f"{label} does not prove the exact host set over IPv4 and IPv6")
     return latest
 
 
-def validate_prepare_receipt(path: Path) -> tuple[dict[str, str], datetime]:
+def validate_legacy_prepare_receipt(
+    path: Path,
+) -> tuple[dict[str, str], datetime]:
     values = receipt(path)
     required = {
         "prepared_at",
@@ -190,47 +232,132 @@ def validate_prepare_receipt(path: Path) -> tuple[dict[str, str], datetime]:
         "external_edge_mutation",
     }
     if set(values) != required:
-        fail("open prepare receipt field set is not exact")
+        fail("legacy open prepare receipt field set is not exact")
     if (
         values["route_state"] != ROUTE_STATE
-        or values["public_host"] != PUBLIC_HOST
+        or values["public_host"] != LEGACY_PUBLIC_HOST
         or values["edge_owner"] != EDGE_OWNER
         or values["public_ipv4_ipv6_closed_status"] != "404"
         or values["db_public_db_bracket"] != "absent-404-absent"
         or values["external_edge_mutation"] != "none"
     ):
-        fail("open prepare receipt does not prove the exact closed Sluice edge")
+        fail("legacy open prepare receipt does not prove the exact closed Sluice edge")
     for name in ("release_evidence_sha256", "open_evidence_sha256"):
         hex64(values[name], f"open prepare receipt {name}")
     return values, moment(values["prepared_at"], "open prepare time")
 
 
-def validate_preopen(value: dict[str, Any], args: argparse.Namespace) -> None:
+def validate_dual_prepare_receipt(
+    path: Path,
+) -> tuple[dict[str, str], datetime]:
+    values = receipt(path)
+    required = {
+        "schema_version",
+        "prepared_at",
+        "release_generation",
+        "release_evidence_sha256",
+        "open_evidence_sha256",
+        "source_grant_id",
+        "route_state",
+        "public_host",
+        "legacy_public_host",
+        "legacy_route_state",
+        "legacy_public_ipv4_ipv6_closed_status",
+        "edge_owner",
+        "public_ipv4_ipv6_closed_status",
+        "db_public_db_bracket",
+        "external_edge_mutation",
+    }
+    if set(values) != required:
+        fail("dual-host open prepare receipt field set is not exact")
+    if (
+        values["schema_version"] != "3"
+        or values["release_generation"] != "5"
+        or values["route_state"] != ROUTE_STATE
+        or values["public_host"] != PUBLIC_HOST
+        or values["legacy_public_host"] != LEGACY_PUBLIC_HOST
+        or values["legacy_route_state"] != ROUTE_STATE
+        or values["legacy_public_ipv4_ipv6_closed_status"] != "404"
+        or values["edge_owner"] != EDGE_OWNER
+        or values["public_ipv4_ipv6_closed_status"] != "404"
+        or values["db_public_db_bracket"] != "absent-404-absent"
+        or values["external_edge_mutation"] != "none"
+    ):
+        fail("dual-host open prepare receipt does not prove the exact closed edge")
+    for name in ("release_evidence_sha256", "open_evidence_sha256"):
+        hex64(values[name], f"dual-host open prepare receipt {name}")
+    return values, moment(values["prepared_at"], "open prepare time")
+
+
+def evidence_fields(mode: str, contract: str) -> set[str]:
     fields = {
         "schema_version",
         "ceremony",
         "issued_at",
         "signature_key_sha256",
         "release_evidence_sha256",
-        "open_evidence_sha256",
         "source_grant_id",
-        "open_prepare_receipt_sha256",
         "host",
         "edge_owner",
         "route_state",
         "external_edge_mutations",
         "public_probes",
     }
+    if mode == "preopen":
+        fields.update({"open_evidence_sha256", "open_prepare_receipt_sha256"})
+    else:
+        fields.update(
+            {
+                "preopen_edge_evidence_sha256",
+                "route_close_receipt_sha256",
+                "revocation_evidence_sha256",
+            }
+        )
+    if contract == DUAL_HOST_CONTRACT:
+        fields.add("successor_policy_sha256")
+    return fields
+
+
+def validate_document_shape(
+    value: dict[str, Any], mode: str, contract: str, policy_sha: str | None
+) -> None:
+    schema = 3 if contract == DUAL_HOST_CONTRACT else 2
+    ceremony = f"holdfast-rikune-edge-{mode}-v{schema}"
     if (
-        set(value) != fields
-        or value.get("schema_version") != 2
-        or value.get("ceremony") != "holdfast-rikune-edge-preopen-v2"
+        set(value) != evidence_fields(mode, contract)
+        or value.get("schema_version") != schema
+        or value.get("ceremony") != ceremony
     ):
-        fail("edge pre-open field set or v2 ceremony is invalid")
+        fail(f"edge {mode} field set or v{schema} ceremony is invalid")
+    expected_host = (
+        PUBLIC_HOST if contract == DUAL_HOST_CONTRACT else LEGACY_PUBLIC_HOST
+    )
+    validate_edge_identity(value, f"edge {mode} evidence", expected_host)
+    if contract == DUAL_HOST_CONTRACT:
+        if value.get("successor_policy_sha256") != policy_sha:
+            fail(f"edge {mode} frozen successor policy binding differs")
+
+
+def validate_preopen(
+    value: dict[str, Any],
+    args: argparse.Namespace,
+    contract: str,
+    policy_sha: str | None,
+) -> None:
+    validate_document_shape(value, "preopen", contract, policy_sha)
     if args.open_evidence is None or args.prepare_receipt is None:
         fail("pre-open validation requires open evidence and prepare receipt")
     open_value = load(args.open_evidence)
-    prepare_value, prepared_at = validate_prepare_receipt(args.prepare_receipt)
+    if contract == DUAL_HOST_CONTRACT:
+        prepare_value, prepared_at = validate_dual_prepare_receipt(
+            args.prepare_receipt
+        )
+        expected_urls = {PUBLIC_URL, LEGACY_PUBLIC_URL}
+    else:
+        prepare_value, prepared_at = validate_legacy_prepare_receipt(
+            args.prepare_receipt
+        )
+        expected_urls = {LEGACY_PUBLIC_URL}
     expected = {
         "signature_key_sha256": sha256(args.public_key),
         "release_evidence_sha256": sha256(args.release_evidence),
@@ -247,22 +374,22 @@ def validate_preopen(value: dict[str, Any], args: argparse.Namespace) -> None:
         or prepare_value["source_grant_id"] != expected["source_grant_id"]
     ):
         fail("open prepare receipt differs from the release authority binding")
-    validate_edge_identity(value, "edge pre-open evidence")
-    latest_probe = validate_closed_probes(value["public_probes"], prepared_at, "edge pre-open")
+    latest_probe = validate_closed_probes(
+        value["public_probes"], prepared_at, "edge pre-open", expected_urls
+    )
     if moment(value["issued_at"], "issued_at") < latest_probe:
         fail("edge pre-open evidence predates its public probes")
 
 
-def validate_preopen_reference(value: dict[str, Any]) -> None:
-    if (
-        value.get("schema_version") != 2
-        or value.get("ceremony") != "holdfast-rikune-edge-preopen-v2"
-    ):
-        fail("rollback references non-v2 pre-open edge evidence")
-    validate_edge_identity(value, "referenced edge pre-open evidence")
+def validate_preopen_reference(
+    value: dict[str, Any], contract: str, policy_sha: str | None
+) -> None:
+    validate_document_shape(value, "preopen", contract, policy_sha)
 
 
-def validate_route_close_receipt(path: Path) -> tuple[dict[str, str], datetime]:
+def validate_route_close_receipt(
+    path: Path, contract: str
+) -> tuple[dict[str, str], datetime]:
     values = receipt(path)
     required = {
         "schema_version",
@@ -287,10 +414,27 @@ def validate_route_close_receipt(path: Path) -> tuple[dict[str, str], datetime]:
         "db_public_db_bracket",
         "external_edge_mutation",
     }
+    if contract == DUAL_HOST_CONTRACT:
+        required.update(
+            {
+                "legacy_public_host",
+                "legacy_route_state",
+                "legacy_public_ipv4_ipv6_closed_status",
+            }
+        )
     if set(values) != required:
         fail("route-close receipt field set is not exact")
+    expected_schema = "3" if contract == DUAL_HOST_CONTRACT else "2"
+    expected_host = (
+        PUBLIC_HOST if contract == DUAL_HOST_CONTRACT else LEGACY_PUBLIC_HOST
+    )
+    expected_cleanup = (
+        "same-name-or-rikune-root-or-analyze-host"
+        if contract == DUAL_HOST_CONTRACT
+        else "same-name-or-analyze-root"
+    )
     if (
-        values["schema_version"] != "2"
+        values["schema_version"] != expected_schema
         or values["source_state"]
         not in {
             "ingress_open",
@@ -299,14 +443,20 @@ def validate_route_close_receipt(path: Path) -> tuple[dict[str, str], datetime]:
         }
         or values["was_public_open"] != "true"
         or values["route_state"] != ROUTE_STATE
-        or values["public_host"] != PUBLIC_HOST
+        or values["public_host"] != expected_host
         or values["edge_owner"] != EDGE_OWNER
         or values["public_ipv4_ipv6_closed_status"] != "404"
         or values["db_public_db_bracket"] != "absent-404-absent"
-        or values["route_conflict_cleanup"] != "same-name-or-analyze-root"
+        or values["route_conflict_cleanup"] != expected_cleanup
         or values["external_edge_mutation"] != "none"
     ):
         fail("route-close receipt does not prove a formerly-open route is closed on Sluice")
+    if contract == DUAL_HOST_CONTRACT and (
+        values["legacy_public_host"] != LEGACY_PUBLIC_HOST
+        or values["legacy_route_state"] != ROUTE_STATE
+        or values["legacy_public_ipv4_ipv6_closed_status"] != "404"
+    ):
+        fail("route-close receipt does not prove the analyze tombstone")
     for name in (
         "control_sha256",
         "state_before_sha256",
@@ -330,34 +480,20 @@ def validate_route_close_receipt(path: Path) -> tuple[dict[str, str], datetime]:
     return values, moment(values["route_closed_at"], "route close time")
 
 
-def validate_rollback(value: dict[str, Any], args: argparse.Namespace) -> None:
-    fields = {
-        "schema_version",
-        "ceremony",
-        "issued_at",
-        "signature_key_sha256",
-        "release_evidence_sha256",
-        "preopen_edge_evidence_sha256",
-        "route_close_receipt_sha256",
-        "revocation_evidence_sha256",
-        "source_grant_id",
-        "host",
-        "edge_owner",
-        "route_state",
-        "external_edge_mutations",
-        "public_probes",
-    }
-    if (
-        set(value) != fields
-        or value.get("schema_version") != 2
-        or value.get("ceremony") != "holdfast-rikune-edge-rollback-v2"
-    ):
-        fail("edge rollback field set or v2 ceremony is invalid")
+def validate_rollback(
+    value: dict[str, Any],
+    args: argparse.Namespace,
+    contract: str,
+    policy_sha: str | None,
+) -> None:
+    validate_document_shape(value, "rollback", contract, policy_sha)
     if args.open_edge_evidence is None or args.route_close_receipt is None or args.revocation_evidence is None:
         fail("edge rollback requires pre-open edge, route-close, and revocation evidence")
     preopen = load(args.open_edge_evidence)
-    validate_preopen_reference(preopen)
-    close_value, route_closed_at = validate_route_close_receipt(args.route_close_receipt)
+    validate_preopen_reference(preopen, contract, policy_sha)
+    close_value, route_closed_at = validate_route_close_receipt(
+        args.route_close_receipt, contract
+    )
     revocation = load(args.revocation_evidence)
     revocation_issued = moment(revocation.get("issued_at"), "revocation issued_at")
     expected = {
@@ -377,9 +513,16 @@ def validate_rollback(value: dict[str, Any], args: argparse.Namespace) -> None:
         or revocation.get("source_grant_id") != expected["source_grant_id"]
     ):
         fail("edge rollback does not bind the same pre-open evidence and source grant")
-    validate_edge_identity(value, "edge rollback evidence")
+    expected_urls = (
+        {PUBLIC_URL, LEGACY_PUBLIC_URL}
+        if contract == DUAL_HOST_CONTRACT
+        else {LEGACY_PUBLIC_URL}
+    )
     latest_probe = validate_closed_probes(
-        value["public_probes"], max(route_closed_at, revocation_issued), "edge rollback"
+        value["public_probes"],
+        max(route_closed_at, revocation_issued),
+        "edge rollback",
+        expected_urls,
     )
     if moment(value["issued_at"], "issued_at") < latest_probe:
         fail("edge rollback evidence predates its public probes")
@@ -393,6 +536,7 @@ def main() -> int:
     parser.add_argument("--public-key", required=True, type=Path)
     parser.add_argument("--release-env", required=True, type=Path)
     parser.add_argument("--release-evidence", required=True, type=Path)
+    parser.add_argument("--successor-policy", type=Path)
     parser.add_argument("--open-evidence", type=Path)
     parser.add_argument("--prepare-receipt", type=Path)
     parser.add_argument("--open-edge-evidence", type=Path)
@@ -402,12 +546,13 @@ def main() -> int:
     try:
         values = release(args.release_env)
         verify_signature(args.evidence, args.signature, args.public_key, values)
+        contract, policy_sha = validate_frozen_contract(args)
         if args.mode == "preopen":
-            validate_preopen(load(args.evidence), args)
-            success = "signed v2 pre-open evidence proves the exact dual-stack 404 Sluice edge"
+            validate_preopen(load(args.evidence), args, contract, policy_sha)
+            success = f"signed edge pre-open evidence is valid for {contract}"
         else:
-            validate_rollback(load(args.evidence), args)
-            success = "signed v2 rollback evidence proves the exact dual-stack 404 route-absent state"
+            validate_rollback(load(args.evidence), args, contract, policy_sha)
+            success = f"signed edge rollback evidence is valid for {contract}"
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(f"edge evidence: {error}", file=sys.stderr)
         return 1

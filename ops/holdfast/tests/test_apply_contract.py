@@ -359,6 +359,34 @@ class ApplyContractTests(unittest.TestCase):
             ),
         )
 
+    def test_schema_v4_access_candidate_uses_bounded_overlay_and_current_build_tool(
+        self,
+    ) -> None:
+        policy = json.loads(
+            (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(policy["schema_version"], 4)
+        self.assertTrue(policy["overlay"])
+        self.assertLessEqual(len(policy["overlay"]), 64)
+        self.assertNotEqual(
+            policy["successor"]["source_access_build_input_sha256"],
+            policy["predecessor"]["access_build_input_sha256"],
+        )
+        self.assertNotEqual(
+            policy["successor"]["access_build_input_sha256"],
+            policy["predecessor"]["access_build_input_sha256"],
+        )
+        self.assertNotIn("access_candidate_tool_revision", policy["predecessor"])
+
+        script = (OPS_ROOT / "build-access-candidate.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("docker buildx build", script)
+        self.assertIn("--push", script)
+        self.assertIn("schema=holdfast-access-candidate-build/1", script)
+        self.assertIn("holdfast_release_tool_revision=%s", script)
+        self.assertNotIn("holdfast-access-candidate-carry-forward", script)
+
     def test_checked_in_manifests_generate_exact_full_apply_coverage(self) -> None:
         stage = self.root / "stage"
         stage.mkdir()
@@ -1173,12 +1201,16 @@ class ApplyContractTests(unittest.TestCase):
             )
         ]
         first_db = closed_function.index("verify_database_absent")
-        public = closed_function.index(
+        active_public = closed_function.index(
+            'public-origin-verify.sh" --mode closed --url https://rikune.w33d.xyz/'
+        )
+        legacy_public = closed_function.index(
             'public-origin-verify.sh" --mode closed --url https://analyze.w33d.xyz/'
         )
         second_db = closed_function.index("verify_database_absent", first_db + 1)
-        self.assertLess(first_db, public)
-        self.assertLess(public, second_db)
+        self.assertLess(first_db, active_public)
+        self.assertLess(active_public, legacy_public)
+        self.assertLess(legacy_public, second_db)
 
         final_bracket = script.index("\nverify_closed_bracket\n", script.index("activation_step="))
         apply_receipt = script.index('apply_receipt="$backup/APPLY.receipt"')
@@ -2534,7 +2566,7 @@ class ApplyContractTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(state.read_bytes(), original_state)
 
-    def test_successor_receipt_lineage_is_legacy_exact_and_schema3_replaces_apply(
+    def test_successor_receipt_lineage_selects_exact_v3_or_apply_namespace(
         self,
     ) -> None:
         script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
@@ -2605,6 +2637,15 @@ class ApplyContractTests(unittest.TestCase):
         self.assertIn("predecessor_completion_attestation_sha256=ee\n", recovered)
         self.assertIn("predecessor_completion_signature_sha256=ff\n", recovered)
         self.assertIn("predecessor_completion_public_key_sha256=11\n", recovered)
+        schema4 = subprocess.run(
+            ["bash", str(harness), "4"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        self.assertEqual(schema4, legacy)
+        self.assertNotIn("predecessor_completion_", schema4)
+        self.assertNotIn("access_candidate_tool_revision", script)
 
         apply_receipt_start = script.index('apply_receipt_tmp="$backup/.APPLY.receipt.$$"')
         apply_receipt_end = script.index(
@@ -2612,19 +2653,19 @@ class ApplyContractTests(unittest.TestCase):
             apply_receipt_start,
         )
         apply_receipt_body = script[apply_receipt_start:apply_receipt_end]
-        schema3_runtime = apply_receipt_body.index(
-            'if [[ "$successor" == "true" && "$successor_policy_schema" == "3" ]]'
+        frozen_runtime = apply_receipt_body.index(
+            '"$successor_policy_schema" == "4"'
         )
         runtime_receipt = apply_receipt_body.index(
-            "runtime_backup_receipt_sha256=%s", schema3_runtime
+            "runtime_backup_receipt_sha256=%s", frozen_runtime
         )
         runtime_manifest = apply_receipt_body.index(
             "runtime_backup_manifest_sha256=%s", runtime_receipt
         )
-        schema3_end = apply_receipt_body.index("\n  fi", runtime_manifest)
-        self.assertLess(schema3_runtime, runtime_receipt)
+        frozen_end = apply_receipt_body.index("\n  fi", runtime_manifest)
+        self.assertLess(frozen_runtime, runtime_receipt)
         self.assertLess(runtime_receipt, runtime_manifest)
-        self.assertLess(runtime_manifest, schema3_end)
+        self.assertLess(runtime_manifest, frozen_end)
 
 
 if __name__ == "__main__":

@@ -1,18 +1,37 @@
 {
-  "schema_version": 2,
-  "ceremony": "holdfast-rikune-edge-rollback-v2",
-  "issued_at": "REQUIRED_UTC_AFTER_BOTH_CLOSED_PROBES",
+  "schema_version": 3,
+  "ceremony": "holdfast-rikune-edge-rollback-v3",
+  "issued_at": "REQUIRED_UTC_AFTER_ALL_FOUR_CLOSED_PROBES",
   "signature_key_sha256": "REQUIRED_64lowerhex",
   "release_evidence_sha256": "REQUIRED_64lowerhex",
+  "successor_policy_sha256": "REQUIRED_64lowerhex_FROZEN_POLICY",
   "preopen_edge_evidence_sha256": "REQUIRED_64lowerhex",
   "route_close_receipt_sha256": "REQUIRED_64lowerhex_CREATED_FIRST",
   "revocation_evidence_sha256": "REQUIRED_64lowerhex_AFTER_SEVEN_TOMBSTONES",
   "source_grant_id": "REQUIRED_SAME_AS_OPEN_AND_REVOCATION",
-  "host": "analyze.w33d.xyz",
+  "host": "rikune.w33d.xyz",
   "edge_owner": "existing-w33d-sluice",
   "route_state": "absent",
   "external_edge_mutations": [],
   "public_probes": [
+    {
+      "family": "ipv4",
+      "observed_at": "REQUIRED_UTC_AFTER_ROUTE_CLOSE_AND_REVOCATION",
+      "url": "https://rikune.w33d.xyz/",
+      "status": 404,
+      "edge_owner": "existing-w33d-sluice",
+      "route_state": "absent",
+      "response_headers_sha256": "REQUIRED_64lowerhex"
+    },
+    {
+      "family": "ipv6",
+      "observed_at": "REQUIRED_UTC_AFTER_ROUTE_CLOSE_AND_REVOCATION",
+      "url": "https://rikune.w33d.xyz/",
+      "status": 404,
+      "edge_owner": "existing-w33d-sluice",
+      "route_state": "absent",
+      "response_headers_sha256": "REQUIRED_64lowerhex"
+    },
     {
       "family": "ipv4",
       "observed_at": "REQUIRED_UTC_AFTER_ROUTE_CLOSE_AND_REVOCATION",

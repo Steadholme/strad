@@ -344,7 +344,10 @@ def validate_release(
     model = values["STRAD_NEWAPI_MODEL"]
     if not MODEL_ALIAS.fullmatch(model) or model.startswith("REQUIRED"):
         fail("STRAD_NEWAPI_MODEL must be a pinned existing alias")
-    if values["ACCESS_GOVERNANCE_IMAGE"] == values["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"]:
+    if (
+        values["ACCESS_GOVERNANCE_IMAGE"]
+        == values["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"]
+    ):
         fail("Access Governance candidate and rollback images must differ")
     if values["RIKUNE_ANALYZER_IMAGE"] == values["STRAD_ANALYZER_IMAGE"]:
         fail(
@@ -453,7 +456,7 @@ def copy_successor_stage(
         or not isinstance(overlay, list)
         or (policy_version == 1 and len(overlay) != 7)
         or (
-            policy_version in (2, 3)
+            policy_version in (2, 3, 4)
             and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
         )
     ):
@@ -482,7 +485,7 @@ def copy_successor_stage(
         shutil.copy2(source, destination)
         if sha256_file(destination) != raw.get("after_sha256"):
             fail(f"successor overlay copy differs: {relative}")
-    if policy_version in (2, 3) and overlay_paths != sorted(overlay_paths):
+    if policy_version in (2, 3, 4) and overlay_paths != sorted(overlay_paths):
         fail("successor overlay path order differs")
 
     static_asset_sources = validate_static_asset_transition(
@@ -1582,6 +1585,10 @@ def validate_successor_release(
     for key, value in expected.items():
         if release.get(key) != value:
             fail(f"successor release pin differs from its policy: {key}")
+    if policy.get("schema_version") == 4 and release.get(
+        "ACCESS_GOVERNANCE_IMAGE"
+    ) == predecessor.get("access_image"):
+        fail("schema 4 Access candidate must advance beyond its rollback image")
 
 
 def stable_file_identity(metadata: os.stat_result) -> tuple[int, ...]:

@@ -915,6 +915,11 @@ class RollbackLifecycleTests(unittest.TestCase):
         policy = json.loads(
             (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
         )
+        policy["schema_version"] = 3
+        policy["ceremony"] = "holdfast-rikune-successor-v3"
+        policy_predecessor = policy["predecessor"]
+        assert isinstance(policy_predecessor, dict)
+        policy_predecessor.pop("apply_receipt_sha256", None)
         policy["predecessor"].update(
             {
                 "current_state_sha256": predecessor_current_sha,
@@ -1538,6 +1543,35 @@ class RollbackLifecycleTests(unittest.TestCase):
         )
         self.assertIn("predecessor_completion_signature_sha256=", receipt)
         self.assertNotIn("predecessor_apply_receipt_sha256=", receipt)
+
+    def test_schema_v4_rollback_contract_uses_apply_lineage_without_completion_namespace(
+        self,
+    ) -> None:
+        source = (OPS_ROOT / "rollback.sh").read_text(encoding="utf-8")
+        self.assertIn("holdfast-rikune-successor-v4", source)
+        self.assertIn("validate_no_predecessor_completion_namespace", source)
+        self.assertIn('"$successor_policy_version" == "4"', source)
+        self.assertIn("predecessor_apply_receipt_sha256", source)
+        self.assertNotIn("access_candidate_tool_revision", source)
+
+    def test_rollback_closed_contract_names_active_and_legacy_hosts(self) -> None:
+        source = (OPS_ROOT / "rollback.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            '"$public_verify" --mode closed --url https://rikune.w33d.xyz/',
+            source,
+        )
+        self.assertIn(
+            '"$public_verify" --mode closed --url https://analyze.w33d.xyz/',
+            source,
+        )
+        for expected in (
+            "route_conflict_cleanup=same-name-or-rikune-root-or-analyze-host",
+            "public_host=rikune.w33d.xyz",
+            "legacy_public_host=analyze.w33d.xyz",
+            "legacy_route_state=absent",
+            "legacy_public_ipv4_ipv6_closed_status=404",
+        ):
+            self.assertIn(expected, source)
 
     def test_schema_v3_rollback_sigkill_retry_needs_no_old_backup(self) -> None:
         predecessor_bytes, predecessor_backup = (

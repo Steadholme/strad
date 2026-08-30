@@ -166,7 +166,7 @@ SUCCESSOR_ARMED_KEYS = (
     "ingress_opened",
 )
 
-RECOVERY_ARMED_KEYS = (
+RECOVERY_ARMED_V3_KEYS = (
     "schema_version",
     "armed_at",
     "attempt_id",
@@ -203,7 +203,12 @@ RECOVERY_ARMED_KEYS = (
     "pre_restored_superseded_state_sha256",
     "pre_restored_runtime_disposition",
     "route_state",
+    "route_conflict_cleanup",
     "public_host",
+    "public_ipv4_ipv6_closed_status",
+    "legacy_public_host",
+    "legacy_route_state",
+    "legacy_public_ipv4_ipv6_closed_status",
     "db_public_db_bracket",
     "successor",
     "successor_armed_receipt_sha256",
@@ -218,7 +223,7 @@ RECOVERY_ARMED_KEYS = (
     "release_generation",
 )
 
-RECOVERY_COMPLETION_KEYS = (
+RECOVERY_COMPLETION_V3_KEYS = (
     "schema_version",
     "completed_at",
     "attempt_id",
@@ -256,7 +261,12 @@ RECOVERY_COMPLETION_KEYS = (
     "runtime_verified",
     "live_estate_disposition",
     "route_state",
+    "route_conflict_cleanup",
     "public_host",
+    "public_ipv4_ipv6_closed_status",
+    "legacy_public_host",
+    "legacy_route_state",
+    "legacy_public_ipv4_ipv6_closed_status",
     "db_public_db_bracket",
     "apply_receipt_created",
     "successor",
@@ -270,6 +280,24 @@ RECOVERY_COMPLETION_KEYS = (
     "predecessor_runtime_backup_manifest_sha256",
     "predecessor_release_generation",
     "release_generation",
+)
+
+DUAL_HOST_RECOVERY_KEYS = frozenset(
+    {
+        "route_conflict_cleanup",
+        "public_ipv4_ipv6_closed_status",
+        "legacy_public_host",
+        "legacy_route_state",
+        "legacy_public_ipv4_ipv6_closed_status",
+    }
+)
+RECOVERY_ARMED_V2_KEYS = tuple(
+    key for key in RECOVERY_ARMED_V3_KEYS if key not in DUAL_HOST_RECOVERY_KEYS
+)
+RECOVERY_COMPLETION_V2_KEYS = tuple(
+    key
+    for key in RECOVERY_COMPLETION_V3_KEYS
+    if key not in DUAL_HOST_RECOVERY_KEYS
 )
 
 RECOVERY_ARCHIVE_KEYS = {
@@ -1654,6 +1682,11 @@ class ApplyRecoveryTests(unittest.TestCase):
         policy = json.loads(
             (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
         )
+        policy["schema_version"] = 3
+        policy["ceremony"] = "holdfast-rikune-successor-v3"
+        policy_predecessor = policy["predecessor"]
+        assert isinstance(policy_predecessor, dict)
+        policy_predecessor.pop("apply_receipt_sha256", None)
         policy["predecessor"].update(
             {
                 "current_state_sha256": predecessor_current_sha,
@@ -2211,7 +2244,7 @@ class ApplyRecoveryTests(unittest.TestCase):
             'if [[ -n "${HOLDFAST_TEST_TOUCH_ANCESTOR_DURING_PUBLIC:-}" && ! -e "$HOLDFAST_TEST_LOG.target-ancestor-touched" ]]; then touch -- "$HOLDFAST_TEST_TOUCH_ANCESTOR_DURING_PUBLIC"; touch "$HOLDFAST_TEST_LOG.target-ancestor-touched"; fi\n'
             'if [[ -n "${HOLDFAST_TEST_RECREATE_ANCESTOR_DURING_PUBLIC:-}" && ! -e "$HOLDFAST_TEST_LOG.target-ancestor-recreated" ]]; then target=$HOLDFAST_TEST_RECREATE_ANCESTOR_DURING_PUBLIC; old="$target.recreated.$$"; mode=$(stat -c %a -- "$target"); mv -- "$target" "$old"; mkdir -m "$mode" -- "$target"; shopt -s dotglob nullglob; entries=("$old"/*); if ((${#entries[@]})); then mv -- "${entries[@]}" "$target"/; fi; rmdir -- "$old"; touch "$HOLDFAST_TEST_LOG.target-ancestor-recreated"; fi\n'
             'if [[ -n "${HOLDFAST_TEST_CREATE_DURING_PUBLIC:-}" ]]; then printf "hybrid\\n" >"$HOLDFAST_TEST_CREATE_DURING_PUBLIC"; chmod 0600 "$HOLDFAST_TEST_CREATE_DURING_PUBLIC"; fi\n'
-            'if [[ -n "${HOLDFAST_TEST_SYMLINK_DURING_PUBLIC:-}" ]]; then ln -s /dev/null "$HOLDFAST_TEST_SYMLINK_DURING_PUBLIC"; fi\n'
+            'if [[ -n "${HOLDFAST_TEST_SYMLINK_DURING_PUBLIC:-}" && ! -e "$HOLDFAST_TEST_SYMLINK_DURING_PUBLIC" && ! -L "$HOLDFAST_TEST_SYMLINK_DURING_PUBLIC" ]]; then ln -s /dev/null "$HOLDFAST_TEST_SYMLINK_DURING_PUBLIC"; fi\n'
             'if [[ -n "${HOLDFAST_TEST_REPLACE_BACKUP_ROOT_DURING_PUBLIC:-}" && ! -e "$HOLDFAST_TEST_LOG.backup-root-replaced" ]]; then old="$HOLDFAST_TEST_REPLACE_BACKUP_ROOT_DURING_PUBLIC.replaced"; mv "$HOLDFAST_TEST_REPLACE_BACKUP_ROOT_DURING_PUBLIC" "$old"; mkdir -m 0700 "$HOLDFAST_TEST_REPLACE_BACKUP_ROOT_DURING_PUBLIC"; shopt -s dotglob nullglob; entries=("$old"/*); ((${#entries[@]})); mv -- "${entries[@]}" "$HOLDFAST_TEST_REPLACE_BACKUP_ROOT_DURING_PUBLIC"/; rmdir "$old"; touch "$HOLDFAST_TEST_LOG.backup-root-replaced"; fi\n'
             '[[ "${HOLDFAST_TEST_ROUTE_OPEN:-0}" != "1" ]]\n',
         )
@@ -2649,6 +2682,38 @@ class ApplyRecoveryTests(unittest.TestCase):
         )
         self.assertIn("predecessor_completion_public_key_sha256=", completion_text)
         self.assertNotIn("predecessor_apply_receipt_sha256=", completion_text)
+
+    def test_schema_v4_recovery_contract_uses_apply_lineage_without_completion_namespace(
+        self,
+    ) -> None:
+        source = RECOVER.read_text(encoding="utf-8")
+        self.assertIn('4)\n', source)
+        self.assertIn('holdfast-rikune-successor-v4', source)
+        self.assertIn('predecessor_apply_receipt_sha256', source)
+        self.assertIn('validate_no_predecessor_completion_namespace', source)
+        self.assertIn('"$successor_policy_version" == "4"', source)
+        self.assertNotIn('access_candidate_tool_revision', source)
+
+    def test_recovery_closed_bracket_and_receipts_name_active_and_legacy_hosts(
+        self,
+    ) -> None:
+        source = RECOVER.read_text(encoding="utf-8")
+        self.assertIn(
+            '"$public_verify" --mode closed --url https://rikune.w33d.xyz/',
+            source,
+        )
+        self.assertIn(
+            '"$public_verify" --mode closed --url https://analyze.w33d.xyz/',
+            source,
+        )
+        self.assertIn(
+            "route_conflict_cleanup=same-name-or-rikune-root-or-analyze-host",
+            source,
+        )
+        self.assertIn("public_host=rikune.w33d.xyz", source)
+        self.assertIn("legacy_public_host=analyze.w33d.xyz", source)
+        self.assertIn("legacy_route_state=absent", source)
+        self.assertIn("legacy_public_ipv4_ipv6_closed_status=404", source)
 
     def test_schema_v3_terminal_snapshots_completion_before_signed_validator(
         self,
@@ -4103,8 +4168,24 @@ class ApplyRecoveryTests(unittest.TestCase):
             SUCCESSOR_ARMED_KEYS,
         )
         self.assertEqual(receipt_keys(failure), ACTIVATION_FAILURE_KEYS)
-        self.assertEqual(receipt_keys(recovery_armed), RECOVERY_ARMED_KEYS)
-        self.assertEqual(receipt_keys(completion_receipt), RECOVERY_COMPLETION_KEYS)
+        self.assertEqual(receipt_keys(recovery_armed), RECOVERY_ARMED_V2_KEYS)
+        self.assertEqual(
+            receipt_keys(completion_receipt), RECOVERY_COMPLETION_V2_KEYS
+        )
+        recovery_armed_values = dict(
+            line.split("=", 1)
+            for line in recovery_armed.read_text(encoding="utf-8").splitlines()
+        )
+        completion_values = dict(
+            line.split("=", 1)
+            for line in completion_receipt.read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(recovery_armed_values["schema_version"], "2")
+        self.assertEqual(
+            recovery_armed_values["public_host"], "analyze.w33d.xyz"
+        )
+        self.assertEqual(completion_values["schema_version"], "2")
+        self.assertEqual(completion_values["public_host"], "analyze.w33d.xyz")
         archive_value = json.loads(completion_archive.read_text(encoding="utf-8"))
         current_value = json.loads(
             (self.state / "CURRENT.json").read_text(encoding="utf-8")

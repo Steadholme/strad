@@ -28,6 +28,55 @@ SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 RIKUNE_ACCEPTANCE_SUBJECT = re.compile(r"^user:usr_[A-Za-z0-9_-]{43}$")
 PRIVILEGED_ACCEPTANCE_SUBJECTS = frozenset({"user:u_admin", "user:w33d"})
+ROUTE_CLOSE_V2_FIELDS = (
+    "schema_version",
+    "route_closed_at",
+    "source_state",
+    "estate_root",
+    "backup_dir",
+    "control_sha256",
+    "state_before_sha256",
+    "route_down_sha256",
+    "route_down_execution_evidence_sha256",
+    "route_preimage_sha256",
+    "route_conflict_cleanup",
+    "open_evidence_sha256",
+    "source_grant_id",
+    "was_public_open",
+    "preopen_edge_evidence_sha256",
+    "route_state",
+    "public_host",
+    "edge_owner",
+    "public_ipv4_ipv6_closed_status",
+    "db_public_db_bracket",
+    "external_edge_mutation",
+)
+ROUTE_CLOSE_V3_FIELDS = (
+    "schema_version",
+    "route_closed_at",
+    "source_state",
+    "estate_root",
+    "backup_dir",
+    "control_sha256",
+    "state_before_sha256",
+    "route_down_sha256",
+    "route_down_execution_evidence_sha256",
+    "open_evidence_sha256",
+    "source_grant_id",
+    "was_public_open",
+    "preopen_edge_evidence_sha256",
+    "route_preimage_sha256",
+    "route_conflict_cleanup",
+    "route_state",
+    "public_host",
+    "legacy_public_host",
+    "legacy_route_state",
+    "legacy_public_ipv4_ipv6_closed_status",
+    "edge_owner",
+    "public_ipv4_ipv6_closed_status",
+    "db_public_db_bracket",
+    "external_edge_mutation",
+)
 
 
 def fail(message: str) -> NoReturn:
@@ -85,6 +134,61 @@ def receipt(path: Path) -> dict[str, str]:
             fail(f"duplicate receipt key: {key}")
         result[key] = value
     return result
+
+
+def validate_route_close_receipt(value: dict[str, str]) -> None:
+    schema = value.get("schema_version")
+    if schema == "2":
+        expected_fields = ROUTE_CLOSE_V2_FIELDS
+        expected_values = {
+            "route_conflict_cleanup": "same-name-or-analyze-root",
+            "public_host": "analyze.w33d.xyz",
+        }
+    elif schema == "3":
+        expected_fields = ROUTE_CLOSE_V3_FIELDS
+        expected_values = {
+            "route_conflict_cleanup": (
+                "same-name-or-rikune-root-or-analyze-host"
+            ),
+            "public_host": "rikune.w33d.xyz",
+            "legacy_public_host": "analyze.w33d.xyz",
+            "legacy_route_state": "absent",
+            "legacy_public_ipv4_ipv6_closed_status": "404",
+        }
+    else:
+        fail("route-close receipt schema is unsupported")
+    if tuple(value) != expected_fields:
+        fail(f"route-close schema-v{schema} field set or order is not exact")
+    expected_values.update(
+        {
+            "route_state": "absent",
+            "edge_owner": "existing-w33d-sluice",
+            "public_ipv4_ipv6_closed_status": "404",
+            "db_public_db_bracket": "absent-404-absent",
+            "external_edge_mutation": "none",
+        }
+    )
+    for field, expected in expected_values.items():
+        if value[field] != expected:
+            fail(f"route-close schema-v{schema} differs: {field}")
+    timestamp(value["route_closed_at"], "route_closed_at")
+    for field in (
+        "control_sha256",
+        "state_before_sha256",
+        "route_down_sha256",
+        "route_down_execution_evidence_sha256",
+        "route_preimage_sha256",
+        "open_evidence_sha256",
+    ):
+        if not HEX64.fullmatch(value[field]):
+            fail(f"route-close receipt has an invalid digest: {field}")
+    if value["was_public_open"] not in {"true", "false"}:
+        fail("route-close receipt has an invalid public-open state")
+    preopen = value["preopen_edge_evidence_sha256"]
+    if (value["was_public_open"] == "true" and not HEX64.fullmatch(preopen)) or (
+        value["was_public_open"] == "false" and preopen != "none"
+    ):
+        fail("route-close receipt has an invalid preopen evidence binding")
 
 
 def require_id(value: object, field: str) -> str:
@@ -268,6 +372,7 @@ def validate_rollback(value: dict[str, Any], release: dict[str, str], args: argp
         fail("rollback validation requires open evidence and route-close receipt")
     open_value = load_object(args.open_evidence)
     close_receipt = receipt(args.route_close_receipt)
+    validate_route_close_receipt(close_receipt)
     expected_open_sha = sha256(args.open_evidence)
     expected_close_sha = sha256(args.route_close_receipt)
     if value.get("open_evidence_sha256") != expected_open_sha:

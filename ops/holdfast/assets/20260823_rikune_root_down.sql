@@ -11,7 +11,8 @@ CREATE TEMP TABLE holdfast_rikune_root_rollback_preimage ON COMMIT DROP AS
 SELECT to_jsonb(route) AS route
   FROM routes AS route
  WHERE route.name = 'rikune-root'
-    OR (route.host = 'analyze.w33d.xyz' AND route.path_prefix = '/');
+    OR (lower(route.host) = 'rikune.w33d.xyz' AND route.path_prefix = '/')
+    OR lower(route.host) = 'analyze.w33d.xyz';
 
 COPY (
     SELECT jsonb_build_object(
@@ -34,7 +35,8 @@ COPY (
 
 DELETE FROM routes
  WHERE name = 'rikune-root'
-    OR (host = 'analyze.w33d.xyz' AND path_prefix = '/');
+    OR (lower(host) = 'rikune.w33d.xyz' AND path_prefix = '/')
+    OR lower(host) = 'analyze.w33d.xyz';
 
 DO $$
 BEGIN
@@ -42,7 +44,8 @@ BEGIN
         SELECT 1
           FROM routes
          WHERE name = 'rikune-root'
-            OR (host = 'analyze.w33d.xyz' AND path_prefix = '/')
+            OR (lower(host) = 'rikune.w33d.xyz' AND path_prefix = '/')
+            OR lower(host) = 'analyze.w33d.xyz'
     ) THEN
         RAISE EXCEPTION 'rikune-root rollback verification failed';
     END IF;

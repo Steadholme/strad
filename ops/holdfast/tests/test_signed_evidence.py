@@ -15,6 +15,8 @@ from unittest import mock
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+import authority_evidence  # noqa: E402
+import edge_evidence  # noqa: E402
 import supply_chain_evidence  # noqa: E402
 
 PERMISSIONS = sorted(
@@ -68,6 +70,214 @@ class SignedEvidenceTests(unittest.TestCase):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+    def test_rikune_hostname_assets_preserve_route_resource_and_permissions(self) -> None:
+        route_up = (OPS_ROOT / "assets/20260823_rikune_root_up.sql").read_text(
+            encoding="utf-8"
+        )
+        route_down = (
+            OPS_ROOT / "assets/20260823_rikune_root_down.sql"
+        ).read_text(encoding="utf-8")
+        verify_open = (OPS_ROOT / "assets/verify_rikune_root.sql").read_text(
+            encoding="utf-8"
+        )
+        verify_absent = (
+            OPS_ROOT / "assets/verify_rikune_root_absent.sql"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("'rikune-root', 'rikune.w33d.xyz', '/'", route_up)
+        self.assertNotIn("'rikune-root', 'analyze.w33d.xyz', '/'", route_up)
+        self.assertIn("'rikune.console.enter', 'route:rikune-root'", route_up)
+        for asset in (route_up, route_down, verify_open, verify_absent):
+            self.assertIn("rikune-root", asset)
+            self.assertIn("rikune.w33d.xyz", asset)
+            self.assertIn("analyze.w33d.xyz", asset)
+
+        self.assertEqual(sorted(authority_evidence.PERMISSIONS), PERMISSIONS)
+        self.assertEqual(len(PERMISSIONS), 7)
+
+    def test_hostname_conflict_cleanup_and_absence_are_case_insensitive(self) -> None:
+        assets = {
+            name: (OPS_ROOT / f"assets/{name}").read_text(encoding="utf-8")
+            for name in (
+                "20260823_rikune_root_up.sql",
+                "20260823_rikune_root_down.sql",
+                "verify_rikune_root.sql",
+                "verify_rikune_root_absent.sql",
+            )
+        }
+        for name, sql in assets.items():
+            with self.subTest(asset=name, variant="RiKuNe.W33D.XyZ"):
+                self.assertIn("lower(", sql)
+                self.assertIn("'rikune.w33d.xyz'", sql)
+            with self.subTest(asset=name, variant="ANALYZE.W33D.XYZ"):
+                self.assertIn("lower(", sql)
+                self.assertIn("'analyze.w33d.xyz'", sql)
+
+        route_up = assets["20260823_rikune_root_up.sql"]
+        self.assertIn("lower(host) = 'rikune.w33d.xyz'", route_up)
+        self.assertGreaterEqual(
+            route_up.count("lower(host) = 'analyze.w33d.xyz'"), 2
+        )
+        route_down = assets["20260823_rikune_root_down.sql"]
+        self.assertGreaterEqual(
+            route_down.count("lower(route.host) = 'rikune.w33d.xyz'"), 1
+        )
+        self.assertGreaterEqual(
+            route_down.count("lower(host) = 'rikune.w33d.xyz'"), 2
+        )
+        self.assertGreaterEqual(
+            route_down.count("lower(host) = 'analyze.w33d.xyz'"), 2
+        )
+        verifier = assets["verify_rikune_root.sql"]
+        self.assertIn(
+            "lower(conflict.host) = 'rikune.w33d.xyz'", verifier
+        )
+        self.assertIn(
+            "lower(conflict.host) = 'analyze.w33d.xyz'", verifier
+        )
+        absent = assets["verify_rikune_root_absent.sql"]
+        self.assertIn("lower(host) = 'rikune.w33d.xyz'", absent)
+        self.assertIn("lower(host) = 'analyze.w33d.xyz'", absent)
+
+        # The one persisted canonical row remains exact lowercase; lower(host)
+        # is only for collision, cleanup, and absence predicates.
+        self.assertIn("AND host = 'rikune.w33d.xyz'", route_up)
+        self.assertIn("host = 'rikune.w33d.xyz'", verifier)
+
+    def test_edge_examples_have_exact_dual_host_v3_schemas(self) -> None:
+        common_fields = {
+            "schema_version",
+            "ceremony",
+            "issued_at",
+            "signature_key_sha256",
+            "release_evidence_sha256",
+            "successor_policy_sha256",
+            "source_grant_id",
+            "host",
+            "edge_owner",
+            "route_state",
+            "external_edge_mutations",
+            "public_probes",
+        }
+        example_contracts = {
+            "edge-preopen.example.json": (
+                "holdfast-rikune-edge-preopen-v3",
+                common_fields
+                | {
+                    "open_evidence_sha256",
+                    "open_prepare_receipt_sha256",
+                },
+            ),
+            "edge-rollback.example.json": (
+                "holdfast-rikune-edge-rollback-v3",
+                common_fields
+                | {
+                    "preopen_edge_evidence_sha256",
+                    "route_close_receipt_sha256",
+                    "revocation_evidence_sha256",
+                },
+            ),
+        }
+        expected_pairs = {
+            ("https://rikune.w33d.xyz/", "ipv4"),
+            ("https://rikune.w33d.xyz/", "ipv6"),
+            ("https://analyze.w33d.xyz/", "ipv4"),
+            ("https://analyze.w33d.xyz/", "ipv6"),
+        }
+        probe_fields = {
+            "family",
+            "observed_at",
+            "url",
+            "status",
+            "edge_owner",
+            "route_state",
+            "response_headers_sha256",
+        }
+
+        for filename, (ceremony, fields) in example_contracts.items():
+            with self.subTest(filename=filename):
+                value = edge_evidence.load(OPS_ROOT / filename)
+                self.assertEqual(set(value), fields)
+                self.assertEqual(value["schema_version"], 3)
+                self.assertEqual(value["ceremony"], ceremony)
+                self.assertEqual(value["host"], "rikune.w33d.xyz")
+                self.assertEqual(value["edge_owner"], "existing-w33d-sluice")
+                self.assertEqual(value["route_state"], "absent")
+                self.assertEqual(value["external_edge_mutations"], [])
+                self.assertEqual(len(value["public_probes"]), 4)
+                self.assertEqual(
+                    {
+                        (probe["url"], probe["family"])
+                        for probe in value["public_probes"]
+                    },
+                    expected_pairs,
+                )
+                for probe in value["public_probes"]:
+                    self.assertEqual(set(probe), probe_fields)
+                    self.assertEqual(probe["status"], 404)
+                    self.assertEqual(probe["edge_owner"], "existing-w33d-sluice")
+                    self.assertEqual(probe["route_state"], "absent")
+
+    def test_authority_route_close_receipt_dispatch_preserves_v2_and_v3(self) -> None:
+        common = {
+            "route_closed_at": "2026-08-22T03:00:00Z",
+            "source_state": "ingress_open",
+            "estate_root": str(self.root / "estate"),
+            "backup_dir": str(self.root / "backup"),
+            "control_sha256": "1" * 64,
+            "state_before_sha256": "2" * 64,
+            "route_down_sha256": "3" * 64,
+            "route_down_execution_evidence_sha256": "4" * 64,
+            "open_evidence_sha256": "5" * 64,
+            "source_grant_id": "source-grant-0001",
+            "was_public_open": "true",
+            "preopen_edge_evidence_sha256": "6" * 64,
+            "route_preimage_sha256": "7" * 64,
+            "route_state": "absent",
+            "edge_owner": "existing-w33d-sluice",
+            "public_ipv4_ipv6_closed_status": "404",
+            "db_public_db_bracket": "absent-404-absent",
+            "external_edge_mutation": "none",
+        }
+        v2 = {
+            field: (
+                "2"
+                if field == "schema_version"
+                else "same-name-or-analyze-root"
+                if field == "route_conflict_cleanup"
+                else "analyze.w33d.xyz"
+                if field == "public_host"
+                else common[field]
+            )
+            for field in authority_evidence.ROUTE_CLOSE_V2_FIELDS
+        }
+        v3_values = dict(common)
+        v3_values.update(
+            {
+                "route_conflict_cleanup": (
+                    "same-name-or-rikune-root-or-analyze-host"
+                ),
+                "public_host": "rikune.w33d.xyz",
+                "legacy_public_host": "analyze.w33d.xyz",
+                "legacy_route_state": "absent",
+                "legacy_public_ipv4_ipv6_closed_status": "404",
+            }
+        )
+        v3 = {
+            field: "3" if field == "schema_version" else v3_values[field]
+            for field in authority_evidence.ROUTE_CLOSE_V3_FIELDS
+        }
+        authority_evidence.validate_route_close_receipt(v2)
+        authority_evidence.validate_route_close_receipt(v3)
+
+        for name, candidate in (
+            ("v2-extra-dual", {**v2, "legacy_public_host": "analyze.w33d.xyz"}),
+            ("v3-analyze-host", {**v3, "public_host": "analyze.w33d.xyz"}),
+            ("v3-version-downgrade", {**v3, "schema_version": "2"}),
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                authority_evidence.validate_route_close_receipt(candidate)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -426,6 +636,17 @@ class SignedEvidenceTests(unittest.TestCase):
                     "/", 1
                 )[0],
                 "subject_digest": rollback_digest,
+            }
+        )
+        candidate = images["ACCESS_GOVERNANCE_IMAGE"]
+        assert isinstance(candidate, dict)
+        candidate_digest = release["ACCESS_GOVERNANCE_IMAGE"].rsplit("@", 1)[1]
+        candidate.update(
+            {
+                "image": release["ACCESS_GOVERNANCE_IMAGE"],
+                "manifest_digest": candidate_digest,
+                "registry": release["ACCESS_GOVERNANCE_IMAGE"].split("/", 1)[0],
+                "subject_digest": candidate_digest,
             }
         )
         waivers = evidence["waivers"]
@@ -796,9 +1017,31 @@ class SignedEvidenceTests(unittest.TestCase):
             release["STRAD_REVISION"],
         )
         self.assertNotIn("source_revision", evidence["access_candidate"])
+        if policy["schema_version"] == 4:
+            self.assertNotEqual(
+                release["ACCESS_GOVERNANCE_IMAGE"],
+                release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"],
+            )
+            self.assertEqual(
+                evidence["access_candidate"]["tool_revision"],
+                release["HOLDFAST_RELEASE_TOOL_REVISION"],
+            )
 
         recovered_policy = json.loads(json.dumps(policy))
+        recovered_policy["schema_version"] = 3
+        recovered_policy["ceremony"] = "holdfast-rikune-successor-v3"
+        recovered_policy["overlay"] = [
+            {
+                "path": "access-governance/src/recovered.rs",
+                "before_sha256": "1" * 64,
+                "after_sha256": "2" * 64,
+            }
+        ]
         recovered_predecessor = recovered_policy["predecessor"]
+        recovered_predecessor.pop("apply_receipt_sha256", None)
+        recovered_predecessor["access_image"] = (
+            "registry.example/w33d/recovered-predecessor@sha256:" + "d" * 64
+        )
         recovered_predecessor["completion"] = {
             "kind": "recovery-completion-attestation-v1",
             "attestation_sha256": "a" * 64,
@@ -810,11 +1053,49 @@ class SignedEvidenceTests(unittest.TestCase):
             json.dumps(recovered_policy) + "\n", encoding="utf-8"
         )
         recovered_evidence = json.loads(json.dumps(evidence))
+        recovered_release = dict(release)
+        recovered_release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"] = (
+            recovered_predecessor["access_image"]
+        )
         recovered_evidence["successor_binding"] = json.loads(
             json.dumps(recovered_predecessor)
         )
+        recovered_evidence["access_candidate"]["tool_revision"] = (
+            recovered_release["HOLDFAST_RELEASE_TOOL_REVISION"]
+        )
+        recovered_rollback = recovered_evidence["registry_verification"][
+            "images"
+        ]["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"]
+        recovered_rollback_digest = recovered_release[
+            "ACCESS_GOVERNANCE_ROLLBACK_IMAGE"
+        ].rsplit("@", 1)[1]
+        recovered_rollback.update(
+            {
+                "image": recovered_release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"],
+                "manifest_digest": recovered_rollback_digest,
+                "registry": "registry.example",
+                "subject_digest": recovered_rollback_digest,
+            }
+        )
+        for waiver in recovered_evidence["waivers"]:
+            if waiver["image_key"] == "ACCESS_GOVERNANCE_ROLLBACK_IMAGE":
+                waiver["image"] = recovered_release[
+                    "ACCESS_GOVERNANCE_ROLLBACK_IMAGE"
+                ]
+        recovered_canonical = "".join(
+            f"{key}={recovered_release[key]}\n"
+            for key in sorted(recovered_release)
+            if key
+            not in {
+                "SUPPLY_CHAIN_EVIDENCE_SHA256",
+                "SUPPLY_CHAIN_SIGNATURE_SHA256",
+            }
+        )
+        recovered_evidence["release_pins_sha256"] = hashlib.sha256(
+            recovered_canonical.encode("utf-8")
+        ).hexdigest()
         recovered_valid = self.run_supply_fixture(
-            release,
+            recovered_release,
             recovered_evidence,
             "v3-recovered-valid",
             successor_policy=recovered_policy_path,
@@ -829,7 +1110,7 @@ class SignedEvidenceTests(unittest.TestCase):
             "signature_sha256"
         ] = "d" * 64
         recovered_invalid = self.run_supply_fixture(
-            release,
+            recovered_release,
             recovered_tamper,
             "v3-recovered-tamper",
             successor_policy=recovered_policy_path,
@@ -1147,7 +1428,31 @@ class SignedEvidenceTests(unittest.TestCase):
         self.assertIn("release-pinned acceptance subject", mismatch.stderr)
         route_receipt = self.root / "ROUTE-CLOSE.receipt"
         route_receipt.write_text(
-            f"route_closed_at=2026-08-22T01:00:00Z\nopen_evidence_sha256={sha256(open_evidence)}\nsource_grant_id=source-grant-0001\n",
+            "".join(
+                (
+                    "schema_version=2\n",
+                    "route_closed_at=2026-08-22T01:00:00Z\n",
+                    "source_state=ingress_open\n",
+                    f"estate_root={self.root / 'estate'}\n",
+                    f"backup_dir={self.root / 'backup'}\n",
+                    f"control_sha256={'1' * 64}\n",
+                    f"state_before_sha256={'2' * 64}\n",
+                    f"route_down_sha256={'3' * 64}\n",
+                    f"route_down_execution_evidence_sha256={'4' * 64}\n",
+                    f"route_preimage_sha256={'5' * 64}\n",
+                    "route_conflict_cleanup=same-name-or-analyze-root\n",
+                    f"open_evidence_sha256={sha256(open_evidence)}\n",
+                    "source_grant_id=source-grant-0001\n",
+                    "was_public_open=true\n",
+                    f"preopen_edge_evidence_sha256={'6' * 64}\n",
+                    "route_state=absent\n",
+                    "public_host=analyze.w33d.xyz\n",
+                    "edge_owner=existing-w33d-sluice\n",
+                    "public_ipv4_ipv6_closed_status=404\n",
+                    "db_public_db_bracket=absent-404-absent\n",
+                    "external_edge_mutation=none\n",
+                )
+            ),
             encoding="utf-8",
         )
         rollback_value = {
@@ -1219,7 +1524,20 @@ class SignedEvidenceTests(unittest.TestCase):
             f"AUTHORITY_PUBLIC_KEY_SHA256={sha256(self.public_key)}\n", encoding="utf-8"
         )
         release_evidence = self.root / "edge-release-evidence.json"
-        release_evidence.write_text("{}\n", encoding="utf-8")
+        successor_policy = OPS_ROOT / "successor-policy.json"
+        policy = json.loads(successor_policy.read_text(encoding="utf-8"))
+        release_evidence.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "release_mode": "successor",
+                    "predecessor_binding": policy["predecessor"],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         open_evidence = self.root / "edge-open.json"
         open_evidence.write_text(
             json.dumps({"source_grant_id": "source-grant-0001"}), encoding="utf-8"
@@ -1228,12 +1546,17 @@ class SignedEvidenceTests(unittest.TestCase):
         prepare_receipt.write_text(
             "\n".join(
                 (
+                    "schema_version=3",
                     "prepared_at=2026-08-22T02:00:00Z",
+                    "release_generation=5",
                     f"release_evidence_sha256={sha256(release_evidence)}",
                     f"open_evidence_sha256={sha256(open_evidence)}",
                     "source_grant_id=source-grant-0001",
                     "route_state=absent",
-                    "public_host=analyze.w33d.xyz",
+                    "public_host=rikune.w33d.xyz",
+                    "legacy_public_host=analyze.w33d.xyz",
+                    "legacy_route_state=absent",
+                    "legacy_public_ipv4_ipv6_closed_status=404",
                     "edge_owner=existing-w33d-sluice",
                     "public_ipv4_ipv6_closed_status=404",
                     "db_public_db_bracket=absent-404-absent",
@@ -1244,15 +1567,16 @@ class SignedEvidenceTests(unittest.TestCase):
             encoding="utf-8",
         )
         value = {
-            "schema_version": 2,
-            "ceremony": "holdfast-rikune-edge-preopen-v2",
+            "schema_version": 3,
+            "ceremony": "holdfast-rikune-edge-preopen-v3",
             "issued_at": "2026-08-22T02:10:00Z",
             "signature_key_sha256": sha256(self.public_key),
             "release_evidence_sha256": sha256(release_evidence),
+            "successor_policy_sha256": sha256(successor_policy),
             "open_evidence_sha256": sha256(open_evidence),
             "source_grant_id": "source-grant-0001",
             "open_prepare_receipt_sha256": sha256(prepare_receipt),
-            "host": "analyze.w33d.xyz",
+            "host": "rikune.w33d.xyz",
             "edge_owner": "existing-w33d-sluice",
             "route_state": "absent",
             "external_edge_mutations": [],
@@ -1260,13 +1584,18 @@ class SignedEvidenceTests(unittest.TestCase):
                 {
                     "family": family,
                     "observed_at": "2026-08-22T02:05:00Z",
-                    "url": "https://analyze.w33d.xyz/",
+                    "url": url,
                     "status": 404,
                     "edge_owner": "existing-w33d-sluice",
                     "route_state": "absent",
                     "response_headers_sha256": digest * 64,
                 }
-                for family, digest in (("ipv4", "a"), ("ipv6", "b"))
+                for url, family, digest in (
+                    ("https://rikune.w33d.xyz/", "ipv4", "a"),
+                    ("https://rikune.w33d.xyz/", "ipv6", "b"),
+                    ("https://analyze.w33d.xyz/", "ipv4", "c"),
+                    ("https://analyze.w33d.xyz/", "ipv6", "d"),
+                )
             ],
         }
         evidence = self.root / "edge-preopen.json"
@@ -1283,6 +1612,8 @@ class SignedEvidenceTests(unittest.TestCase):
             str(release_env),
             "--release-evidence",
             str(release_evidence),
+            "--successor-policy",
+            str(successor_policy),
             "--open-evidence",
             str(open_evidence),
             "--prepare-receipt",
@@ -1301,7 +1632,7 @@ class SignedEvidenceTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
 
-    def test_edge_preopen_and_rollback_v2_bind_exact_dual_stack_404_state(self) -> None:
+    def test_edge_preopen_and_rollback_v3_bind_exact_dual_stack_404_state(self) -> None:
         value, evidence, command, release_env, release_evidence, open_evidence = self.make_preopen_fixture()
         valid = self.run_signed_edge(value, evidence, command)
         self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
@@ -1310,7 +1641,7 @@ class SignedEvidenceTests(unittest.TestCase):
         route_receipt.write_text(
             "\n".join(
                 (
-                    "schema_version=2",
+                    "schema_version=3",
                     "route_closed_at=2026-08-22T03:00:00Z",
                     "source_state=ingress_open",
                     "estate_root=/srv/w33d_infra",
@@ -1324,9 +1655,12 @@ class SignedEvidenceTests(unittest.TestCase):
                     "was_public_open=true",
                     f"preopen_edge_evidence_sha256={sha256(evidence)}",
                     f"route_preimage_sha256={'f' * 64}",
-                    "route_conflict_cleanup=same-name-or-analyze-root",
+                    "route_conflict_cleanup=same-name-or-rikune-root-or-analyze-host",
                     "route_state=absent",
-                    "public_host=analyze.w33d.xyz",
+                    "public_host=rikune.w33d.xyz",
+                    "legacy_public_host=analyze.w33d.xyz",
+                    "legacy_route_state=absent",
+                    "legacy_public_ipv4_ipv6_closed_status=404",
                     "edge_owner=existing-w33d-sluice",
                     "public_ipv4_ipv6_closed_status=404",
                     "db_public_db_bracket=absent-404-absent",
@@ -1347,16 +1681,17 @@ class SignedEvidenceTests(unittest.TestCase):
             encoding="utf-8",
         )
         rollback_value = {
-            "schema_version": 2,
-            "ceremony": "holdfast-rikune-edge-rollback-v2",
+            "schema_version": 3,
+            "ceremony": "holdfast-rikune-edge-rollback-v3",
             "issued_at": "2026-08-22T03:15:00Z",
             "signature_key_sha256": sha256(self.public_key),
             "release_evidence_sha256": sha256(release_evidence),
+            "successor_policy_sha256": sha256(OPS_ROOT / "successor-policy.json"),
             "preopen_edge_evidence_sha256": sha256(evidence),
             "route_close_receipt_sha256": sha256(route_receipt),
             "revocation_evidence_sha256": sha256(revocation),
             "source_grant_id": "source-grant-0001",
-            "host": "analyze.w33d.xyz",
+            "host": "rikune.w33d.xyz",
             "edge_owner": "existing-w33d-sluice",
             "route_state": "absent",
             "external_edge_mutations": [],
@@ -1364,13 +1699,18 @@ class SignedEvidenceTests(unittest.TestCase):
                 {
                     "family": family,
                     "observed_at": "2026-08-22T03:10:00Z",
-                    "url": "https://analyze.w33d.xyz/",
+                    "url": url,
                     "status": 404,
                     "edge_owner": "existing-w33d-sluice",
                     "route_state": "absent",
                     "response_headers_sha256": digest * 64,
                 }
-                for family, digest in (("ipv4", "d"), ("ipv6", "e"))
+                for url, family, digest in (
+                    ("https://rikune.w33d.xyz/", "ipv4", "d"),
+                    ("https://rikune.w33d.xyz/", "ipv6", "e"),
+                    ("https://analyze.w33d.xyz/", "ipv4", "f"),
+                    ("https://analyze.w33d.xyz/", "ipv6", "0"),
+                )
             ],
         }
         rollback_evidence = self.root / "edge-rollback.json"
@@ -1387,6 +1727,8 @@ class SignedEvidenceTests(unittest.TestCase):
             str(release_env),
             "--release-evidence",
             str(release_evidence),
+            "--successor-policy",
+            str(OPS_ROOT / "successor-policy.json"),
             "--open-edge-evidence",
             str(evidence),
             "--route-close-receipt",
@@ -1397,6 +1739,250 @@ class SignedEvidenceTests(unittest.TestCase):
         rolled_back = self.run_signed_edge(rollback_value, rollback_evidence, rollback_command)
         self.assertEqual(rolled_back.returncode, 0, rolled_back.stdout + rolled_back.stderr)
 
+    def test_legacy_v2_analyze_only_preopen_and_route_close_remain_valid(self) -> None:
+        release_env = self.root / "legacy-edge.release.env"
+        release_env.write_text(
+            f"AUTHORITY_PUBLIC_KEY_SHA256={sha256(self.public_key)}\n",
+            encoding="utf-8",
+        )
+        legacy_policy = self.root / "legacy-successor-policy.json"
+        legacy_policy_value = json.loads(
+            (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
+        )
+        legacy_policy_value["schema_version"] = 3
+        legacy_policy_value["ceremony"] = "holdfast-rikune-successor-v3"
+        legacy_policy_value["predecessor"].pop("apply_receipt_sha256")
+        legacy_policy_value["predecessor"]["completion"] = {
+            "kind": "recovery-completion-attestation-v1",
+            "attestation_sha256": "a" * 64,
+            "signature_sha256": "b" * 64,
+            "public_key_sha256": "c" * 64,
+        }
+        legacy_policy.write_text(
+            json.dumps(legacy_policy_value, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        release_evidence = self.root / "legacy-edge-release.json"
+        release_evidence.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "release_mode": "successor",
+                    "predecessor_binding": legacy_policy_value["predecessor"],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        open_evidence = self.root / "legacy-edge-open.json"
+        open_evidence.write_text(
+            json.dumps({"source_grant_id": "source-grant-legacy"}),
+            encoding="utf-8",
+        )
+        prepare_receipt = self.root / "LEGACY-OPEN-PREPARE.receipt"
+        prepare_receipt.write_text(
+            "\n".join(
+                (
+                    "prepared_at=2026-08-22T02:00:00Z",
+                    f"release_evidence_sha256={sha256(release_evidence)}",
+                    f"open_evidence_sha256={sha256(open_evidence)}",
+                    "source_grant_id=source-grant-legacy",
+                    "route_state=absent",
+                    "public_host=analyze.w33d.xyz",
+                    "edge_owner=existing-w33d-sluice",
+                    "public_ipv4_ipv6_closed_status=404",
+                    "db_public_db_bracket=absent-404-absent",
+                    "external_edge_mutation=none",
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        preopen_value = {
+            "schema_version": 2,
+            "ceremony": "holdfast-rikune-edge-preopen-v2",
+            "issued_at": "2026-08-22T02:10:00Z",
+            "signature_key_sha256": sha256(self.public_key),
+            "release_evidence_sha256": sha256(release_evidence),
+            "open_evidence_sha256": sha256(open_evidence),
+            "source_grant_id": "source-grant-legacy",
+            "open_prepare_receipt_sha256": sha256(prepare_receipt),
+            "host": "analyze.w33d.xyz",
+            "edge_owner": "existing-w33d-sluice",
+            "route_state": "absent",
+            "external_edge_mutations": [],
+            "public_probes": [
+                {
+                    "family": family,
+                    "observed_at": "2026-08-22T02:05:00Z",
+                    "url": "https://analyze.w33d.xyz/",
+                    "status": 404,
+                    "edge_owner": "existing-w33d-sluice",
+                    "route_state": "absent",
+                    "response_headers_sha256": digest * 64,
+                }
+                for family, digest in (("ipv4", "a"), ("ipv6", "b"))
+            ],
+        }
+        preopen = self.root / "legacy-edge-preopen.json"
+        preopen_command = [
+            "python3",
+            str(OPS_ROOT / "edge_evidence.py"),
+            "--mode",
+            "preopen",
+            "--evidence",
+            str(preopen),
+            "--public-key",
+            str(self.public_key),
+            "--release-env",
+            str(release_env),
+            "--release-evidence",
+            str(release_evidence),
+            "--successor-policy",
+            str(legacy_policy),
+            "--open-evidence",
+            str(open_evidence),
+            "--prepare-receipt",
+            str(prepare_receipt),
+        ]
+        valid_preopen = self.run_signed_edge(
+            preopen_value, preopen, preopen_command
+        )
+        self.assertEqual(
+            valid_preopen.returncode,
+            0,
+            valid_preopen.stdout + valid_preopen.stderr,
+        )
+
+        route_receipt = self.root / "LEGACY-ROUTE-CLOSE.receipt"
+        route_receipt.write_text(
+            "\n".join(
+                (
+                    "schema_version=2",
+                    "route_closed_at=2026-08-22T03:00:00Z",
+                    "source_state=ingress_open",
+                    "estate_root=/srv/w33d_infra",
+                    "backup_dir=/var/lib/holdfast-rikune/backups/legacy",
+                    f"control_sha256={'a' * 64}",
+                    f"state_before_sha256={'b' * 64}",
+                    f"route_down_sha256={'c' * 64}",
+                    f"route_down_execution_evidence_sha256={'d' * 64}",
+                    f"route_preimage_sha256={'e' * 64}",
+                    "route_conflict_cleanup=same-name-or-analyze-root",
+                    f"open_evidence_sha256={sha256(open_evidence)}",
+                    "source_grant_id=source-grant-legacy",
+                    "was_public_open=true",
+                    f"preopen_edge_evidence_sha256={sha256(preopen)}",
+                    "route_state=absent",
+                    "public_host=analyze.w33d.xyz",
+                    "edge_owner=existing-w33d-sluice",
+                    "public_ipv4_ipv6_closed_status=404",
+                    "db_public_db_bracket=absent-404-absent",
+                    "external_edge_mutation=none",
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        revocation = self.root / "legacy-edge-revocation.json"
+        revocation.write_text(
+            json.dumps(
+                {
+                    "issued_at": "2026-08-22T03:05:00Z",
+                    "source_grant_id": "source-grant-legacy",
+                }
+            ),
+            encoding="utf-8",
+        )
+        rollback_value = {
+            "schema_version": 2,
+            "ceremony": "holdfast-rikune-edge-rollback-v2",
+            "issued_at": "2026-08-22T03:15:00Z",
+            "signature_key_sha256": sha256(self.public_key),
+            "release_evidence_sha256": sha256(release_evidence),
+            "preopen_edge_evidence_sha256": sha256(preopen),
+            "route_close_receipt_sha256": sha256(route_receipt),
+            "revocation_evidence_sha256": sha256(revocation),
+            "source_grant_id": "source-grant-legacy",
+            "host": "analyze.w33d.xyz",
+            "edge_owner": "existing-w33d-sluice",
+            "route_state": "absent",
+            "external_edge_mutations": [],
+            "public_probes": [
+                {
+                    "family": family,
+                    "observed_at": "2026-08-22T03:10:00Z",
+                    "url": "https://analyze.w33d.xyz/",
+                    "status": 404,
+                    "edge_owner": "existing-w33d-sluice",
+                    "route_state": "absent",
+                    "response_headers_sha256": digest * 64,
+                }
+                for family, digest in (("ipv4", "c"), ("ipv6", "d"))
+            ],
+        }
+        rollback = self.root / "legacy-edge-rollback.json"
+        rollback_command = [
+            "python3",
+            str(OPS_ROOT / "edge_evidence.py"),
+            "--mode",
+            "rollback",
+            "--evidence",
+            str(rollback),
+            "--public-key",
+            str(self.public_key),
+            "--release-env",
+            str(release_env),
+            "--release-evidence",
+            str(release_evidence),
+            "--successor-policy",
+            str(legacy_policy),
+            "--open-edge-evidence",
+            str(preopen),
+            "--route-close-receipt",
+            str(route_receipt),
+            "--revocation-evidence",
+            str(revocation),
+        ]
+        valid_rollback = self.run_signed_edge(
+            rollback_value, rollback, rollback_command
+        )
+        self.assertEqual(
+            valid_rollback.returncode,
+            0,
+            valid_rollback.stdout + valid_rollback.stderr,
+        )
+
+    def test_schema4_policy_dispatch_rejects_legacy_v2_or_unbound_v3(self) -> None:
+        value, evidence, command, *_ = self.make_preopen_fixture()
+        legacy = json.loads(json.dumps(value))
+        legacy["schema_version"] = 2
+        legacy["ceremony"] = "holdfast-rikune-edge-preopen-v2"
+        legacy["host"] = "analyze.w33d.xyz"
+        legacy.pop("successor_policy_sha256")
+        legacy["public_probes"] = [
+            probe
+            for probe in legacy["public_probes"]
+            if probe["url"] == "https://analyze.w33d.xyz/"
+        ]
+        wrong_schema = self.run_signed_edge(legacy, evidence, command)
+        self.assertNotEqual(wrong_schema.returncode, 0)
+        self.assertIn("v3 ceremony", wrong_schema.stderr)
+
+        unbound_command = list(command)
+        policy_index = unbound_command.index("--successor-policy")
+        del unbound_command[policy_index : policy_index + 2]
+        unbound = self.run_signed_edge(value, evidence, unbound_command)
+        self.assertNotEqual(unbound.returncode, 0)
+        self.assertIn("requires its frozen successor policy", unbound.stderr)
+
+        wrong_policy_hash = json.loads(json.dumps(value))
+        wrong_policy_hash["successor_policy_sha256"] = "f" * 64
+        mismatched = self.run_signed_edge(wrong_policy_hash, evidence, command)
+        self.assertNotEqual(mismatched.returncode, 0)
+        self.assertIn("policy binding differs", mismatched.stderr)
+
     def test_actual_route_close_receipt_is_accepted_by_edge_rollback_validator(
         self,
     ) -> None:
@@ -1405,6 +1991,61 @@ class SignedEvidenceTests(unittest.TestCase):
         value, evidence, command, release_env, release_evidence, open_evidence = (
             self.make_preopen_fixture()
         )
+        legacy_policy = self.root / "actual-route-legacy-policy.json"
+        legacy_policy_value = json.loads(
+            (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
+        )
+        legacy_policy_value["schema_version"] = 3
+        legacy_policy_value["ceremony"] = "holdfast-rikune-successor-v3"
+        legacy_policy_value["predecessor"].pop("apply_receipt_sha256")
+        legacy_policy_value["predecessor"]["completion"] = {
+            "kind": "recovery-completion-attestation-v1",
+            "attestation_sha256": "a" * 64,
+            "signature_sha256": "b" * 64,
+            "public_key_sha256": "c" * 64,
+        }
+        legacy_policy.write_text(
+            json.dumps(legacy_policy_value, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        release_value = json.loads(release_evidence.read_text(encoding="utf-8"))
+        release_value["predecessor_binding"] = legacy_policy_value["predecessor"]
+        release_evidence.write_text(
+            json.dumps(release_value, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        prepare_receipt = Path(
+            command[command.index("--prepare-receipt") + 1]
+        )
+        prepare_receipt.write_text(
+            "\n".join(
+                (
+                    "prepared_at=2026-08-22T02:00:00Z",
+                    f"release_evidence_sha256={sha256(release_evidence)}",
+                    f"open_evidence_sha256={sha256(open_evidence)}",
+                    "source_grant_id=source-grant-0001",
+                    "route_state=absent",
+                    "public_host=analyze.w33d.xyz",
+                    "edge_owner=existing-w33d-sluice",
+                    "public_ipv4_ipv6_closed_status=404",
+                    "db_public_db_bracket=absent-404-absent",
+                    "external_edge_mutation=none",
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        value["schema_version"] = 2
+        value["ceremony"] = "holdfast-rikune-edge-preopen-v2"
+        value.pop("successor_policy_sha256")
+        value["release_evidence_sha256"] = sha256(release_evidence)
+        value["open_prepare_receipt_sha256"] = sha256(prepare_receipt)
+        value["host"] = "analyze.w33d.xyz"
+        value["public_probes"] = [
+            probe
+            for probe in value["public_probes"]
+            if probe["url"] == "https://analyze.w33d.xyz/"
+        ]
+        command[command.index("--successor-policy") + 1] = str(legacy_policy)
         valid = self.run_signed_edge(value, evidence, command)
         self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
 
@@ -1488,13 +2129,16 @@ class SignedEvidenceTests(unittest.TestCase):
                     {
                         "family": family,
                         "observed_at": utc_after(10),
-                        "url": "https://analyze.w33d.xyz/",
+                        "url": url,
                         "status": 404,
                         "edge_owner": "existing-w33d-sluice",
                         "route_state": "absent",
                         "response_headers_sha256": digest * 64,
                     }
-                    for family, digest in (("ipv4", "d"), ("ipv6", "e"))
+                    for url, family, digest in (
+                        ("https://analyze.w33d.xyz/", "ipv4", "f"),
+                        ("https://analyze.w33d.xyz/", "ipv6", "0"),
+                    )
                 ],
             }
             rollback_evidence = self.root / "actual-route-edge-rollback.json"
@@ -1511,6 +2155,8 @@ class SignedEvidenceTests(unittest.TestCase):
                 str(release_env),
                 "--release-evidence",
                 str(release_evidence),
+                "--successor-policy",
+                str(legacy_policy),
                 "--open-edge-evidence",
                 str(evidence),
                 "--route-close-receipt",
@@ -1529,7 +2175,7 @@ class SignedEvidenceTests(unittest.TestCase):
         finally:
             lifecycle.tearDown()
 
-    def test_edge_preopen_rejects_v1_pages_single_stack_wrong_status_host_and_mutation(self) -> None:
+    def test_edge_preopen_v3_rejects_pages_single_stack_wrong_status_host_and_mutation(self) -> None:
         value, evidence, command, *_ = self.make_preopen_fixture()
         cases: list[tuple[str, dict[str, object], str]] = []
 
@@ -1540,19 +2186,19 @@ class SignedEvidenceTests(unittest.TestCase):
             "repository": "Last-emo-boy/rikune",
             "cname": "rikune.w33d.xyz",
         }
-        cases.append(("old Pages schema", old_pages, "v2 ceremony"))
+        cases.append(("old Pages schema", old_pages, "v3 ceremony"))
 
         single_stack = json.loads(json.dumps(value))
         single_stack["public_probes"] = single_stack["public_probes"][:1]
-        cases.append(("single stack", single_stack, "exactly one IPv4 and one IPv6"))
+        cases.append(("single stack", single_stack, "one IPv4 and one IPv6 probe per host"))
 
         wrong_status = json.loads(json.dumps(value))
         wrong_status["public_probes"][0]["status"] = 200
         cases.append(("wrong closed status", wrong_status, "exact 404"))
 
         wrong_host = json.loads(json.dumps(value))
-        wrong_host["host"] = "rikune.w33d.xyz"
-        cases.append(("wrong host", wrong_host, "host is not analyze.w33d.xyz"))
+        wrong_host["host"] = "analyze.w33d.xyz"
+        cases.append(("wrong host", wrong_host, "host is not rikune.w33d.xyz"))
 
         mutated_edge = json.loads(json.dumps(value))
         mutated_edge["external_edge_mutations"] = ["cloudflare-dns-patch"]
@@ -1586,22 +2232,48 @@ class SignedEvidenceTests(unittest.TestCase):
         compensation = script[script.index("compensate_finalize()"):route_insert]
         self.assertIn("force_route_absent", compensation)
         self.assertGreaterEqual(compensation.count("verify_database_absent"), 2)
-        self.assertIn('public-origin-verify.sh\" --mode closed', compensation)
+        self.assertIn("verify_public_closed", compensation)
         self.assertIn("record_interrupted_state", compensation)
         self.assertIn("mark_compensation_unverified", compensation)
         self.assertIn('state="ingress_compensation_unverified"', script)
 
         armed_recovery = script.index('if [[ "$current_state" == "finalizing_route_armed" ]]')
-        release_validation = script.index("validate_release_evidence.py")
+        release_validation = script.index("validate_release_evidence.py", armed_recovery)
         self.assertLess(armed_recovery, release_validation)
         recover_function = script[script.index("recover_armed_open()"):armed_recovery]
         self.assertLess(recover_function.index("force_route_absent"), recover_function.index("open_armed_prepare_receipt_sha256"))
+        self.assertIn("validate_armed_open_contract", recover_function)
         self.assertIn('holdfast_die "armed open was compensated', script)
         self.assertIn('"closed-state-route-present"', script)
 
+        armed_contract = script[
+            script.index("validate_armed_open_contract()") : script.index(
+                "recover_armed_open()"
+            )
+        ]
+        self.assertIn("successor-policy.json", armed_contract)
+        self.assertIn("frozen route assets differ from release evidence", armed_contract)
+        self.assertIn('policy_schema" == "4', armed_contract)
+        self.assertIn(
+            '.open_armed_public_host == "rikune.w33d.xyz"', armed_contract
+        )
+        self.assertIn(
+            '.open_armed_public_host == "analyze.w33d.xyz"', armed_contract
+        )
+        self.assertIn(
+            '(has("open_armed_legacy_public_host") | not)', armed_contract
+        )
+
         self.assertGreater(script.index("verify_open_bracket", route_insert), route_insert)
-        self.assertIn("verify_database_absent\n  \"$script_dir/public-origin-verify.sh\" --mode closed", script)
-        self.assertIn("verify_database_open\n  \"$script_dir/public-origin-verify.sh\" --mode open", script)
+        self.assertIn("verify_database_absent\n  verify_public_closed", script)
+        self.assertIn(
+            'verify_database_open\n  "$script_dir/public-origin-verify.sh" --mode open --url https://rikune.w33d.xyz/',
+            script,
+        )
+        self.assertIn(
+            'public-origin-verify.sh" --mode closed --url https://analyze.w33d.xyz/',
+            script,
+        )
 
         rollback = (OPS_ROOT / "rollback.sh").read_text(encoding="utf-8")
         close_phase = rollback[rollback.index('if [[ "$phase" == "close-route" ]]'):]
@@ -1738,7 +2410,11 @@ printf '%s' "$status"
         )
         fake_curl.chmod(0o755)
 
-        def verify(contract: str, mode: str) -> subprocess.CompletedProcess[str]:
+        def verify(
+            contract: str,
+            mode: str,
+            url: str = "https://rikune.w33d.xyz/",
+        ) -> subprocess.CompletedProcess[str]:
             env = {
                 **os.environ,
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
@@ -1751,7 +2427,7 @@ printf '%s' "$status"
                     "--mode",
                     mode,
                     "--url",
-                    "https://analyze.w33d.xyz/",
+                    url,
                 ],
                 check=False,
                 text=True,
@@ -1764,6 +2440,16 @@ printf '%s' "$status"
             with self.subTest(contract=contract):
                 result = verify(contract, mode)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        tombstone = verify(
+            "closed", "closed", "https://analyze.w33d.xyz/"
+        )
+        self.assertEqual(tombstone.returncode, 0, tombstone.stdout + tombstone.stderr)
+        tombstone_open = verify(
+            "open", "open", "https://analyze.w33d.xyz/"
+        )
+        self.assertEqual(tombstone_open.returncode, 2)
+        self.assertIn("permanently closed tombstone", tombstone_open.stderr)
 
         for contract, mode, error in (
             ("bad-location", "open", "untrusted-or-duplicate-location"),

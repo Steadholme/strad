@@ -363,7 +363,7 @@ mod tests {
 
     fn headers(verifier: &AuthVerifier, subject: &str, groups: &str, minute: i64) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_static("analyze.w33d.xyz"));
+        headers.insert(header::HOST, HeaderValue::from_static("rikune.w33d.xyz"));
         headers.insert(HEADER_SUBJECT, HeaderValue::from_str(subject).unwrap());
         headers.insert(HEADER_GROUPS, HeaderValue::from_str(groups).unwrap());
         headers.insert(
@@ -382,7 +382,7 @@ mod tests {
             HeaderValue::from_bytes(&sign_zone(
                 &verifier.zone_key,
                 b"rikune-root",
-                b"analyze.w33d.xyz",
+                b"rikune.w33d.xyz",
                 b"external",
                 minute,
             ))
@@ -434,5 +434,50 @@ mod tests {
             ),
         );
         assert!(verifier.verify_at(&wrong, 42).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_host_and_legacy_host_zone_binding() {
+        let config = Config::for_tests(std::env::temp_dir());
+        let verifier = AuthVerifier::new(&config);
+
+        let mut legacy_host = headers(&verifier, "alice", "", 42);
+        legacy_host.insert(header::HOST, HeaderValue::from_static("analyze.w33d.xyz"));
+        assert!(verifier.verify_at(&legacy_host, 42).is_err());
+
+        let mut legacy_zone_binding = headers(&verifier, "alice", "", 42);
+        legacy_zone_binding.insert(
+            HEADER_ZONE_SIG,
+            HeaderValue::from_bytes(&sign_zone(
+                &verifier.zone_key,
+                b"rikune-root",
+                b"analyze.w33d.xyz",
+                b"external",
+                42,
+            ))
+            .unwrap(),
+        );
+        assert!(verifier.verify_at(&legacy_zone_binding, 42).is_err());
+    }
+
+    #[test]
+    fn mutation_origin_is_exactly_the_canonical_rikune_host() {
+        let mut canonical = HeaderMap::new();
+        canonical.insert(header::HOST, HeaderValue::from_static("rikune.w33d.xyz"));
+        canonical.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://rikune.w33d.xyz"),
+        );
+        assert!(verify_same_origin(&canonical, "rikune.w33d.xyz").is_ok());
+
+        for legacy in [
+            ("analyze.w33d.xyz", "https://rikune.w33d.xyz"),
+            ("rikune.w33d.xyz", "https://analyze.w33d.xyz"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_static(legacy.0));
+            headers.insert(header::ORIGIN, HeaderValue::from_static(legacy.1));
+            assert!(verify_same_origin(&headers, "rikune.w33d.xyz").is_err());
+        }
     }
 }

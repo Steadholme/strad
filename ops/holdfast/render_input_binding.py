@@ -35,6 +35,7 @@ SUCCESSOR_POLICY_CEREMONIES = {
     1: "holdfast-rikune-successor-v1",
     2: "holdfast-rikune-successor-v2",
     3: "holdfast-rikune-successor-v3",
+    4: "holdfast-rikune-successor-v4",
 }
 SECURE_DESCRIPTOR_TRAVERSAL_SUPPORTED = (
     all(
@@ -231,10 +232,12 @@ def validate_adjacent_recovery_completion(
     source_estate_root: Path | None,
     require_root_owner: bool,
 ) -> None:
-    if policy_version < 3:
+    if policy_version != 3:
         present = set(os.listdir(stage_root)) & RECOVERY_COMPLETION_NAMES
         if present:
-            fail("legacy successor stage contains recovery completion authority")
+            if policy_version < 3:
+                fail("legacy successor stage contains recovery completion authority")
+            fail("schema 4 APPLY-authority stage contains recovery completion authority")
         return
     directory = open_private_directory(stage_root)
     try:
@@ -1004,11 +1007,9 @@ def verify_apply_binding(
         predecessor = policy.get("predecessor")
         policy_successor = policy.get("successor")
         overlay = policy.get("overlay")
-        expected_predecessor_fields = (
-            RECOVERED_PREDECESSOR_FIELDS
-            if policy_version == 3
-            else LEGACY_PREDECESSOR_FIELDS
-        )
+        expected_predecessor_fields = {
+            3: RECOVERED_PREDECESSOR_FIELDS,
+        }.get(policy_version, LEGACY_PREDECESSOR_FIELDS)
         if (
             not isinstance(predecessor, dict)
             or set(predecessor) != expected_predecessor_fields
@@ -1024,7 +1025,7 @@ def verify_apply_binding(
                 != ACCESS_BUILD_INPUT_SCHEMA_V1
             )
             or (
-                policy_version == 3
+                policy_version in (3, 4)
                 and predecessor.get("access_build_input_schema")
                 != ACCESS_BUILD_INPUT_SCHEMA_V2
             )
@@ -1055,7 +1056,7 @@ def verify_apply_binding(
         if not isinstance(overlay, list) or (
             policy_version == 1 and len(overlay) != 7
         ) or (
-            policy_version in (2, 3)
+            policy_version in (2, 3, 4)
             and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
         ):
             fail("successor overlay field set differs")
@@ -1090,7 +1091,7 @@ def verify_apply_binding(
                 fail(f"stage successor overlay differs: {relative}")
             seen_overlay.add(relative)
             overlay_paths.append(relative)
-        if policy_version in (2, 3) and overlay_paths != sorted(overlay_paths):
+        if policy_version in (2, 3, 4) and overlay_paths != sorted(overlay_paths):
             fail("successor overlay path order differs")
         validate_adjacent_recovery_completion(
             stage,
@@ -1120,6 +1121,11 @@ def verify_apply_binding(
             != evidence.get("holdfast_release_tool_revision")
             or release.get("ACCESS_GOVERNANCE_ROLLBACK_IMAGE")
             != predecessor.get("access_image")
+            or (
+                policy_version == 4
+                and release.get("ACCESS_GOVERNANCE_IMAGE")
+                == predecessor.get("access_image")
+            )
         ):
             fail("successor release pins differ from predecessor or tool authority")
         delta_path = rooted_regular(

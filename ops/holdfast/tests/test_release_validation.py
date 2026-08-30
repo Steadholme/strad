@@ -220,6 +220,43 @@ class AnalyzerImageBindingTests(unittest.TestCase):
         )
         validate_release_evidence.validate_evidence(self.successor_evidence())
 
+    def test_schema_v4_advances_access_candidate_with_current_tool_revision(
+        self,
+    ) -> None:
+        policy = json.loads(
+            (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(policy["schema_version"], 4)
+        evidence = self.successor_evidence()
+        release = evidence["release"]
+        predecessor = policy["predecessor"]
+        self.assertNotEqual(
+            release["ACCESS_GOVERNANCE_IMAGE"],
+            release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"],
+        )
+        self.assertEqual(
+            release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"],
+            predecessor["access_image"],
+        )
+        self.assertNotIn("access_candidate_tool_revision", evidence)
+        self.assertEqual(
+            evidence["holdfast_release_tool_revision"],
+            release["HOLDFAST_RELEASE_TOOL_REVISION"],
+        )
+        render.validate_release(
+            release,
+            False,
+            successor=True,
+        )
+        validate_release_evidence.validate_evidence(evidence)
+
+        wrong_image = copy.deepcopy(evidence)
+        wrong_image["release"]["ACCESS_GOVERNANCE_IMAGE"] = wrong_image[
+            "release"
+        ]["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"]
+        with self.assertRaisesRegex(ValueError, "candidate and rollback images must differ"):
+            validate_release_evidence.validate_evidence(wrong_image)
+
     def test_successor_evidence_rejects_non_exact_mode_policy_and_tool_binding(
         self,
     ) -> None:
@@ -314,18 +351,34 @@ class AnalyzerImageBindingTests(unittest.TestCase):
         policy = json.loads(
             (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
         )
+        policy["schema_version"] = 3
+        policy["ceremony"] = "holdfast-rikune-successor-v3"
         predecessor = policy["predecessor"]
+        predecessor.pop("apply_receipt_sha256")
         predecessor["completion"] = {
             "kind": "recovery-completion-attestation-v1",
             "attestation_sha256": "a" * 64,
             "signature_sha256": "b" * 64,
             "public_key_sha256": "c" * 64,
         }
+        policy["overlay"] = [
+            {
+                "path": "access-governance/src/lib.rs",
+                "before_sha256": "d" * 64,
+                "after_sha256": "e" * 64,
+            }
+        ]
         with tempfile.TemporaryDirectory(prefix="holdfast-evidence-v3-") as temp:
             policy_path = Path(temp) / "successor-policy.json"
             policy_path.write_text(json.dumps(policy) + "\n", encoding="utf-8")
             evidence = self.successor_evidence()
             evidence["predecessor_binding"] = copy.deepcopy(predecessor)
+            evidence["release"]["ACCESS_GOVERNANCE_IMAGE"] = self.release[
+                "ACCESS_GOVERNANCE_IMAGE"
+            ]
+            evidence["successor_delta_sha256"] = hashlib.sha256(
+                f"{'d' * 64}  {'e' * 64}  access-governance/src/lib.rs\n".encode()
+            ).hexdigest()
             validate_release_evidence.validate_evidence(evidence, policy_path)
 
             tampered = copy.deepcopy(evidence)

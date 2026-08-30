@@ -117,6 +117,8 @@ def validate_successor_evidence(
     release: dict[str, Any],
     successor_policy_path: Path,
 ) -> None:
+    policy = validate_successor_policy(successor_policy_path)
+    policy_version = policy["schema_version"]
     expected_root = set(SUCCESSOR_ROOT_FIELDS)
     if not catalog_only:
         expected_root.update(SUCCESSOR_FULL_FIELDS)
@@ -138,7 +140,6 @@ def validate_successor_evidence(
     if value.get("secret_references") != SECRET_REFERENCES:
         fail("successor secret reference set or order differs")
 
-    policy = validate_successor_policy(successor_policy_path)
     predecessor_policy = policy["predecessor"]
     successor_policy = policy["successor"]
     predecessor = value.get("predecessor_binding")
@@ -179,6 +180,10 @@ def validate_successor_evidence(
         fail("successor release-tool revision differs from the release pin")
     if release.get("ACCESS_GOVERNANCE_ROLLBACK_IMAGE") != predecessor["access_image"]:
         fail("successor rollback image is not the immediate predecessor candidate")
+    if policy_version == 4 and release.get(
+        "ACCESS_GOVERNANCE_IMAGE"
+    ) == release.get("ACCESS_GOVERNANCE_ROLLBACK_IMAGE"):
+        fail("schema 4 Access candidate and rollback images must differ")
     semantic_release_fields = {
         "access_governance_build_input_sha256": "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256",
         "permission_catalog_sha256": "PERMISSION_CATALOG_SHA256",

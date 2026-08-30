@@ -20,10 +20,18 @@ BEGIN
     IF EXISTS (
         SELECT 1
           FROM routes
-         WHERE host = 'analyze.w33d.xyz'
+         WHERE lower(host) = 'rikune.w33d.xyz'
            AND path_prefix = '/'
     ) THEN
-        RAISE EXCEPTION 'analyze.w33d.xyz root is already owned by another route';
+        RAISE EXCEPTION 'rikune.w33d.xyz root is already owned by another route';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+          FROM routes
+         WHERE lower(host) = 'analyze.w33d.xyz'
+    ) THEN
+        RAISE EXCEPTION 'analyze.w33d.xyz has a route but is a closed tombstone; refusing apply';
     END IF;
 END
 $$;
@@ -34,7 +42,7 @@ INSERT INTO routes (
     step_up_resume_path
 )
 VALUES (
-    'rikune-root', 'analyze.w33d.xyz', '/', 'http://strad:9360', TRUE, 'sso', FALSE, '',
+    'rikune-root', 'rikune.w33d.xyz', '/', 'http://strad:9360', TRUE, 'sso', FALSE, '',
     FALSE, 'rikune.console.enter', 'route:rikune-root', 'critical', '', ''
 );
 
@@ -46,7 +54,7 @@ BEGIN
       INTO exact_count
       FROM routes
      WHERE name = 'rikune-root'
-       AND host = 'analyze.w33d.xyz'
+       AND host = 'rikune.w33d.xyz'
        AND path_prefix = '/'
        AND upstream = 'http://strad:9360'
        AND protected = TRUE
@@ -61,6 +69,14 @@ BEGIN
        AND step_up_resume_path = '';
     IF exact_count <> 1 THEN
         RAISE EXCEPTION 'rikune-root apply verification expected one exact row, got %', exact_count;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+          FROM routes
+         WHERE lower(host) = 'analyze.w33d.xyz'
+    ) THEN
+        RAISE EXCEPTION 'analyze.w33d.xyz tombstone verification failed';
     END IF;
 END
 $$;

@@ -2,12 +2,14 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --mode closed|open [--url https://analyze.w33d.xyz/]" >&2
+  echo "usage: $0 --mode closed|open [--url https://rikune.w33d.xyz/]" >&2
   exit 2
 }
 
 mode=""
-url="https://analyze.w33d.xyz/"
+canonical_url="https://rikune.w33d.xyz/"
+legacy_tombstone_url="https://analyze.w33d.xyz/"
+url="$canonical_url"
 while (($#)); do
   case "$1" in
     --mode) [[ $# -ge 2 ]] || usage; mode=$2; shift 2 ;;
@@ -16,7 +18,14 @@ while (($#)); do
   esac
 done
 [[ "$mode" == "closed" || "$mode" == "open" ]] || usage
-[[ "$url" == "https://analyze.w33d.xyz/" ]] || { echo "unexpected public URL" >&2; exit 2; }
+[[ "$url" == "$canonical_url" || "$url" == "$legacy_tombstone_url" ]] || {
+  echo "unexpected public URL" >&2
+  exit 2
+}
+if [[ "$mode" == "open" && "$url" == "$legacy_tombstone_url" ]]; then
+  echo "analyze.w33d.xyz is a permanently closed tombstone" >&2
+  exit 2
+fi
 probe_dir=$(mktemp -d "${TMPDIR:-/var/tmp}/holdfast-public-probe.XXXXXX")
 trap 'rm -rf -- "$probe_dir"' EXIT
 

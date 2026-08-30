@@ -2,7 +2,7 @@
 SELECT CASE
          WHEN count(*) = 1
           AND bool_and(
-              host = 'analyze.w33d.xyz'
+              host = 'rikune.w33d.xyz'
               AND path_prefix = '/'
               AND upstream = 'http://strad:9360'
               AND protected = TRUE
@@ -20,4 +20,14 @@ SELECT CASE
          ELSE 'invalid'
        END
   FROM routes
- WHERE name = 'rikune-root';
+ WHERE name = 'rikune-root'
+   AND NOT EXISTS (
+       SELECT 1
+         FROM routes AS conflict
+        WHERE (
+              lower(conflict.host) = 'rikune.w33d.xyz'
+              AND conflict.path_prefix = '/'
+              AND conflict.name IS DISTINCT FROM 'rikune-root'
+          )
+          OR lower(conflict.host) = 'analyze.w33d.xyz'
+   );

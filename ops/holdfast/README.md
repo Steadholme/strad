@@ -237,9 +237,10 @@ acceptance user's own step-up and normal 2-of-2 approval. Record the same pinned
 source grant, and all seven positive epochs/ack timestamps using `authority-open.example.json`,
 then detached-sign the JSON with the release-pinned authority key.
 
-`analyze.w33d.xyz` already reaches the existing W33D Sluice ingress through the managed wildcard
-Cloudflare/DNS estate. With no `rikune-root` row, both public IPv4 and IPv6 must return exact
-`404` responses carrying the expected W33D safety headers. Opening and rollback are route-only:
+`rikune.w33d.xyz` reaches the existing W33D Sluice ingress through the managed wildcard
+Cloudflare/DNS estate; `analyze.w33d.xyz` is its permanently closed tombstone. With no canonical
+root route and no route on the tombstone host, both hosts must return exact `404` responses over
+public IPv4 and IPv6 with the expected W33D safety headers. Opening and rollback are route-only:
 they never change GitHub Pages, Cloudflare, DNS, wildcard ownership, or caches.
 
 Prepare validates the release/runtime and authority, then brackets the public closed probe with two
@@ -255,25 +256,40 @@ ROUTES_DATABASE_URL='supplied by route authority' ./open-ingress.sh --execute --
   --authority-public-key /secure/release/release-authority.pub
 ```
 
+If a completed successor apply finds a stale predecessor `OPEN-PREPARE.receipt`, supersede it in a
+standalone invocation before preparing again. The reason must be a canonical root-owned,
+single-link, mode-`0600` file. This mode requires the exact schema-v4/Gen5 successor authority,
+including the frozen policy and predecessor APPLY hashes with no recovery-completion namespace. It
+verifies both frozen release hash chains, archives the original bytes without overwrite, writes the
+hash-bound supersede receipt, and exits; it cannot be combined with prepare or finalize. Existing
+artifacts are accepted only as byte-exact replay, and any hybrid or conflicting receipt fails closed:
+
+```sh
+./open-ingress.sh --execute --abandon-prepare \
+  --reason-file /secure/release/open-prepare-abandon.reason
+```
+
 A successful prepare atomically records `OPEN-PREPARE.receipt` and
-`edge_prepared_route_closed`. It proves `absent -> dual-stack 404 -> absent`, the
-`analyze.w33d.xyz` host, and `existing-w33d-sluice`, with
+`edge_prepared_route_closed`. It proves database absence around exact dual-stack `404` responses
+for `rikune.w33d.xyz` and the `analyze.w33d.xyz` tombstone on `existing-w33d-sluice`, with
 `external_edge_mutation=none`.
 
 After prepare, copy `edge-preopen.example.json` to a protected operator directory. Record exactly
-one post-prepare IPv4 probe and one post-prepare IPv6 probe. Each probe must target
-`https://analyze.w33d.xyz/`, return `404`, identify the existing W33D Sluice edge and
-route-absent state, and include a SHA-256 of the complete response headers. Keep
-`external_edge_mutations` as the exact empty list, fill the receipt/evidence hashes and same
-`source_grant_id`, then detached-sign the v2 JSON with the same authority key.
+one post-prepare IPv4 and one post-prepare IPv6 probe for each of `https://rikune.w33d.xyz/` and
+`https://analyze.w33d.xyz/` (four probes total). Every probe must return `404`, identify the
+existing W33D Sluice edge and route-absent state, and include a SHA-256 of the complete response
+headers. Keep `external_edge_mutations` as the exact empty list, fill the receipt/evidence hashes,
+frozen `successor_policy_sha256`, and same `source_grant_id`, then detached-sign the v3 JSON with
+the same authority key.
 
-Finalize validates that signed v2 pre-open evidence before any exposure change, repeats runtime and
+Finalize validates that signed v3 pre-open evidence before any exposure change, repeats runtime and
 the database/public/database closed bracket, validates the pinned up/down SQL, and atomically writes
 `finalizing_route_armed`. Only then is the `rikune-root` row inserted as the final exposure
 mutation. Verification accepts only a same-round IPv4+IPv6 anonymous `302` to
 `https://sso.w33d.xyz/authorize...` where every `Cache-Control` field is exactly the
-`private,no-store` directive set. Both closed and open checks retry for at least 70 seconds to
-cover Sluice's reload window, and the open probe is bracketed by exact database route checks.
+`private,no-store` directive set on `rikune.w33d.xyz`, while `analyze.w33d.xyz` must remain exact
+dual-stack `404`. Both closed and open checks retry for at least 70 seconds to cover Sluice's
+reload window, and the public probes are bracketed by exact database route checks.
 
 ```sh
 ROUTES_DATABASE_URL='supplied by route authority' ./open-ingress.sh --execute --phase finalize \
@@ -298,8 +314,9 @@ prohibited until the rollback close ceremony resolves the route.
 For direct diagnostics, the public verifier requires an explicit mode:
 
 ```sh
+./public-origin-verify.sh --mode closed --url https://rikune.w33d.xyz/
 ./public-origin-verify.sh --mode closed --url https://analyze.w33d.xyz/
-./public-origin-verify.sh --mode open --url https://analyze.w33d.xyz/
+./public-origin-verify.sh --mode open --url https://rikune.w33d.xyz/
 ```
 
 Closed mode requires same-round dual-stack `404`, HSTS, `nosniff`, `SAMEORIGIN`,
@@ -311,17 +328,22 @@ contract above.
 
 Do **not** pre-create revocation evidence. Rollback ordering is enforced:
 
-1. snapshot every route row with name `rikune-root` or the `analyze.w33d.xyz` root match;
-2. delete both the same-name row and any conflicting analyze-root owner under the route advisory
-   lock, then prove `absent -> dual-stack 404 -> absent`;
+1. snapshot every route row with name `rikune-root`, the `rikune.w33d.xyz` root match, or any route
+   on the `analyze.w33d.xyz` tombstone;
+2. delete that exact conflict set under the route advisory lock, then prove database absence around
+   exact dual-stack `404` responses for both hosts;
 3. write the immutable route-close receipt and revoke the exact `source_grant_id`;
 4. wait for and acknowledge all seven tombstones/epochs;
-5. if the route may have been public, sign v2 rollback evidence proving only the same dual-stack
-   route-absent `404` state; no Pages, Cloudflare, or DNS restore exists;
+5. if the route may have been public, sign v3 rollback evidence with four probes proving the same
+   dual-stack route-absent `404` state for both hosts; no Pages, Cloudflare, or DNS restore exists;
 6. durably arm the exact seven-service running snapshot, quiesce all seven release services,
    restore the dedicated Strad database, six volume dispositions, and the mixed-state estate,
    then reactivate only the frozen shared-service subset plus the runtime pre-apply Strad/analyzer
    subset while continuing to verify the public route remains closed.
+
+Frozen releases before schema-v4 continue to use the exact legacy v2 analyze-only evidence and
+route-close receipt contracts. The validator dispatches from the frozen release/policy; it never
+accepts v2 as a substitute for the Gen5 dual-host v3 ceremony.
 
 Create the route-close receipt first:
 
@@ -343,9 +365,10 @@ Older generation artifacts remain immutable so a completed successor terminal ca
 revalidated while the restored predecessor begins a separate rollback ceremony.
 
 Populate and sign `authority-rollback.example.json` only after route close. If
-`was_public_open=true`, also populate and sign `edge-rollback.example.json`; it binds the v2
-pre-open evidence, route-close receipt, revocation evidence, same source grant, exact host/edge,
-empty external-mutation list, and two post-revocation `404` probes.
+`was_public_open=true`, also populate and sign `edge-rollback.example.json`; it binds the matching
+policy-versioned pre-open evidence, route-close receipt, revocation evidence, same source grant,
+exact host/edge, empty external-mutation list, and four post-revocation `404` probes covering both
+hosts and both address families.
 
 ```sh
 ROUTES_DATABASE_URL='supplied by route authority' ./rollback.sh --execute --phase execute \

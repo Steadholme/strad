@@ -41,6 +41,7 @@ POLICY_CEREMONIES = {
     1: "holdfast-rikune-successor-v1",
     2: "holdfast-rikune-successor-v2",
     3: "holdfast-rikune-successor-v3",
+    4: "holdfast-rikune-successor-v4",
 }
 POLICY_CEREMONY = POLICY_CEREMONIES[1]
 BUILD_INPUT_V1 = ACCESS_BUILD_INPUT_SCHEMA_V1
@@ -69,6 +70,84 @@ LEGACY_PREDECESSOR_FIELDS = {
 RECOVERED_PREDECESSOR_FIELDS = (
     LEGACY_PREDECESSOR_FIELDS - {"apply_receipt_sha256"}
 ) | {"completion"}
+GEN4_APPLY_RECEIPT_FIELDS = {
+    "schema_version",
+    "completion_state",
+    "applied_at",
+    "closed_verified_at",
+    "estate_root",
+    "backup_dir",
+    "release_env_sha256",
+    "release_evidence_sha256",
+    "render_inputs_sha256",
+    "apply_armed_receipt_sha256",
+    "control_sha256",
+    "transaction_sha256",
+    "applied_targets_sha256",
+    "cargo_gate",
+    "runtime_backup",
+    "closed_bracket",
+    "route_database_state",
+    "public_ipv4_ipv6_closed_status",
+    "ingress_opened",
+    "services_activated",
+    "runtime_verified",
+    "successor",
+    "successor_armed_receipt",
+    "successor_armed_receipt_sha256",
+    "predecessor_current_file",
+    "predecessor_current_sha256",
+    "predecessor_backup_dir",
+    "predecessor_control_sha256",
+    "predecessor_completion_kind",
+    "predecessor_completion_attestation_sha256",
+    "predecessor_completion_signature_sha256",
+    "predecessor_completion_public_key_sha256",
+    "predecessor_release_evidence_sha256",
+    "predecessor_runtime_backup_receipt_sha256",
+    "predecessor_runtime_backup_manifest_sha256",
+    "predecessor_release_generation",
+    "release_generation",
+    "runtime_backup_receipt_sha256",
+    "runtime_backup_manifest_sha256",
+}
+GEN4_CURRENT_FIELDS = {
+    "schema_version",
+    "state",
+    "estate_root",
+    "backup_dir",
+    "apply_receipt_sha256",
+    "apply_armed_receipt_sha256",
+    "control_sha256",
+    "release_evidence_sha256",
+    "transaction_sha256",
+    "applied_targets_sha256",
+    "closed_verified_at",
+    "route_database_state",
+    "public_ipv4_ipv6_closed_status",
+    "services_activated",
+    "runtime_verified",
+    "ingress_opened",
+    "successor",
+    "successor_armed_receipt",
+    "successor_armed_receipt_sha256",
+    "predecessor_current_file",
+    "predecessor_current_sha256",
+    "predecessor_backup_dir",
+    "predecessor_control_sha256",
+    "predecessor_completion_kind",
+    "predecessor_completion_attestation_sha256",
+    "predecessor_completion_signature_sha256",
+    "predecessor_completion_public_key_sha256",
+    "predecessor_release_evidence_sha256",
+    "predecessor_runtime_backup_receipt_sha256",
+    "predecessor_runtime_backup_manifest_sha256",
+    "predecessor_release_generation",
+    "release_generation",
+    "runtime_backup_receipt_sha256",
+    "runtime_backup_manifest_sha256",
+}
+GEN4_SHARED_COMPLETION_FIELDS = GEN4_CURRENT_FIELDS & GEN4_APPLY_RECEIPT_FIELDS
 RECOVERY_COMPLETION_NAMES = (
     RECOVERY_ATTESTATION_NAME,
     RECOVERY_SIGNATURE_NAME,
@@ -166,6 +245,177 @@ def load_json_bytes(raw: bytes, path: Path) -> dict[str, Any]:
     return value
 
 
+def parse_receipt_bytes(raw: bytes, label: str) -> dict[str, str]:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        fail(f"{label} is not UTF-8: {error}")
+    result: dict[str, str] = {}
+    for line_number, line in enumerate(lines, 1):
+        if "=" not in line:
+            fail(f"{label} line {line_number} is malformed")
+        key, value = line.split("=", 1)
+        if (
+            not re.fullmatch(r"[a-z][a-z0-9_]*", key)
+            or not value
+            or key in result
+        ):
+            fail(f"{label} line {line_number} is invalid or duplicate")
+        result[key] = value
+    if not result:
+        fail(f"{label} is empty")
+    return result
+
+
+def validate_gen4_apply_completion(
+    raw: bytes,
+    predecessor: dict[str, Any],
+    estate: Path,
+    backup: Path,
+    current: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Validate Gen4's APPLY receipt as Gen5 completion authority.
+
+    The embedded Gen3 recovery-completion values are immutable history only;
+    schema v4 binds and forwards the APPLY receipt digest, never that namespace.
+    """
+
+    if sha256_bytes(raw) != predecessor.get("apply_receipt_sha256"):
+        fail("Gen4 APPLY completion digest differs")
+    receipt = parse_receipt_bytes(raw, "Gen4 APPLY completion")
+    if set(receipt) != GEN4_APPLY_RECEIPT_FIELDS:
+        fail("Gen4 APPLY completion field set is not exact")
+    expected_values = {
+        "schema_version": "2",
+        "completion_state": "applied_ingress_closed",
+        "estate_root": str(estate),
+        "backup_dir": str(backup),
+        "cargo_gate": "passed",
+        "runtime_backup": "passed",
+        "closed_bracket": "passed",
+        "route_database_state": "absent",
+        "public_ipv4_ipv6_closed_status": "404",
+        "ingress_opened": "false",
+        "services_activated": "true",
+        "runtime_verified": "true",
+        "successor": "true",
+        "successor_armed_receipt": "SUCCESSOR-ARMED.receipt",
+        "predecessor_current_file": "PREDECESSOR-CURRENT.json",
+        "predecessor_completion_kind": RECOVERY_COMPLETION_KIND,
+        "predecessor_release_generation": "3",
+        "release_generation": "4",
+    }
+    for field, expected in expected_values.items():
+        if receipt[field] != expected:
+            if field in {"predecessor_release_generation", "release_generation"}:
+                fail("Gen4 APPLY completion generation linkage differs")
+            fail(f"Gen4 APPLY completion differs: {field}")
+    if not re.fullmatch(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", receipt["applied_at"]):
+        fail("Gen4 APPLY completion applied_at differs")
+    if not re.fullmatch(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", receipt["closed_verified_at"]):
+        fail("Gen4 APPLY completion closed_verified_at differs")
+    digest_fields = {
+        field for field in GEN4_APPLY_RECEIPT_FIELDS if field.endswith("_sha256")
+    }
+    for field in digest_fields:
+        require_hex(receipt[field], f"Gen4 APPLY completion {field}")
+    artifact_paths = {
+        "release_env_sha256": backup / "release.env",
+        "release_evidence_sha256": backup / "RELEASE-EVIDENCE.json",
+        "render_inputs_sha256": backup / "RENDER-INPUTS.sha256",
+        "apply_armed_receipt_sha256": backup / "APPLY-ARMED.receipt",
+        "control_sha256": backup / "CONTROL.sha256",
+        "transaction_sha256": backup / "estate/TRANSACTION.json",
+        "applied_targets_sha256": backup / "estate/APPLIED-TARGETS.sha256",
+        "successor_armed_receipt_sha256": backup / "SUCCESSOR-ARMED.receipt",
+        "runtime_backup_receipt_sha256": backup / "runtime/BACKUP.receipt",
+        "runtime_backup_manifest_sha256": backup / "runtime/SHA256SUMS",
+    }
+    for field, path in artifact_paths.items():
+        artifact = require_regular(path)
+        if sha256(artifact) != receipt[field]:
+            fail(f"Gen4 APPLY completion artifact differs: {field}")
+    if current is not None:
+        validated_current = validate_gen4_current(
+            current, estate=estate, backup=backup
+        )
+        require_gen4_current_apply_alignment(validated_current, receipt)
+        lineage_artifacts = {
+            "predecessor_current_sha256": backup / "PREDECESSOR-CURRENT.json",
+            "predecessor_completion_attestation_sha256": (
+                backup / RECOVERY_ATTESTATION_NAME
+            ),
+            "predecessor_completion_signature_sha256": (
+                backup / RECOVERY_SIGNATURE_NAME
+            ),
+            "predecessor_completion_public_key_sha256": (
+                backup / RECOVERY_PUBLIC_KEY_NAME
+            ),
+        }
+        for field, path in lineage_artifacts.items():
+            artifact = require_regular(path)
+            if sha256(artifact) != receipt[field]:
+                fail(f"Gen4 APPLY completion artifact differs: {field}")
+        predecessor_current_path = backup / receipt["predecessor_current_file"]
+        predecessor_current = load_json(predecessor_current_path)
+        predecessor_backup = require_directory(
+            Path(receipt["predecessor_backup_dir"]), private=True
+        )
+        predecessor_current_values: dict[str, object] = {
+            "schema_version": 2,
+            "state": "applied_ingress_closed",
+            "estate_root": str(estate),
+            "backup_dir": str(predecessor_backup),
+            "successor": True,
+            "predecessor_release_generation": 2,
+            "release_generation": 3,
+            "services_activated": True,
+            "runtime_verified": True,
+            "ingress_opened": False,
+        }
+        for field, expected in predecessor_current_values.items():
+            if predecessor_current.get(field) != expected:
+                fail(f"Gen4 PREDECESSOR-CURRENT differs: {field}")
+        predecessor_artifacts = {
+            "predecessor_control_sha256": predecessor_backup / "CONTROL.sha256",
+            "predecessor_release_evidence_sha256": (
+                predecessor_backup / "RELEASE-EVIDENCE.json"
+            ),
+            "predecessor_runtime_backup_receipt_sha256": (
+                predecessor_backup / "runtime/BACKUP.receipt"
+            ),
+            "predecessor_runtime_backup_manifest_sha256": (
+                predecessor_backup / "runtime/SHA256SUMS"
+            ),
+        }
+        predecessor_bytes: dict[str, bytes] = {}
+        for field, path in predecessor_artifacts.items():
+            artifact = require_regular(path)
+            raw_artifact = read_safe_regular(
+                artifact, f"Gen4 predecessor artifact {field}"
+            )
+            predecessor_bytes[field] = raw_artifact
+            if sha256_bytes(raw_artifact) != receipt[field]:
+                fail(f"Gen4 APPLY predecessor artifact differs: {field}")
+        for state_field, receipt_field in (
+            ("control_sha256", "predecessor_control_sha256"),
+            ("release_evidence_sha256", "predecessor_release_evidence_sha256"),
+        ):
+            if predecessor_current.get(state_field) != receipt[receipt_field]:
+                fail(f"Gen4 PREDECESSOR-CURRENT artifact differs: {state_field}")
+        verify_checksum_manifest(
+            predecessor_backup,
+            predecessor_backup / "CONTROL.sha256",
+            predecessor_bytes["predecessor_control_sha256"],
+        )
+        verify_checksum_manifest(
+            predecessor_backup / "runtime",
+            predecessor_backup / "runtime/SHA256SUMS",
+            predecessor_bytes["predecessor_runtime_backup_manifest_sha256"],
+        )
+    return receipt
+
+
 def exact_object(value: object, keys: set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
         fail(f"{label} field set is not exact")
@@ -176,6 +426,79 @@ def require_hex(value: object, label: str) -> str:
     if not isinstance(value, str) or not HEX64.fullmatch(value):
         fail(f"{label} must be lowercase SHA-256")
     return value
+
+
+def validate_gen4_current(
+    value: object,
+    *,
+    estate: Path | None = None,
+    backup: Path | None = None,
+) -> dict[str, Any]:
+    """Validate the one exact CURRENT contract emitted by Gen4.
+
+    This contract is intentionally independent from the Gen5 policy.  Gen5
+    may bind these immutable bytes, but it must not reinterpret their shape.
+    """
+
+    current = exact_object(value, GEN4_CURRENT_FIELDS, "Gen4 CURRENT")
+    expected_values: dict[str, object] = {
+        "schema_version": 2,
+        "state": "applied_ingress_closed",
+        "route_database_state": "absent",
+        "public_ipv4_ipv6_closed_status": 404,
+        "services_activated": True,
+        "runtime_verified": True,
+        "ingress_opened": False,
+        "successor": True,
+        "successor_armed_receipt": "SUCCESSOR-ARMED.receipt",
+        "predecessor_current_file": "PREDECESSOR-CURRENT.json",
+        "predecessor_completion_kind": RECOVERY_COMPLETION_KIND,
+        "predecessor_release_generation": 3,
+        "release_generation": 4,
+    }
+    if estate is not None:
+        expected_values["estate_root"] = str(estate)
+    if backup is not None:
+        expected_values["backup_dir"] = str(backup)
+    for field, expected in expected_values.items():
+        if current[field] != expected:
+            if field in {"predecessor_release_generation", "release_generation"}:
+                fail("Gen4 CURRENT generation linkage differs")
+            fail(f"Gen4 CURRENT differs: {field}")
+    if not re.fullmatch(
+        r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+        str(current["closed_verified_at"]),
+    ):
+        fail("Gen4 CURRENT closed_verified_at differs")
+    for field in GEN4_CURRENT_FIELDS:
+        if field.endswith("_sha256"):
+            require_hex(current[field], f"Gen4 CURRENT {field}")
+    for field in ("estate_root", "backup_dir", "predecessor_backup_dir"):
+        path = current[field]
+        if (
+            not isinstance(path, str)
+            or not Path(path).is_absolute()
+            or Path(path) == Path("/")
+        ):
+            fail(f"Gen4 CURRENT {field} is unsafe")
+    return current
+
+
+def require_gen4_current_apply_alignment(
+    current: dict[str, Any], receipt: dict[str, str]
+) -> None:
+    for field in GEN4_SHARED_COMPLETION_FIELDS:
+        observed: object = receipt[field]
+        expected: object = current[field]
+        if isinstance(expected, bool):
+            observed = observed == "true" if observed in {"true", "false"} else observed
+        elif isinstance(expected, int):
+            try:
+                observed = int(observed)
+            except ValueError:
+                pass
+        if observed != expected:
+            fail(f"Gen4 CURRENT/APPLY completion differs: {field}")
 
 
 def validate_completion_binding(value: object) -> dict[str, Any]:
@@ -391,7 +714,7 @@ def validate_static_asset_transition(
     }
     if policy_version == 1:
         valid_transition = changed_paths == set(sources)
-    elif policy_version in (2, 3):
+    elif policy_version in (2, 3, 4):
         valid_transition = changed_paths.issubset(sources)
     else:
         valid_transition = False
@@ -464,11 +787,9 @@ def validate_policy(path: Path) -> dict[str, Any]:
         or policy["ceremony"] != POLICY_CEREMONIES[policy_version]
     ):
         fail("successor policy version or ceremony differs")
-    predecessor_fields = (
-        RECOVERED_PREDECESSOR_FIELDS
-        if policy_version == 3
-        else LEGACY_PREDECESSOR_FIELDS
-    )
+    predecessor_fields = {
+        3: RECOVERED_PREDECESSOR_FIELDS,
+    }.get(policy_version, LEGACY_PREDECESSOR_FIELDS)
     predecessor = exact_object(
         policy["predecessor"], predecessor_fields, "predecessor policy"
     )
@@ -483,7 +804,7 @@ def validate_policy(path: Path) -> dict[str, Any]:
         "permission_catalog_sha256",
         "package_catalog_sha256",
     ]
-    if policy_version < 3:
+    if policy_version != 3:
         predecessor_hash_fields.append("apply_receipt_sha256")
     else:
         validate_completion_binding(predecessor["completion"])
@@ -500,10 +821,10 @@ def validate_policy(path: Path) -> dict[str, Any]:
     ):
         fail("legacy successor policy cannot bind a v2 predecessor")
     if (
-        policy_version == 3
+        policy_version in (3, 4)
         and predecessor["access_build_input_schema"] != BUILD_INPUT_V2
     ):
-        fail("recovered successor policy requires a v2 predecessor")
+        fail("modern successor policy requires a v2 predecessor")
     if not isinstance(predecessor["access_image"], str) or not IMAGE.fullmatch(
         predecessor["access_image"]
     ):
@@ -555,7 +876,7 @@ def validate_policy(path: Path) -> dict[str, Any]:
     if not isinstance(overlay, list) or (
         policy_version == 1 and len(overlay) != 7
     ) or (
-        policy_version in (2, 3)
+        policy_version in (2, 3, 4)
         and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
     ):
         fail("successor overlay size differs from its policy version")
@@ -579,7 +900,7 @@ def validate_policy(path: Path) -> dict[str, Any]:
         if entry["before_sha256"] is not None:
             require_hex(entry["before_sha256"], f"overlay {relative} before")
         require_hex(entry["after_sha256"], f"overlay {relative} after")
-    if policy_version in (2, 3) and paths != sorted(paths):
+    if policy_version in (2, 3, 4) and paths != sorted(paths):
         fail("successor overlay paths must be sorted")
     return policy
 
@@ -885,6 +1206,8 @@ def validate_predecessor(
     if sha256_bytes(state_raw) != predecessor["current_state_sha256"]:
         fail("CURRENT authority differs from the successor policy")
     state = load_json_bytes(state_raw, state_path)
+    if policy_version == 4:
+        state = validate_gen4_current(state)
     if (
         state.get("schema_version") != 2
         or state.get("state") != "applied_ingress_closed"
@@ -922,6 +1245,12 @@ def validate_predecessor(
         validate_predecessor_generation(
             state, predecessor["access_build_input_schema"]
         )
+        if policy_version == 4 and (
+            state.get("successor") is not True
+            or state.get("predecessor_release_generation") != 3
+            or state.get("release_generation") != 4
+        ):
+            fail("schema 4 predecessor generation linkage must be exactly 3 -> 4")
     estate = require_directory(estate_root)
     if Path(str(state.get("estate_root"))).resolve() != estate:
         fail("CURRENT estate root differs")
@@ -953,7 +1282,7 @@ def validate_predecessor(
             fail(f"predecessor authority differs: {key}")
     if state.get("control_sha256") != predecessor["control_sha256"]:
         fail("CURRENT control binding differs")
-    if policy_version < 3 and (
+    if policy_version != 3 and (
         state.get("apply_receipt_sha256") != predecessor["apply_receipt_sha256"]
     ):
         fail("CURRENT apply receipt binding differs")
@@ -969,6 +1298,22 @@ def validate_predecessor(
         backup / "runtime/SHA256SUMS",
         authority_bytes["runtime_manifest_sha256"],
     )
+    if policy_version == 4:
+        apply_completion = validate_gen4_apply_completion(
+            authority_bytes["apply_receipt_sha256"],
+            predecessor,
+            estate,
+            backup,
+            state,
+        )
+        for field in (
+            "predecessor_completion_kind",
+            "predecessor_completion_attestation_sha256",
+            "predecessor_completion_signature_sha256",
+            "predecessor_completion_public_key_sha256",
+        ):
+            if state.get(field) != apply_completion[field]:
+                fail(f"Gen4 CURRENT historical completion differs: {field}")
     recovery_completion: dict[str, Any] | None = None
     if policy_version == 3:
         assert recovery_completion_root is not None
@@ -1081,15 +1426,81 @@ def write_delta_manifest(stage_root: Path, policy: dict[str, Any]) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy", required=True, type=Path)
-    parser.add_argument("--current-state", required=True, type=Path)
-    parser.add_argument("--estate-root", required=True, type=Path)
-    parser.add_argument("--predecessor-candidate", required=True, type=Path)
-    parser.add_argument("--predecessor-stage", required=True, type=Path)
-    parser.add_argument("--successor-preimages", required=True, type=Path)
+    validation_mode = parser.add_mutually_exclusive_group()
+    validation_mode.add_argument("--validate-gen4-current", action="store_true")
+    validation_mode.add_argument("--validate-gen4-lineage", action="store_true")
+    parser.add_argument("--policy", type=Path)
+    parser.add_argument("--current-state", type=Path)
+    parser.add_argument("--estate-root", type=Path)
+    parser.add_argument("--predecessor-candidate", type=Path)
+    parser.add_argument("--predecessor-stage", type=Path)
+    parser.add_argument("--successor-preimages", type=Path)
     parser.add_argument("--recovery-completion-root", type=Path)
     args = parser.parse_args()
     try:
+        if args.validate_gen4_current or args.validate_gen4_lineage:
+            if (
+                args.current_state is None
+                or args.estate_root is None
+                or any(
+                    value is not None
+                    for value in (
+                        args.policy,
+                        args.predecessor_candidate,
+                        args.predecessor_stage,
+                        args.successor_preimages,
+                        args.recovery_completion_root,
+                    )
+                )
+            ):
+                parser.error(
+                    "Gen4 validation requires only --current-state and "
+                    "--estate-root"
+                )
+            current_path = args.current_state.absolute()
+            current = load_json(current_path)
+            validated_current = validate_gen4_current(
+                current,
+                estate=args.estate_root.absolute(),
+                backup=Path(str(current.get("backup_dir"))),
+            )
+            if args.validate_gen4_lineage:
+                backup = require_directory(
+                    Path(str(validated_current["backup_dir"])), private=True
+                )
+                apply_path = require_regular(backup / "APPLY.receipt")
+                validate_gen4_apply_completion(
+                    read_safe_regular(apply_path, "Gen4 APPLY completion"),
+                    {
+                        "apply_receipt_sha256": validated_current[
+                            "apply_receipt_sha256"
+                        ]
+                    },
+                    args.estate_root.absolute(),
+                    backup,
+                    validated_current,
+                )
+                print("Holdfast Gen4 CURRENT/APPLY lineage is valid")
+            else:
+                print("Holdfast Gen4 CURRENT exact contract is valid")
+            return 0
+        required = {
+            "--policy": args.policy,
+            "--current-state": args.current_state,
+            "--estate-root": args.estate_root,
+            "--predecessor-candidate": args.predecessor_candidate,
+            "--predecessor-stage": args.predecessor_stage,
+            "--successor-preimages": args.successor_preimages,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            parser.error(f"required arguments are missing: {', '.join(missing)}")
+        assert args.policy is not None
+        assert args.current_state is not None
+        assert args.estate_root is not None
+        assert args.predecessor_candidate is not None
+        assert args.predecessor_stage is not None
+        assert args.successor_preimages is not None
         validate_predecessor(
             policy_path=args.policy.absolute(),
             current_state_path=args.current_state.absolute(),

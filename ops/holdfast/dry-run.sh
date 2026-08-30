@@ -73,7 +73,7 @@ fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 successor_policy_schema=0
 if [[ "$successor" == true ]]; then
-  successor_policy_schema=$(jq -er '.schema_version | select(. == 1 or . == 2 or . == 3)' \
+  successor_policy_schema=$(jq -er '.schema_version | select(. == 1 or . == 2 or . == 3 or . == 4)' \
     "$script_dir/successor-policy.json")
   predecessor_validation_args=(
     --policy "$script_dir/successor-policy.json"
@@ -258,6 +258,8 @@ release_env_digest=$(sha256sum "$release_env" | cut -d' ' -f1)
       printf 'predecessor_completion_attestation_sha256=%s\n' "$(jq -er '.predecessor_binding.completion.attestation_sha256' "$output/stage/RELEASE-EVIDENCE.json")"
       printf 'predecessor_completion_signature_sha256=%s\n' "$(jq -er '.predecessor_binding.completion.signature_sha256' "$output/stage/RELEASE-EVIDENCE.json")"
       printf 'predecessor_completion_public_key_sha256=%s\n' "$(jq -er '.predecessor_binding.completion.public_key_sha256' "$output/stage/RELEASE-EVIDENCE.json")"
+    elif [[ "$successor_policy_schema" == "4" ]]; then
+      printf 'predecessor_apply_receipt_sha256=%s\n' "$(jq -er '.predecessor_binding.apply_receipt_sha256' "$output/stage/RELEASE-EVIDENCE.json")"
     fi
   else
     printf 'generator=%s\n' "$(tr -d '\n' <"$script_dir/GENERATOR_VERSION")"
