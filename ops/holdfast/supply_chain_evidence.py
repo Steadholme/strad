@@ -14,6 +14,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
+from urllib.parse import parse_qsl, urlsplit
 
 from successor_binding import validate_policy as validate_successor_policy
 from validate_release_evidence import BASE_RELEASE_KEYS, SUCCESSOR_RELEASE_KEYS
@@ -35,6 +36,28 @@ IMAGE_KEYS = (
     "VERDICT_IMAGE",
     "NEWAPI_IMAGE",
     "SLUICE_IMAGE",
+)
+FRESH_IMAGE_KEYS = (
+    "ACCESS_GOVERNANCE_IMAGE",
+    "STRAD_IMAGE",
+    "STRAD_ANALYZER_IMAGE",
+)
+ACCESS_COSIGN_PUBLIC_KEY_SHA256 = (
+    "425becc7b2ea1ef27f6103bfb5299c99b2d4e746c448680174bcb4a6cf9a8d40"
+)
+ACCESS_BUILDER_HOST = "w33d.xyz"
+ACCESS_BUILDER_PATH = "/holdfast/builders/local-root/v1"
+STRAD_COSIGN_IDENTITY = (
+    "https://github.com/Steadholme/strad/.github/workflows/"
+    "release.yml@refs/heads/main"
+)
+STRAD_COSIGN_ISSUER = "https://token.actions.githubusercontent.com"
+COSIGN_VERIFIER_IMAGE = (
+    "ghcr.io/sigstore/cosign/cosign@sha256:"
+    "6ca1127dc1e9ff19f3f2bfa214936813a86fbbf52919652eda49d393c888ad3c"
+)
+SIGSTORE_TRUSTED_ROOT_SHA256 = (
+    "844a1c6de3986c9f02070266b25e0d1a2fa99ceccc89f6b9ad90aae47b62a16e"
 )
 STATIC_LOCK_SHA256 = "32e3ea5103ff73c413062b17ad3bb4e7270fbcd6fd1325f6a7f3dc831bee83ef"
 SUCCESSOR_BUILD_INPUT_SCHEMA = "access-build-input/2"
@@ -170,6 +193,16 @@ def release_pins_sha256(values: dict[str, str]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def canonical_object_sha256(value: object) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def exact_keys(value: object, expected: set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != expected:
         fail(f"{label} field set is not exact")
@@ -209,7 +242,7 @@ def cosign_signature(
     common_fields = additional_fields or set()
     keyed_fields = common_fields | COSIGN_KEY_FIELDS
     if (
-        schema_version == 3
+        schema_version in (3, 4)
         and isinstance(value, dict)
         and set(value) == keyed_fields
     ):
@@ -222,9 +255,114 @@ def cosign_signature(
 
 
 def valid_rekor_log_index(value: object, schema_version: int) -> bool:
-    if schema_version == 3:
+    if schema_version in (3, 4):
         return type(value) is int and value >= 0
     return isinstance(value, int) and value >= 0
+
+
+def validate_access_builder_identity(
+    value: object, public_key_sha256: object
+) -> str:
+    key_digest = require_hex(public_key_sha256, "Access Cosign public key")
+    if key_digest != ACCESS_COSIGN_PUBLIC_KEY_SHA256 or not isinstance(value, str):
+        fail("Access builder identity does not bind the canonical Cosign key")
+    try:
+        parsed = urlsplit(value)
+        query = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+        port = parsed.port
+    except ValueError as error:
+        fail(f"Access builder identity is not canonical: {error}")
+    expected = (
+        f"https://{ACCESS_BUILDER_HOST}{ACCESS_BUILDER_PATH}"
+        f"?cosign-sha256={key_digest}"
+    )
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != ACCESS_BUILDER_HOST
+        or parsed.hostname != ACCESS_BUILDER_HOST
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path != ACCESS_BUILDER_PATH
+        or parsed.fragment
+        or query != [("cosign-sha256", key_digest)]
+        or value != expected
+    ):
+        fail("Access builder identity is not the canonical keyed authority")
+    return value
+
+
+def validate_schema4_fresh_signer_roles(images: dict[str, Any]) -> None:
+    access = images["ACCESS_GOVERNANCE_IMAGE"]
+    access_signature, access_keyed = cosign_signature(
+        access["signature"], "fresh Access signature", 4
+    )
+    if not access_keyed:
+        fail("fresh Access signature must use the canonical keyed authority")
+    if access_signature["public_key_sha256"] != ACCESS_COSIGN_PUBLIC_KEY_SHA256:
+        fail("fresh Access signature public key differs from the canonical authority")
+    access_provenance = access.get("provenance")
+    if not isinstance(access_provenance, dict):
+        fail("fresh Access provenance is absent")
+    validate_access_builder_identity(
+        access_provenance.get("builder_id"),
+        access_signature["public_key_sha256"],
+    )
+
+    for image_key in ("STRAD_IMAGE", "STRAD_ANALYZER_IMAGE"):
+        signature, keyed = cosign_signature(
+            images[image_key]["signature"], f"fresh {image_key} signature", 4
+        )
+        if keyed:
+            fail(f"fresh {image_key} signature must use the GitHub keyless authority")
+        if (
+            signature["identity"] != STRAD_COSIGN_IDENTITY
+            or signature["issuer"] != STRAD_COSIGN_ISSUER
+        ):
+            fail(f"fresh {image_key} signature authority differs from release workflow")
+
+
+def validate_schema4_registry_verifier(value: object) -> str:
+    if not isinstance(value, str):
+        fail("schema-v4 registry verifier identity is absent")
+    parts = value.split(";")
+    if len(parts) != 4 or parts[0] != "cosign-offline-oci-layout/v1":
+        fail("schema-v4 registry verifier shape differs")
+    fields: dict[str, str] = {}
+    for raw in parts[1:]:
+        if raw.count("=") != 1:
+            fail("schema-v4 registry verifier field is malformed")
+        key, field_value = raw.split("=", 1)
+        if not key or not field_value or key in fields:
+            fail("schema-v4 registry verifier field set differs")
+        fields[key] = field_value
+    if set(fields) != {
+        "image",
+        "trusted_root_sha256",
+        "strad_release_manifest_sha256",
+    }:
+        fail("schema-v4 registry verifier field set differs")
+    manifest_sha256 = require_hex(
+        fields["strad_release_manifest_sha256"],
+        "schema-v4 Strad release manifest",
+    )
+    expected = (
+        "cosign-offline-oci-layout/v1;"
+        f"image={COSIGN_VERIFIER_IMAGE};"
+        f"trusted_root_sha256={SIGSTORE_TRUSTED_ROOT_SHA256};"
+        f"strad_release_manifest_sha256={manifest_sha256}"
+    )
+    if (
+        fields["image"] != COSIGN_VERIFIER_IMAGE
+        or fields["trusted_root_sha256"] != SIGSTORE_TRUSTED_ROOT_SHA256
+        or value != expected
+    ):
+        fail("schema-v4 registry verifier authority differs")
+    return manifest_sha256
 
 
 def validate_waivers(
@@ -328,14 +466,16 @@ def validate_document(
         "analyzer_overlay",
         "access_candidate",
     }
-    if schema_version in (2, 3):
+    if schema_version in (2, 3, 4):
         expected_root.add("waivers")
-    if schema_version == 3:
+    if schema_version in (3, 4):
         expected_root.add("successor_binding")
+    if schema_version == 4:
+        expected_root.add("fresh_image_bindings")
     exact_keys(value, expected_root, "evidence")
     if (
         type(schema_version) is not int
-        or schema_version not in (1, 2, 3)
+        or schema_version not in (1, 2, 3, 4)
         or value["platform"] != "linux/amd64"
     ):
         fail("unsupported supply-chain schema or platform")
@@ -347,14 +487,19 @@ def validate_document(
         validate_waivers(
             value["waivers"], release, datetime.now(timezone.utc), schema_version
         )
-        if schema_version in (2, 3)
+        if schema_version in (2, 3, 4)
         else {}
     )
     consumed_waivers: set[tuple[str, str]] = set()
 
-    if schema_version == 3:
+    if schema_version in (3, 4):
         if successor_policy is None:
-            fail("schema 3 supply-chain evidence requires the successor policy")
+            fail(
+                f"schema {schema_version} supply-chain evidence requires "
+                "the matching successor policy"
+            )
+        if successor_policy.get("schema_version") != schema_version:
+            fail("supply-chain schema and successor-policy schema differ")
         predecessor_policy = successor_policy["predecessor"]
         successor_policy_value = successor_policy["successor"]
         successor_binding = exact_keys(
@@ -391,7 +536,12 @@ def validate_document(
     )
     if not isinstance(registry["verified_at"], str) or not registry["verified_at"].endswith("Z"):
         fail("registry verification timestamp is invalid")
-    if not isinstance(registry["verifier"], str) or len(registry["verifier"]) < 8:
+    schema4_manifest_sha256: str | None = None
+    if schema_version == 4:
+        schema4_manifest_sha256 = validate_schema4_registry_verifier(
+            registry["verifier"]
+        )
+    elif not isinstance(registry["verifier"], str) or len(registry["verifier"]) < 8:
         fail("registry verifier identity is absent")
     images = exact_keys(registry["images"], set(IMAGE_KEYS), "registry images")
     image_fields = {
@@ -484,7 +634,7 @@ def validate_document(
     ):
         fail("analyzer overlay revision differs from release")
 
-    if schema_version == 3:
+    if schema_version in (3, 4):
         access = exact_keys(
             value["access_candidate"],
             {
@@ -530,6 +680,65 @@ def validate_document(
         if access[key] != expected:
             fail(f"Access candidate build input differs: {key}")
 
+    if schema_version == 4:
+        validate_schema4_fresh_signer_roles(images)
+        fresh = exact_keys(
+            value["fresh_image_bindings"],
+            set(FRESH_IMAGE_KEYS),
+            "fresh image bindings",
+        )
+        access_binding = exact_keys(
+            fresh["ACCESS_GOVERNANCE_IMAGE"],
+            {
+                "record_sha256",
+                "build_input_sha256",
+                "candidate_receipt_sha256",
+            },
+            "fresh Access image binding",
+        )
+        if (
+            require_hex(
+                access_binding["record_sha256"],
+                "fresh Access registry record",
+            )
+            != canonical_object_sha256(images["ACCESS_GOVERNANCE_IMAGE"])
+            or access_binding["build_input_sha256"]
+            != release["ACCESS_GOVERNANCE_BUILD_INPUT_SHA256"]
+        ):
+            fail("fresh Access image binding differs")
+        require_hex(
+            access_binding["candidate_receipt_sha256"],
+            "fresh Access candidate receipt",
+        )
+
+        manifest_sha256: str | None = None
+        for image_key in ("STRAD_IMAGE", "STRAD_ANALYZER_IMAGE"):
+            binding = exact_keys(
+                fresh[image_key],
+                {
+                    "record_sha256",
+                    "source_revision",
+                    "release_manifest_sha256",
+                },
+                f"fresh {image_key} binding",
+            )
+            if (
+                require_hex(binding["record_sha256"], f"fresh {image_key} record")
+                != canonical_object_sha256(images[image_key])
+                or binding["source_revision"] != release["STRAD_REVISION"]
+            ):
+                fail(f"fresh {image_key} binding differs")
+            observed_manifest = require_hex(
+                binding["release_manifest_sha256"],
+                f"fresh {image_key} release manifest",
+            )
+            if manifest_sha256 is None:
+                manifest_sha256 = observed_manifest
+            elif observed_manifest != manifest_sha256:
+                fail("fresh Strad image bindings use different release manifests")
+        if manifest_sha256 != schema4_manifest_sha256:
+            fail("schema-v4 verifier and fresh Strad release manifest differ")
+
 
 def validate_local_binding(
     value: dict[str, Any],
@@ -548,7 +757,7 @@ def validate_local_binding(
         release_evidence = load_json(args.release_evidence)
         selected_keys = (
             SUCCESSOR_RELEASE_KEYS
-            if value.get("schema_version") == 3
+            if value.get("schema_version") in (3, 4)
             else BASE_RELEASE_KEYS
         )
         missing = sorted(selected_keys - set(release))
@@ -580,14 +789,14 @@ def validate_local_binding(
         for field, wanted in expected.items():
             if binding.get(field) != wanted:
                 fail(f"supply chain and RELEASE-EVIDENCE differ: {field}")
-        if value.get("schema_version") == 3:
+        if value.get("schema_version") in (3, 4):
             if (
                 release_evidence.get("schema_version") != 2
                 or release_evidence.get("release_mode") != "successor"
                 or release_evidence.get("access_governance_build_input_schema")
                 != SUCCESSOR_BUILD_INPUT_SCHEMA
             ):
-                fail("schema 3 supply chain requires successor RELEASE-EVIDENCE")
+                fail("successor supply chain requires successor RELEASE-EVIDENCE")
             if release_evidence.get("predecessor_binding") != value.get(
                 "successor_binding"
             ):
@@ -699,14 +908,14 @@ def main() -> int:
             if release.get(key) != observed:
                 fail(f"{key} differs from the release pin")
         successor_policy = None
-        if document.get("schema_version") == 3:
+        if document.get("schema_version") in (3, 4):
             if args.successor_policy is None:
-                fail("schema 3 supply-chain evidence requires --successor-policy")
+                fail("successor supply-chain evidence requires --successor-policy")
             successor_policy = validate_successor_policy(
                 args.successor_policy.absolute()
             )
         elif args.successor_policy is not None:
-            fail("--successor-policy is only valid for schema 3 evidence")
+            fail("--successor-policy is only valid for successor evidence")
         validate_document(
             document,
             release,

@@ -606,6 +606,15 @@ class SignedEvidenceTests(unittest.TestCase):
         policy = json.loads(
             (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
         )
+        policy["schema_version"] = 3
+        policy["ceremony"] = "holdfast-rikune-successor-v3"
+        policy["predecessor"].pop("apply_receipt_sha256")
+        policy["predecessor"]["completion"] = {
+            "kind": "recovery-completion-attestation-v1",
+            "attestation_sha256": "9" * 64,
+            "signature_sha256": "a" * 64,
+            "public_key_sha256": "b" * 64,
+        }
         predecessor = policy["predecessor"]
         successor = policy["successor"]
         release.update(
@@ -681,6 +690,13 @@ class SignedEvidenceTests(unittest.TestCase):
             canonical.encode("utf-8")
         ).hexdigest()
         return release, evidence, policy
+
+    def write_successor_policy(
+        self, policy: dict[str, object], label: str
+    ) -> Path:
+        path = self.root / f"successor-policy-{label}.json"
+        path.write_text(json.dumps(policy, sort_keys=True), encoding="utf-8")
+        return path
 
     def use_keyed_cosign(self, evidence: dict[str, object]) -> None:
         public_key_sha256 = sha256(self.public_key)
@@ -861,20 +877,21 @@ class SignedEvidenceTests(unittest.TestCase):
                 )
 
     def test_supply_chain_v3_accepts_exact_keyed_cosign_material(self) -> None:
-        release, evidence, _ = self.make_supply_v3_fixture()
+        release, evidence, policy = self.make_supply_v3_fixture()
         self.use_keyed_cosign(evidence)
+        policy_path = self.write_successor_policy(policy, "v3-keyed-cosign")
         valid = self.run_supply_fixture(
             release,
             evidence,
             "v3-keyed-cosign",
-            successor_policy=OPS_ROOT / "successor-policy.json",
+            successor_policy=policy_path,
         )
         self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
 
     def test_supply_chain_v3_rejects_malformed_keyed_cosign_material(self) -> None:
-        release, evidence, _ = self.make_supply_v3_fixture()
+        release, evidence, policy = self.make_supply_v3_fixture()
         self.use_keyed_cosign(evidence)
-        policy_path = OPS_ROOT / "successor-policy.json"
+        policy_path = self.write_successor_policy(policy, "v3-keyed-malformed")
         cases: list[tuple[str, dict[str, object], str]] = []
 
         registry_missing_hash = json.loads(json.dumps(evidence))
@@ -1004,7 +1021,7 @@ class SignedEvidenceTests(unittest.TestCase):
         self,
     ) -> None:
         release, evidence, policy = self.make_supply_v3_fixture()
-        policy_path = OPS_ROOT / "successor-policy.json"
+        policy_path = self.write_successor_policy(policy, "v3-valid")
         valid = self.run_supply_fixture(
             release,
             evidence,

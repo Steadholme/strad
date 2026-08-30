@@ -49,6 +49,16 @@ canonical `successor-policy.json`; it cannot be verified as schema v1/v2 or skip
 Schema v3 records keyless Cosign signatures as `identity` plus `issuer`, and key-based signatures as
 `mode=key` plus `public_key_sha256`; a key-based signature must not invent a Fulcio issuer.
 
+Schema v4 is the Gen5 form and is intentionally separate from schema v3. It binds the policy-v4
+predecessor `apply_receipt_sha256`, the exact Access candidate receipt, and fresh
+`ACCESS_GOVERNANCE_IMAGE`, `STRAD_IMAGE`, and `STRAD_ANALYZER_IMAGE` records. Every other image
+record is copied byte-for-byte from the signed predecessor evidence. Strad and analyzer must share
+the release manifest's exact `STRAD_REVISION`; Access must use the frozen Gen5 build-input digest.
+`assemble_supply_chain_v4.py` verifies root-owned private `cosign save` OCI layouts with the pinned
+offline Cosign image, including the image signature, GitHub provenance, BuildKit provenance, SBOM,
+platform, config labels, and OCI digest graph. It only writes unsigned evidence and an unsigned env;
+`finalize-env` accepts only a detached signature that passes the production validator.
+
 Keep `STRAD_DATABASE_URL`, bridge/file-server/NewAPI tokens, and all existing gateway/Verdict
 secrets in a separate mode-`0600` secret env. Evidence files contain only identities and hashes.
 
@@ -59,10 +69,14 @@ The first-apply renderer remains available for a new estate. An estate with an a
 mode-`0700`, versioned release directory; never overwrite or reuse an earlier candidate, dry-run,
 release env, or predecessor backup.
 
-Render from the sealed immediate predecessor plus the exact seven-file TASK-001 overlay, then
+Render from the sealed immediate predecessor plus the exact frozen policy-v4 overlay, then
 build and push from that immutable tree:
 
 ```sh
+set -euo pipefail
+umask 077
+release_dir=/secure/release/holdfast-successor-<release-id>
+install -d -o root -g root -m 0700 "$release_dir"
 ./candidate-source.sh \
   --successor \
   --estate-root /root/w33d_infra \
@@ -70,22 +84,231 @@ build and push from that immutable tree:
   --predecessor-candidate /secure/release/<sealed-predecessor>/rikune-candidate-source \
   --predecessor-stage /secure/release/<sealed-predecessor>/rikune-dry-run/stage \
   --release-tool-revision <clean-strad-head-commit> \
-  --output /secure/release/holdfast-successor-<release-id>/rikune-candidate-source
+  --output "$release_dir/rikune-candidate-source"
+```
 
+The Access signer, release signer, registry auth config, and any password source stay outside the
+release directory. The commands below pass only credential paths or environment-variable names;
+never put their values in the release tree, command line, or log. Before building, create the new
+release directory as root-owned mode `0700`, copy only the two public keys and pinned Sigstore
+trusted root into it as mode `0600`, and verify these frozen trust anchors:
+
+```sh
+set -euo pipefail
+umask 077
+release_dir=/secure/release/holdfast-successor-<release-id>
+previous_release=/secure/release/<sealed-predecessor>
+registry_auth=/root/.docker/config.json
+access_signing_key=/secure/authority/holdfast-cosign.key
+release_signing_key=/secure/authority/holdfast-release-authority.key
+cosign_image='ghcr.io/sigstore/cosign/cosign@sha256:6ca1127dc1e9ff19f3f2bfa214936813a86fbbf52919652eda49d393c888ad3c'
+
+install -d -o root -g root -m 0700 "$release_dir"
+install -o root -g root -m 0600 /secure/authority/holdfast-cosign.pub \
+  "$release_dir/holdfast-cosign.pub"
+install -o root -g root -m 0600 "$previous_release/SIGSTORE-TRUSTED-ROOT.json" \
+  "$release_dir/SIGSTORE-TRUSTED-ROOT.json"
+openssl pkey -in "$release_signing_key" -pubout \
+  -out "$release_dir/release-authority.pub"
+chmod 0600 "$release_dir/release-authority.pub"
+test "$(sha256sum "$release_dir/holdfast-cosign.pub" | cut -d' ' -f1)" = \
+  425becc7b2ea1ef27f6103bfb5299c99b2d4e746c448680174bcb4a6cf9a8d40
+test "$(sha256sum "$release_dir/SIGSTORE-TRUSTED-ROOT.json" | cut -d' ' -f1)" = \
+  844a1c6de3986c9f02070266b25e0d1a2fa99ceccc89f6b9ad90aae47b62a16e
+test "$(stat -c '%a:%U:%h' "$registry_auth")" = 600:root:1
+test "$(stat -c '%a:%U:%h' "$access_signing_key")" = 600:root:1
+test "$(stat -c '%a:%U:%h' "$release_signing_key")" = 600:root:1
+jq -e '.auths["registry.w33d.xyz"] | type == "object" and
+  (has("auth") or has("identitytoken"))' "$registry_auth" >/dev/null
+```
+
+Build and push only after substituting the verified Access public-key digest in the exact canonical
+builder URI:
+
+```sh
+set -euo pipefail
+export DOCKER_CONFIG="$(dirname "$registry_auth")"
 ./build-access-candidate.sh \
   --candidate-root /secure/release/holdfast-successor-<release-id>/rikune-candidate-source \
-  --image-tag registry.w33d.xyz/steadholme/access-governance:<release-id> \
-  --builder-id https://w33d.xyz/holdfast/builders/<stable-builder-id> \
+  --image-tag registry.w33d.xyz/steadholme/access-governance:holdfast-successor-<release-id> \
+  --builder-id 'https://w33d.xyz/holdfast/builders/local-root/v1?cosign-sha256=425becc7b2ea1ef27f6103bfb5299c99b2d4e746c448680174bcb4a6cf9a8d40' \
   --release-tool-revision <clean-strad-head-commit> \
   --metadata-file /secure/release/holdfast-successor-<release-id>/access-build.metadata.json \
   --receipt /secure/release/holdfast-successor-<release-id>/ACCESS-BUILD.receipt
 ```
 
-The build always pushes `linux/amd64` with BuildKit `mode=max` provenance, a required stable HTTPS
-builder identity, and SBOM, then records the immutable digest. Real registry attestation,
-image-signature, signer/issuer, and
-transparency-log evidence must be collected into schema-v3 `SUPPLY-CHAIN.json` and detached-signed
-off host before the full dry-run. The script does not invent or locally sign that evidence.
+The build always pushes `linux/amd64` with BuildKit `mode=max` provenance, the canonical HTTPS
+builder identity containing the exact Access public-key SHA-256, and SBOM, then records the
+immutable digest. Parse that digest exactly, sign it with the pinned Cosign container using the
+local Access key, upload both the timestamp and transparency-log entry, and immediately verify the
+same digest. `COSIGN_PASSWORD` may be injected into the shell, but its value must never be printed:
+
+```sh
+set -euo pipefail
+access_ref="$(sed -n 's/^image=//p' "$release_dir/ACCESS-BUILD.receipt")"
+test "$(grep -c '^image=' "$release_dir/ACCESS-BUILD.receipt")" -eq 1
+printf '%s\n' "$access_ref" | grep -Eq \
+  '^registry\.w33d\.xyz/steadholme/access-governance@sha256:[0-9a-f]{64}$'
+
+docker run --rm --pull=never --platform linux/amd64 --user 0:0 \
+  --env COSIGN_PASSWORD --env DOCKER_CONFIG=/cosign-auth \
+  --volume "$registry_auth:/cosign-auth/config.json:ro" \
+  --volume "$access_signing_key:/keys/holdfast-cosign.key:ro" \
+  --volume "$release_dir:/release" \
+  "$cosign_image" sign --yes --use-signing-config=true \
+  --trusted-root /release/SIGSTORE-TRUSTED-ROOT.json \
+  --key /keys/holdfast-cosign.key \
+  --bundle /release/ACCESS-CANDIDATE.image-signature.bundle.json \
+  "$access_ref"
+
+docker run --rm --pull=never --platform linux/amd64 --user 0:0 \
+  --env DOCKER_CONFIG=/cosign-auth \
+  --volume "$registry_auth:/cosign-auth/config.json:ro" \
+  --volume "$release_dir:/release:ro" \
+  "$cosign_image" verify --key /release/holdfast-cosign.pub \
+  --trusted-root /release/SIGSTORE-TRUSTED-ROOT.json \
+  --use-signed-timestamps "$access_ref"
+```
+
+Snapshot the exact registry-rendered Access provenance and SBOM wrappers for that same digest:
+
+```sh
+set -euo pipefail
+umask 077
+set -o noclobber
+export DOCKER_CONFIG="$(dirname "$registry_auth")"
+docker buildx imagetools inspect "$access_ref" \
+  --format '{{json .Provenance.SLSA}}' \
+  > "$release_dir/ACCESS-CANDIDATE.builder-provenance.predicate.json"
+docker buildx imagetools inspect "$access_ref" \
+  --format '{{json .Provenance}}' \
+  > "$release_dir/ACCESS-CANDIDATE.provenance.json"
+docker buildx imagetools inspect "$access_ref" \
+  --format '{{json .SBOM}}' \
+  > "$release_dir/ACCESS-CANDIDATE.sbom.json"
+chmod 0600 \
+  "$release_dir/ACCESS-CANDIDATE.builder-provenance.predicate.json" \
+  "$release_dir/ACCESS-CANDIDATE.provenance.json" \
+  "$release_dir/ACCESS-CANDIDATE.sbom.json"
+```
+
+The assembler rejects those snapshots unless they exactly match the BuildKit attestation blobs in
+the verified Access OCI layout. Obtain `release-images.json` and its Sigstore bundle from the
+successful `Release OCI images` workflow run whose `headSha` is the exact Gen5 Strad revision, and
+verify them against the already pinned trusted-root copy. Authenticate `gh` through its ordinary
+protected environment; do not print its token:
+
+```sh
+set -euo pipefail
+umask 077
+set -o noclobber
+gh run view <release-workflow-run-id> --repo Steadholme/strad \
+  --json headSha,headBranch,event,conclusion,workflowName \
+  > "$release_dir/release-workflow-run.json"
+jq -e --arg revision '<clean-strad-head-commit>' \
+  '.headSha == $revision and .headBranch == "main" and
+   .event == "workflow_dispatch" and .conclusion == "success" and
+   .workflowName == "Release OCI images"' \
+  "$release_dir/release-workflow-run.json"
+gh run download <release-workflow-run-id> --repo Steadholme/strad \
+  --name strad-oci-release-<clean-strad-head-commit> --dir "$release_dir"
+chmod 0600 "$release_dir/release-workflow-run.json" \
+  "$release_dir/release-images.json" \
+  "$release_dir/release-images.sha256" \
+  "$release_dir/release-images.sigstore.json"
+
+docker run --rm --pull=never --network none --platform linux/amd64 --user 0:0 \
+  --volume "$release_dir:/release:ro" \
+  "$cosign_image" verify-blob \
+  --bundle /release/release-images.sigstore.json \
+  --trusted-root /release/SIGSTORE-TRUSTED-ROOT.json \
+  --certificate-identity 'https://github.com/Steadholme/strad/.github/workflows/release.yml@refs/heads/main' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-sha <clean-strad-head-commit> \
+  --use-signed-timestamps /release/release-images.json
+
+strad_ref="$(jq -er '.images.STRAD_IMAGE' "$release_dir/release-images.json")"
+analyzer_ref="$(jq -er '.images.STRAD_ANALYZER_IMAGE' "$release_dir/release-images.json")"
+printf '%s\n' "$strad_ref" | grep -Eq \
+  '^ghcr\.io/steadholme/strad@sha256:[0-9a-f]{64}$'
+printf '%s\n' "$analyzer_ref" | grep -Eq \
+  '^ghcr\.io/steadholme/strad-analyzer@sha256:[0-9a-f]{64}$'
+```
+
+Only after those authorities pass, collect all three exact immutable references. Each `cosign save`
+uses the pinned container and the same protected registry-auth file; it must not use a mutable tag:
+
+```sh
+set -euo pipefail
+for layout in access.oci strad.oci strad-analyzer.oci; do
+  install -d -o root -g root -m 0700 "$release_dir/$layout"
+done
+docker run --rm --pull=never --platform linux/amd64 --user 0:0 \
+  --env DOCKER_CONFIG=/cosign-auth \
+  --volume "$registry_auth:/cosign-auth/config.json:ro" \
+  --volume "$release_dir/access.oci:/oci" \
+  "$cosign_image" save --dir /oci "$access_ref"
+docker run --rm --pull=never --platform linux/amd64 --user 0:0 \
+  --env DOCKER_CONFIG=/cosign-auth \
+  --volume "$registry_auth:/cosign-auth/config.json:ro" \
+  --volume "$release_dir/strad.oci:/oci" \
+  "$cosign_image" save --dir /oci "$strad_ref"
+docker run --rm --pull=never --platform linux/amd64 --user 0:0 \
+  --env DOCKER_CONFIG=/cosign-auth \
+  --volume "$registry_auth:/cosign-auth/config.json:ro" \
+  --volume "$release_dir/strad-analyzer.oci:/oci" \
+  "$cosign_image" save --dir /oci "$analyzer_ref"
+
+chown -R root:root "$release_dir/access.oci" "$release_dir/strad.oci" \
+  "$release_dir/strad-analyzer.oci"
+find "$release_dir/access.oci" "$release_dir/strad.oci" \
+  "$release_dir/strad-analyzer.oci" -type d -exec chmod 0700 {} +
+find "$release_dir/access.oci" "$release_dir/strad.oci" \
+  "$release_dir/strad-analyzer.oci" -type f -exec chmod 0600 {} +
+test -z "$(find "$release_dir/access.oci" "$release_dir/strad.oci" \
+  "$release_dir/strad-analyzer.oci" \( -type l -o -type f ! -links 1 \) -print -quit)"
+```
+
+The Access image signature above is distinct from the outer `SUPPLY-CHAIN.json` signature below.
+Once the three private OCI snapshots are normalized, assemble, externally sign, and finalize:
+
+```sh
+set -euo pipefail
+./assemble_supply_chain_v4.py build-evidence \
+  --previous-release-root /secure/release/<sealed-predecessor> \
+  --previous-successor-policy /secure/backups/<predecessor-backup>/successor-authority/successor-policy.json \
+  --current-state /var/lib/holdfast-rikune/CURRENT.json \
+  --estate-root /root/w33d_infra \
+  --release-root /secure/release/holdfast-successor-<release-id> \
+  --candidate-root /secure/release/holdfast-successor-<release-id>/rikune-candidate-source \
+  --successor-policy /root/w33d_infra/strad/ops/holdfast/successor-policy.json \
+  --strad-revision <clean-strad-head-commit> \
+  --release-tool-revision <clean-strad-head-commit> \
+  --issued-at <RFC3339-UTC> \
+  --access-oci-layout /secure/release/holdfast-successor-<release-id>/access.oci \
+  --strad-oci-layout /secure/release/holdfast-successor-<release-id>/strad.oci \
+  --strad-analyzer-oci-layout /secure/release/holdfast-successor-<release-id>/strad-analyzer.oci \
+  --strad-release-manifest /secure/release/holdfast-successor-<release-id>/release-images.json \
+  --strad-release-bundle /secure/release/holdfast-successor-<release-id>/release-images.sigstore.json \
+  --access-cosign-public-key /secure/release/holdfast-successor-<release-id>/holdfast-cosign.pub \
+  --sigstore-trusted-root /secure/release/holdfast-successor-<release-id>/SIGSTORE-TRUSTED-ROOT.json \
+  --supply-chain-public-key /secure/release/holdfast-successor-<release-id>/release-authority.pub \
+  --output-release-env /secure/release/holdfast-successor-<release-id>/rikune.release.env.unsigned \
+  --output-evidence /secure/release/holdfast-successor-<release-id>/SUPPLY-CHAIN.json
+
+openssl dgst -sha256 -sign "$release_signing_key" \
+  -out /secure/release/holdfast-successor-<release-id>/SUPPLY-CHAIN.sig \
+  /secure/release/holdfast-successor-<release-id>/SUPPLY-CHAIN.json
+
+./assemble_supply_chain_v4.py finalize-env \
+  --release-root /secure/release/holdfast-successor-<release-id> \
+  --unsigned-release-env /secure/release/holdfast-successor-<release-id>/rikune.release.env.unsigned \
+  --evidence /secure/release/holdfast-successor-<release-id>/SUPPLY-CHAIN.json \
+  --signature /secure/release/holdfast-successor-<release-id>/SUPPLY-CHAIN.sig \
+  --public-key /secure/release/holdfast-successor-<release-id>/release-authority.pub \
+  --successor-policy /root/w33d_infra/strad/ops/holdfast/successor-policy.json \
+  --output-release-env /secure/release/holdfast-successor-<release-id>/rikune.release.env
+```
 
 Then run the full gate. There is no `--skip-cargo` option; every production receipt records
 `cargo_gate=passed`, and `apply.sh` rejects a missing or altered gate.
