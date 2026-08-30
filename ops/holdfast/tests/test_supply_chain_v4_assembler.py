@@ -36,6 +36,11 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         source_root = self.root / "sources"
         source_root.mkdir(mode=0o700)
+        self.successor_policy = source_root / "successor-policy.json"
+        self.successor_policy.write_bytes(
+            (OPS_ROOT / "successor-policy.json").read_bytes()
+        )
+        self.successor_policy.chmod(0o644)
         self.dockerfile = source_root / "Dockerfile.analyzer"
         self.dockerfile.write_bytes(
             (REPOSITORY_ROOT / "Dockerfile.analyzer").read_bytes()
@@ -46,9 +51,7 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
             (REPOSITORY_ROOT / "bridge/package-lock.json").read_bytes()
         )
         self.bridge_lock.chmod(0o644)
-        self.policy = json.loads(
-            (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
-        )
+        self.policy = json.loads(self.successor_policy.read_text(encoding="utf-8"))
         self.revision = "c" * 40
         self.issued_at = (
             datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=1)
@@ -584,8 +587,10 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
         estate = self.root / "estate"
         estate.mkdir(mode=0o700)
 
+        backups_root = Path("/secure/backups")
+        backups_root.mkdir(parents=True, mode=0o700, exist_ok=True)
         with tempfile.TemporaryDirectory(
-            prefix="holdfast-rikune-test-", dir="/secure/backups"
+            prefix="holdfast-rikune-test-", dir=backups_root
         ) as backup_name:
             backup = Path(backup_name)
             backup.chmod(0o700)
@@ -988,7 +993,7 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
             evidence=evidence,
             signature=invalid_signature,
             public_key=public_key,
-            successor_policy=OPS_ROOT / "successor-policy.json",
+            successor_policy=self.successor_policy,
             dockerfile=self.dockerfile,
             bridge_lock=self.bridge_lock,
             output_release_env=destination,
@@ -1103,7 +1108,7 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
             evidence=evidence,
             signature=signature,
             public_key=public_key,
-            successor_policy=OPS_ROOT / "successor-policy.json",
+            successor_policy=self.successor_policy,
             dockerfile=self.dockerfile,
             bridge_lock=self.bridge_lock,
             output_release_env=destination,
