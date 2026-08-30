@@ -864,7 +864,7 @@ def read_verified_supply_chain_bundle(
         signature_path, "supply-chain signature", maximum_size=65_536
     )
     public_key = read_safe_bytes(
-        public_key_path, "supply-chain public key", maximum_size=65_536
+        public_key_path, "supply-chain verification authority", maximum_size=65_536
     )
     pins = {
         "SUPPLY_CHAIN_EVIDENCE_SHA256": hashlib.sha256(evidence).hexdigest(),
@@ -883,7 +883,7 @@ def verify_signature(evidence: Path, signature: Path, public_key: Path) -> None:
         signature, "supply-chain signature", maximum_size=65_536
     )
     public_key_raw = read_safe_bytes(
-        public_key, "supply-chain public key", maximum_size=65_536
+        public_key, "supply-chain verification authority", maximum_size=65_536
     )
     verify_signature_bytes(evidence_raw, signature_raw, public_key_raw)
 
