@@ -34,6 +34,18 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
             prefix="holdfast-supply-v4-test-", dir="/root"
         )
         self.root = Path(self.temp.name)
+        source_root = self.root / "sources"
+        source_root.mkdir(mode=0o700)
+        self.dockerfile = source_root / "Dockerfile.analyzer"
+        self.dockerfile.write_bytes(
+            (REPOSITORY_ROOT / "Dockerfile.analyzer").read_bytes()
+        )
+        self.dockerfile.chmod(0o644)
+        self.bridge_lock = source_root / "bridge-package-lock.json"
+        self.bridge_lock.write_bytes(
+            (REPOSITORY_ROOT / "bridge/package-lock.json").read_bytes()
+        )
+        self.bridge_lock.chmod(0o644)
         self.policy = json.loads(
             (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
         )
@@ -339,6 +351,8 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
                 f"{validator.SIGSTORE_TRUSTED_ROOT_SHA256};"
                 f"strad_release_manifest_sha256={'f' * 64}"
             ),
+            dockerfile=self.dockerfile,
+            bridge_lock=self.bridge_lock,
         )
 
     def test_positive_assembly_binds_three_fresh_records_and_carries_others(self) -> None:
@@ -579,10 +593,8 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
                 backup / "successor-authority/successor-policy.json"
             )
             previous_policy_raw = assembler.json_bytes(self.policy)
-            dockerfile_raw = (REPOSITORY_ROOT / "Dockerfile.analyzer").read_bytes()
-            bridge_lock_raw = (
-                REPOSITORY_ROOT / "bridge/package-lock.json"
-            ).read_bytes()
+            dockerfile_raw = self.dockerfile.read_bytes()
+            bridge_lock_raw = self.bridge_lock.read_bytes()
             for path, raw in (
                 (backup / "release.env", authentic["release_env"]),
                 (
@@ -977,8 +989,8 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
             signature=invalid_signature,
             public_key=public_key,
             successor_policy=OPS_ROOT / "successor-policy.json",
-            dockerfile=REPOSITORY_ROOT / "Dockerfile.analyzer",
-            bridge_lock=REPOSITORY_ROOT / "bridge/package-lock.json",
+            dockerfile=self.dockerfile,
+            bridge_lock=self.bridge_lock,
             output_release_env=destination,
         )
         real_run = subprocess.run
@@ -1092,8 +1104,8 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
             signature=signature,
             public_key=public_key,
             successor_policy=OPS_ROOT / "successor-policy.json",
-            dockerfile=REPOSITORY_ROOT / "Dockerfile.analyzer",
-            bridge_lock=REPOSITORY_ROOT / "bridge/package-lock.json",
+            dockerfile=self.dockerfile,
+            bridge_lock=self.bridge_lock,
             output_release_env=destination,
         )
         real_run = subprocess.run
