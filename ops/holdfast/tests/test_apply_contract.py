@@ -325,8 +325,11 @@ class ApplyContractTests(unittest.TestCase):
         recovery_refreeze = script.index(
             'RECOVERY-COMPLETION-ATTESTATION.json', snapshot_freeze
         )
+        gen5_recovery_refreeze = script.index(
+            ".predecessor_binding.recovery_completion", recovery_refreeze
+        )
         root_refreeze = script.index(
-            'chmod 0700 -- "$snapshot_candidate"', recovery_refreeze
+            'chmod 0700 -- "$snapshot_candidate"', gen5_recovery_refreeze
         )
         semantic_verify = script.index("--expected-mode successor-catalog")
         docker_build = script.index("docker buildx build")
@@ -334,7 +337,8 @@ class ApplyContractTests(unittest.TestCase):
         self.assertLess(snapshot_copy, ignored_debris_guard)
         self.assertLess(ignored_debris_guard, snapshot_freeze)
         self.assertLess(snapshot_freeze, recovery_refreeze)
-        self.assertLess(recovery_refreeze, root_refreeze)
+        self.assertLess(recovery_refreeze, gen5_recovery_refreeze)
+        self.assertLess(gen5_recovery_refreeze, root_refreeze)
         self.assertLess(root_refreeze, semantic_verify)
         self.assertLess(semantic_verify, docker_build)
         self.assertIn("trap cleanup_snapshot EXIT", script)
@@ -342,6 +346,9 @@ class ApplyContractTests(unittest.TestCase):
         self.assertIn('require_control_file "$evidence"', script)
         self.assertIn('require_control_file "$targets"', script)
         self.assertIn('require_control_file "$render_inputs"', script)
+        self.assertIn("[.archive,.receipt,.armed_receipt,.failure_receipt][]", script)
+        self.assertIn('"${#recovery_completion_files[@]}" -eq 4', script)
+        self.assertIn("snapshotted Gen5 recovery completion authority", script)
         for ignored_name in (
             ".git",
             ".workflow",

@@ -154,6 +154,29 @@ for recovery_file in RECOVERY-COMPLETION-ATTESTATION.json \
     chmod 0600 -- "$snapshot_candidate/$recovery_file"
   fi
 done
+if jq -e '.predecessor_binding.recovery_completion? != null' \
+  "$snapshot_candidate/RELEASE-EVIDENCE.json" >/dev/null; then
+  mapfile -t recovery_completion_files < <(
+    jq -er \
+      '.predecessor_binding.recovery_completion |
+       [.archive,.receipt,.armed_receipt,.failure_receipt][]' \
+      "$snapshot_candidate/RELEASE-EVIDENCE.json"
+  )
+  [[ "${#recovery_completion_files[@]}" -eq 4 ]] || {
+    echo "snapshotted Gen5 recovery completion file set is not exact" >&2
+    exit 1
+  }
+  for recovery_file in "${recovery_completion_files[@]}"; do
+    [[ "$recovery_file" == "${recovery_file##*/}" && \
+       "$recovery_file" =~ ^APPLY-[A-Z0-9][A-Z0-9._-]{0,199}$ ]] || {
+      echo "snapshotted Gen5 recovery completion filename is invalid" >&2
+      exit 1
+    }
+    require_control_file \
+      "$snapshot_candidate/$recovery_file" "snapshotted Gen5 recovery completion authority"
+    chmod 0600 -- "$snapshot_candidate/$recovery_file"
+  done
+fi
 find "$snapshot_candidate" -mindepth 1 -type d -exec chmod 0500 -- {} +
 chmod 0700 -- "$snapshot_candidate"
 
