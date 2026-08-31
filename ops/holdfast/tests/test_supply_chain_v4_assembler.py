@@ -14,6 +14,9 @@ from unittest import mock
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = OPS_ROOT.parents[1]
+SCHEMA4_POLICY_FIXTURE = Path(__file__).with_name("fixtures") / (
+    "successor-policy-v4.json"
+)
 
 import sys
 
@@ -38,7 +41,7 @@ class SupplyChainV4AssemblerTests(unittest.TestCase):
         source_root.mkdir(mode=0o700)
         self.successor_policy = source_root / "successor-policy.json"
         self.successor_policy.write_bytes(
-            (OPS_ROOT / "successor-policy.json").read_bytes()
+            SCHEMA4_POLICY_FIXTURE.read_bytes()
         )
         self.successor_policy.chmod(0o644)
         self.dockerfile = source_root / "Dockerfile.analyzer"

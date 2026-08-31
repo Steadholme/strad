@@ -27,11 +27,14 @@ from successor_binding import (
     MAX_SUCCESSOR_OVERLAY_PATHS,
     POLICY_CEREMONIES,
     SUCCESSOR_STATIC_ASSET_SOURCES,
+    read_gen5_recovery_completion_artifacts,
     read_recovery_completion_bundle,
+    require_same_gen5_recovery_completion_snapshot,
     require_same_recovery_completion_snapshot,
     validate_predecessor,
     validate_static_asset_transition,
     validate_supporting_snapshot,
+    write_gen5_recovery_completion_bundle,
     write_recovery_completion_bundle,
     write_delta_manifest,
 )
@@ -456,7 +459,7 @@ def copy_successor_stage(
         or not isinstance(overlay, list)
         or (policy_version == 1 and len(overlay) != 7)
         or (
-            policy_version in (2, 3, 4)
+            policy_version in (2, 3, 4, 5)
             and (not overlay or len(overlay) > MAX_SUCCESSOR_OVERLAY_PATHS)
         )
     ):
@@ -485,7 +488,7 @@ def copy_successor_stage(
         shutil.copy2(source, destination)
         if sha256_file(destination) != raw.get("after_sha256"):
             fail(f"successor overlay copy differs: {relative}")
-    if policy_version in (2, 3, 4) and overlay_paths != sorted(overlay_paths):
+    if policy_version in (2, 3, 4, 5) and overlay_paths != sorted(overlay_paths):
         fail("successor overlay path order differs")
 
     static_asset_sources = validate_static_asset_transition(
@@ -543,6 +546,19 @@ def copy_successor_stage(
             fail("schema 3 successor policy lacks recovery completion binding")
         write_recovery_completion_bundle(
             stage_root, predecessor["completion"], recovery_completion
+        )
+    elif policy_version == 5:
+        if recovery_completion is None:
+            fail("schema 5 successor stage lacks Gen5 recovery completion authority")
+        predecessor = policy.get("predecessor")
+        if not isinstance(predecessor, dict) or not isinstance(
+            predecessor.get("recovery_completion"), dict
+        ):
+            fail("schema 5 successor policy lacks recovery completion binding")
+        write_gen5_recovery_completion_bundle(
+            stage_root,
+            predecessor["recovery_completion"],
+            recovery_completion,
         )
     elif recovery_completion is not None:
         fail("legacy successor stage must not contain recovery completion authority")
@@ -1585,7 +1601,7 @@ def validate_successor_release(
     for key, value in expected.items():
         if release.get(key) != value:
             fail(f"successor release pin differs from its policy: {key}")
-    if policy.get("schema_version") == 4 and release.get(
+    if policy.get("schema_version") in (4, 5) and release.get(
         "ACCESS_GOVERNANCE_IMAGE"
     ) == predecessor.get("access_image"):
         fail("schema 4 Access candidate must advance beyond its rollback image")
@@ -1909,6 +1925,17 @@ def validate_final_recovery_completion(
     require_same_recovery_completion_snapshot(initial, staged)
 
 
+def validate_final_gen5_recovery_completion(
+    stage_root: Path,
+    completion: dict[str, object],
+    initial: dict[str, object],
+    final: dict[str, object],
+) -> None:
+    require_same_gen5_recovery_completion_snapshot(initial, final)
+    staged = read_gen5_recovery_completion_artifacts(stage_root, completion)
+    require_same_gen5_recovery_completion_snapshot(initial, staged)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--estate-root", required=True, type=Path)
@@ -2142,15 +2169,29 @@ def main() -> int:
                 final_policy.get("predecessor"), dict
             ):
                 fail("final successor policy snapshot is invalid")
-            completion = final_policy["predecessor"].get("completion")
+            policy_version = final_policy.get("schema_version")
+            binding_field = (
+                "completion" if policy_version == 3 else "recovery_completion"
+            )
+            completion = final_policy["predecessor"].get(binding_field)
             if not isinstance(completion, dict):
                 fail("final recovery completion binding is invalid")
-            validate_final_recovery_completion(
-                stage_root,
-                completion,
-                initial_completion,
-                final_completion,
-            )
+            if policy_version == 3:
+                validate_final_recovery_completion(
+                    stage_root,
+                    completion,
+                    initial_completion,
+                    final_completion,
+                )
+            elif policy_version == 5:
+                validate_final_gen5_recovery_completion(
+                    stage_root,
+                    completion,
+                    initial_completion,
+                    final_completion,
+                )
+            else:
+                fail("recovery completion snapshot is invalid for policy schema")
         validate_final_successor_authority(
             OPS_ROOT,
             stage_root,

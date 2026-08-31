@@ -359,13 +359,13 @@ class ApplyContractTests(unittest.TestCase):
             ),
         )
 
-    def test_schema_v4_access_candidate_uses_bounded_overlay_and_current_build_tool(
+    def test_schema_v5_access_candidate_uses_bounded_overlay_and_current_build_tool(
         self,
     ) -> None:
         policy = json.loads(
             (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(policy["schema_version"], 4)
+        self.assertEqual(policy["schema_version"], 5)
         self.assertTrue(policy["overlay"])
         self.assertLessEqual(len(policy["overlay"]), 64)
         self.assertNotEqual(
@@ -1126,6 +1126,7 @@ class ApplyContractTests(unittest.TestCase):
             + "predecessor_completion_attestation_sha=\n"
             + "predecessor_completion_signature_sha=\n"
             + "predecessor_completion_public_key_sha=\n"
+            + "predecessor_recovery_completion_json='{}'\n"
             + "predecessor_release_sha=$(printf release | sha256sum | cut -d' ' -f1)\n"
             + "predecessor_runtime_receipt_sha=$(printf runtime-receipt | sha256sum | cut -d' ' -f1)\n"
             + "predecessor_runtime_manifest_sha=$(printf runtime-manifest | sha256sum | cut -d' ' -f1)\n"
@@ -1503,6 +1504,11 @@ class ApplyContractTests(unittest.TestCase):
         self.assertLess(snapshot, full_render)
         self.assertIn(
             'recovery_completion_root="$recovery_completion_snapshot"', dry_run
+        )
+        self.assertIn(
+            '"$successor_policy_schema" == "3" || \\\n'
+            '    "$successor_policy_schema" == "5"',
+            dry_run,
         )
         for field in (
             "predecessor_completion_kind",
@@ -2092,6 +2098,7 @@ class ApplyContractTests(unittest.TestCase):
             + "  esac\n"
             + "}\n"
             + "successor=true\n"
+            + "predecessor_recovery_completion_json='{}'\n"
             + "backup=$1\n"
             + "pointer_under_test=$2\n"
             + "tamper_mode=$3\n"
@@ -2566,7 +2573,7 @@ class ApplyContractTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(state.read_bytes(), original_state)
 
-    def test_successor_receipt_lineage_selects_exact_v3_or_apply_namespace(
+    def test_successor_receipt_lineage_selects_exact_v3_v5_or_apply_namespace(
         self,
     ) -> None:
         script = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
@@ -2577,9 +2584,13 @@ class ApplyContractTests(unittest.TestCase):
         self.assertLess(evidence_line, policy_line)
         self.assertLess(policy_line, predecessor_line)
         append_function = shell_function(script, "append_successor_receipt_fields")
+        append_v5_function = shell_function(
+            script, "append_v5_recovery_completion_receipt_fields"
+        )
         harness = self.root / "append-successor-lineage.sh"
         harness.write_text(
             "#!/usr/bin/env bash\nset -euo pipefail\n"
+            f"{append_v5_function}\n"
             f"{append_function}\n"
             "successor=true\n"
             "successor_armed_sha=aa\n"
@@ -2591,6 +2602,15 @@ class ApplyContractTests(unittest.TestCase):
             "predecessor_completion_attestation_sha=ee\n"
             "predecessor_completion_signature_sha=ff\n"
             "predecessor_completion_public_key_sha=11\n"
+            "predecessor_recovery_completion_kind=holdfast-rikune-recovery-resume-completion-v1\n"
+            "predecessor_recovery_completion_archive=APPLY-RECOVERY-COMPLETE-attempt.json\n"
+            "predecessor_recovery_completion_archive_sha=55\n"
+            "predecessor_recovery_completion_receipt=APPLY-RECOVERY-COMPLETE-attempt.receipt\n"
+            "predecessor_recovery_completion_receipt_sha=66\n"
+            "predecessor_recovery_completion_armed_receipt=APPLY-RECOVERY-ARMED-attempt.receipt\n"
+            "predecessor_recovery_completion_armed_receipt_sha=77\n"
+            "predecessor_recovery_completion_failure_receipt=APPLY-ACTIVATION-FAILED-attempt.receipt\n"
+            "predecessor_recovery_completion_failure_receipt_sha=88\n"
             "predecessor_release_sha=22\n"
             "predecessor_runtime_receipt_sha=33\n"
             "predecessor_runtime_manifest_sha=44\n"
@@ -2645,6 +2665,28 @@ class ApplyContractTests(unittest.TestCase):
         ).stdout
         self.assertEqual(schema4, legacy)
         self.assertNotIn("predecessor_completion_", schema4)
+        schema5 = subprocess.run(
+            ["bash", str(harness), "5"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        self.assertNotIn("predecessor_apply_receipt_sha256", schema5)
+        self.assertNotIn("predecessor_completion_", schema5)
+        self.assertIn(
+            "predecessor_recovery_completion_kind="
+            "holdfast-rikune-recovery-resume-completion-v1\n",
+            schema5,
+        )
+        self.assertIn(
+            "predecessor_recovery_completion_archive="
+            "APPLY-RECOVERY-COMPLETE-attempt.json\n",
+            schema5,
+        )
+        self.assertIn(
+            "predecessor_recovery_completion_failure_receipt_sha256=88\n",
+            schema5,
+        )
         self.assertNotIn("access_candidate_tool_revision", script)
 
         apply_receipt_start = script.index('apply_receipt_tmp="$backup/.APPLY.receipt.$$"')
@@ -2666,6 +2708,77 @@ class ApplyContractTests(unittest.TestCase):
         self.assertLess(frozen_runtime, runtime_receipt)
         self.assertLess(runtime_receipt, runtime_manifest)
         self.assertLess(runtime_manifest, frozen_end)
+
+    def test_schema_v5_apply_consumes_recovered_gen5_without_ordinary_apply(
+        self,
+    ) -> None:
+        apply_source = (OPS_ROOT / "apply.sh").read_text(encoding="utf-8")
+        dry_run_source = (OPS_ROOT / "dry-run.sh").read_text(encoding="utf-8")
+        self.assertIn("holdfast-rikune-recovery-resume-completion-v1", apply_source)
+        self.assertIn("--validate-gen5-lineage", apply_source)
+        self.assertIn("--recovery-completion-root", apply_source)
+        self.assertIn("persist_v5_recovery_completion_authority", apply_source)
+        self.assertIn(".predecessor_binding.recovery_completion", apply_source)
+        self.assertIn('"$successor_policy_schema" == "5"', apply_source)
+        self.assertIn(
+            "release_generation=$((predecessor_generation + 1))", apply_source
+        )
+        self.assertIn("recovered predecessor must not contain APPLY.receipt", apply_source)
+        for field in (
+            "predecessor_recovery_completion_archive",
+            "predecessor_recovery_completion_receipt",
+            "predecessor_recovery_completion_armed_receipt",
+            "predecessor_recovery_completion_failure_receipt",
+        ):
+            self.assertIn(field, apply_source)
+            self.assertIn(field, dry_run_source)
+        self.assertIn(
+            'elif [[ "$successor_policy_schema" == "5" ]]', dry_run_source
+        )
+
+    def test_schema_v5_dry_run_passes_recovery_root_to_actual_render_call(
+        self,
+    ) -> None:
+        source = (OPS_ROOT / "dry-run.sh").read_text(encoding="utf-8")
+        start = source.index("render_args=(")
+        invocation = 'python3 "$script_dir/render.py" "${render_args[@]}"'
+        end = source.index(invocation, start) + len(invocation)
+        render_block = source[start:end]
+        harness = self.root / "dry-run-render-args.sh"
+        harness.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            "python3() { printf '%s\\n' \"$@\"; }\n"
+            "script_dir=/ops/holdfast\n"
+            "estate_root=/estate\n"
+            "output=/dry-run\n"
+            "release_env=/dry-run/inputs/release.env\n"
+            "secret_env=/dry-run/inputs/secret.env\n"
+            "successor=true\n"
+            "current_state=/state/CURRENT.json\n"
+            "predecessor_candidate=/candidate\n"
+            "predecessor_stage=/predecessor-stage\n"
+            "recovery_completion_root=/state/recovery-completion\n"
+            "successor_policy_schema=$1\n"
+            f"{render_block}\n",
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+        schema5 = subprocess.run(
+            ["bash", str(harness), "5"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.splitlines()
+        self.assertEqual(schema5[0], "/ops/holdfast/render.py")
+        recovery_index = schema5.index("--recovery-completion-root")
+        self.assertEqual(schema5[recovery_index + 1], "/state/recovery-completion")
+        schema4 = subprocess.run(
+            ["bash", str(harness), "4"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.splitlines()
+        self.assertNotIn("--recovery-completion-root", schema4)
 
 
 if __name__ == "__main__":

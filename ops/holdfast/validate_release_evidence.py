@@ -180,10 +180,12 @@ def validate_successor_evidence(
         fail("successor release-tool revision differs from the release pin")
     if release.get("ACCESS_GOVERNANCE_ROLLBACK_IMAGE") != predecessor["access_image"]:
         fail("successor rollback image is not the immediate predecessor candidate")
-    if policy_version == 4 and release.get(
+    if policy_version in (4, 5) and release.get(
         "ACCESS_GOVERNANCE_IMAGE"
     ) == release.get("ACCESS_GOVERNANCE_ROLLBACK_IMAGE"):
-        fail("schema 4 Access candidate and rollback images must differ")
+        fail(
+            f"schema {policy_version} Access candidate and rollback images must differ"
+        )
     semantic_release_fields = {
         "access_governance_build_input_sha256": "ACCESS_GOVERNANCE_BUILD_INPUT_SHA256",
         "permission_catalog_sha256": "PERMISSION_CATALOG_SHA256",

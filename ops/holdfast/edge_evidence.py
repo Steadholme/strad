@@ -129,7 +129,9 @@ def verify_signature(evidence: Path, signature: Path, public_key: Path, values: 
         fail("detached edge evidence signature verification failed")
 
 
-def validate_frozen_contract(args: argparse.Namespace) -> tuple[str, str | None]:
+def validate_frozen_contract(
+    args: argparse.Namespace,
+) -> tuple[str, str | None, int | None]:
     release_value = load(args.release_evidence)
     is_successor = (
         release_value.get("schema_version") == 2
@@ -138,15 +140,16 @@ def validate_frozen_contract(args: argparse.Namespace) -> tuple[str, str | None]
     if not is_successor:
         if args.successor_policy is not None:
             fail("legacy edge evidence must not claim successor policy authority")
-        return LEGACY_CONTRACT, None
+        return LEGACY_CONTRACT, None, None
     if args.successor_policy is None:
         fail("successor edge evidence requires its frozen successor policy")
     policy = validate_policy(args.successor_policy)
     if release_value.get("predecessor_binding") != policy["predecessor"]:
         fail("release evidence differs from the frozen successor policy")
-    if policy["schema_version"] == 4:
-        return DUAL_HOST_CONTRACT, sha256(args.successor_policy)
-    return LEGACY_CONTRACT, sha256(args.successor_policy)
+    policy_version = policy["schema_version"]
+    if policy_version in (4, 5):
+        return DUAL_HOST_CONTRACT, sha256(args.successor_policy), policy_version + 1
+    return LEGACY_CONTRACT, sha256(args.successor_policy), None
 
 
 def validate_edge_identity(
@@ -249,6 +252,7 @@ def validate_legacy_prepare_receipt(
 
 def validate_dual_prepare_receipt(
     path: Path,
+    expected_generation: int,
 ) -> tuple[dict[str, str], datetime]:
     values = receipt(path)
     required = {
@@ -272,7 +276,7 @@ def validate_dual_prepare_receipt(
         fail("dual-host open prepare receipt field set is not exact")
     if (
         values["schema_version"] != "3"
-        or values["release_generation"] != "5"
+        or values["release_generation"] != str(expected_generation)
         or values["route_state"] != ROUTE_STATE
         or values["public_host"] != PUBLIC_HOST
         or values["legacy_public_host"] != LEGACY_PUBLIC_HOST
@@ -343,14 +347,17 @@ def validate_preopen(
     args: argparse.Namespace,
     contract: str,
     policy_sha: str | None,
+    release_generation: int | None,
 ) -> None:
     validate_document_shape(value, "preopen", contract, policy_sha)
     if args.open_evidence is None or args.prepare_receipt is None:
         fail("pre-open validation requires open evidence and prepare receipt")
     open_value = load(args.open_evidence)
     if contract == DUAL_HOST_CONTRACT:
+        if release_generation is None:
+            fail("dual-host pre-open lacks frozen release generation authority")
         prepare_value, prepared_at = validate_dual_prepare_receipt(
-            args.prepare_receipt
+            args.prepare_receipt, release_generation
         )
         expected_urls = {PUBLIC_URL, LEGACY_PUBLIC_URL}
     else:
@@ -546,9 +553,15 @@ def main() -> int:
     try:
         values = release(args.release_env)
         verify_signature(args.evidence, args.signature, args.public_key, values)
-        contract, policy_sha = validate_frozen_contract(args)
+        contract, policy_sha, release_generation = validate_frozen_contract(args)
         if args.mode == "preopen":
-            validate_preopen(load(args.evidence), args, contract, policy_sha)
+            validate_preopen(
+                load(args.evidence),
+                args,
+                contract,
+                policy_sha,
+                release_generation,
+            )
             success = f"signed edge pre-open evidence is valid for {contract}"
         else:
             validate_rollback(load(args.evidence), args, contract, policy_sha)

@@ -920,6 +920,7 @@ class RollbackLifecycleTests(unittest.TestCase):
         policy_predecessor = policy["predecessor"]
         assert isinstance(policy_predecessor, dict)
         policy_predecessor.pop("apply_receipt_sha256", None)
+        policy_predecessor.pop("recovery_completion", None)
         policy["predecessor"].update(
             {
                 "current_state_sha256": predecessor_current_sha,
@@ -1553,6 +1554,37 @@ class RollbackLifecycleTests(unittest.TestCase):
         self.assertIn('"$successor_policy_version" == "4"', source)
         self.assertIn("predecessor_apply_receipt_sha256", source)
         self.assertNotIn("access_candidate_tool_revision", source)
+
+    def test_schema_v5_rollback_revalidates_frozen_producer_completion(
+        self,
+    ) -> None:
+        source = (OPS_ROOT / "rollback.sh").read_text(encoding="utf-8")
+        start = source.index("load_recovered_successor_v5_authority()")
+        end = source.index("\nload_successor_authority()", start)
+        loader = source[start:end]
+        self.assertIn("holdfast-rikune-recovery-resume-completion-v1", source)
+        self.assertIn("--validate-gen5-lineage", loader)
+        self.assertIn("--recovery-completion-root", loader)
+        self.assertIn("schema-v5 recovered predecessor contains ordinary APPLY.receipt", loader)
+        self.assertNotIn(
+            'holdfast_sha256 "$predecessor_backup/APPLY.receipt"', loader
+        )
+        self.assertIn('predecessor_generation" == "5"', loader)
+        self.assertIn('release_generation" == "6"', loader)
+        self.assertIn(".predecessor_binding.recovery_completion", loader)
+        self.assertIn("validate_v5_recovery_completion_lineage", loader)
+        self.assertIn("validate_successor_completion_namespace", loader)
+        self.assertIn("append_v5_recovery_completion_lineage", source)
+        self.assertIn(
+            '"$backup_successor_policy_version" == "5"', source
+        )
+        for field in (
+            "predecessor_recovery_completion_archive",
+            "predecessor_recovery_completion_receipt",
+            "predecessor_recovery_completion_armed_receipt",
+            "predecessor_recovery_completion_failure_receipt",
+        ):
+            self.assertIn(f'"$backup/${field}"', source)
 
     def test_rollback_closed_contract_names_active_and_legacy_hosts(self) -> None:
         source = (OPS_ROOT / "rollback.sh").read_text(encoding="utf-8")

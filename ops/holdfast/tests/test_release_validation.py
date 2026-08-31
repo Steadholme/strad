@@ -220,13 +220,13 @@ class AnalyzerImageBindingTests(unittest.TestCase):
         )
         validate_release_evidence.validate_evidence(self.successor_evidence())
 
-    def test_schema_v4_advances_access_candidate_with_current_tool_revision(
+    def test_schema_v5_advances_access_candidate_with_current_tool_revision(
         self,
     ) -> None:
         policy = json.loads(
             (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(policy["schema_version"], 4)
+        self.assertEqual(policy["schema_version"], 5)
         evidence = self.successor_evidence()
         release = evidence["release"]
         predecessor = policy["predecessor"]
@@ -354,7 +354,7 @@ class AnalyzerImageBindingTests(unittest.TestCase):
         policy["schema_version"] = 3
         policy["ceremony"] = "holdfast-rikune-successor-v3"
         predecessor = policy["predecessor"]
-        predecessor.pop("apply_receipt_sha256")
+        predecessor.pop("recovery_completion")
         predecessor["completion"] = {
             "kind": "recovery-completion-attestation-v1",
             "attestation_sha256": "a" * 64,
@@ -387,6 +387,22 @@ class AnalyzerImageBindingTests(unittest.TestCase):
             ] = "d" * 64
             with self.assertRaisesRegex(ValueError, "frozen policy"):
                 validate_release_evidence.validate_evidence(tampered, policy_path)
+
+    def test_schema_v5_preserves_gen5_recovery_completion_exactly(self) -> None:
+        policy = json.loads(
+            (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
+        )
+        evidence = self.successor_evidence()
+        self.assertEqual(
+            evidence["predecessor_binding"]["recovery_completion"],
+            policy["predecessor"]["recovery_completion"],
+        )
+        tampered = copy.deepcopy(evidence)
+        tampered["predecessor_binding"]["recovery_completion"][
+            "receipt_sha256"
+        ] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "frozen policy"):
+            validate_release_evidence.validate_evidence(tampered)
 
 
 if __name__ == "__main__":

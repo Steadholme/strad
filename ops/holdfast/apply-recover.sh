@@ -461,6 +461,31 @@ validate_successor_completion_namespace() {
       [[ "$count" == "0" ]] || \
         holdfast_die "schema-v4 successor CONTROL contains predecessor completion authority"
       ;;
+    5)
+      load_v5_recovery_completion_authority "$policy"
+      for relative in "${completion_names[@]}"; do
+        [[ ! -e "$backup/$relative" && ! -L "$backup/$relative" ]] || \
+          holdfast_die "schema-v5 successor backup contains signed completion authority: $relative"
+      done
+      count=$(grep -Ec \
+        '[[:space:]][[:space:]]RECOVERY-COMPLETION-ATTESTATION\.(json|sig|pub)$' \
+        "$backup/CONTROL.sha256" || true)
+      [[ "$count" == "0" ]] || \
+        holdfast_die "schema-v5 successor CONTROL contains signed completion authority"
+      while IFS=$'\t' read -r relative expected; do
+        require_root_file "$backup/$relative"
+        [[ "$(holdfast_sha256 "$backup/$relative")" == "$expected" ]] || \
+          holdfast_die "schema-v5 recovery completion artifact differs: $relative"
+        count=$(grep -Fxc "$expected  $relative" "$backup/CONTROL.sha256" || true)
+        [[ "$count" == "1" ]] || \
+          holdfast_die "schema-v5 successor CONTROL does not exactly bind $relative"
+      done <<EOF
+$predecessor_recovery_completion_archive	$predecessor_recovery_completion_archive_sha
+$predecessor_recovery_completion_receipt	$predecessor_recovery_completion_receipt_sha
+$predecessor_recovery_completion_armed_receipt	$predecessor_recovery_completion_armed_receipt_sha
+$predecessor_recovery_completion_failure_receipt	$predecessor_recovery_completion_failure_receipt_sha
+EOF
+      ;;
     *) holdfast_die "successor policy schema is unsupported" ;;
   esac
 }
@@ -512,6 +537,19 @@ validate_v3_partial_backup_namespace() {
         RECOVERY-COMPLETION-ATTESTATION.pub RECOVERY-COMPLETION-ATTESTATION.sig; do
         [[ ! -e "$backup/$relative" && ! -L "$backup/$relative" ]] || \
           holdfast_die "partial schema-v4 backup contains predecessor completion authority: $relative"
+      done
+      ;;
+    5)
+      load_v5_recovery_completion_authority \
+        "$backup/successor-authority/successor-policy.json"
+      root_entries["$predecessor_recovery_completion_archive"]=1
+      root_entries["$predecessor_recovery_completion_receipt"]=1
+      root_entries["$predecessor_recovery_completion_armed_receipt"]=1
+      root_entries["$predecessor_recovery_completion_failure_receipt"]=1
+      for relative in RECOVERY-COMPLETION-ATTESTATION.json \
+        RECOVERY-COMPLETION-ATTESTATION.pub RECOVERY-COMPLETION-ATTESTATION.sig; do
+        [[ ! -e "$backup/$relative" && ! -L "$backup/$relative" ]] || \
+          holdfast_die "partial schema-v5 backup contains signed completion authority: $relative"
       done
       ;;
     *) holdfast_die "partial successor policy schema is unsupported" ;;
@@ -606,6 +644,19 @@ derive_backup_successor_mode() {
         jq -e '.ceremony == "holdfast-rikune-successor-v4"' \
           "$backup/successor-authority/successor-policy.json" >/dev/null || \
           holdfast_die "partial schema-v4 successor policy ceremony differs"
+        ;;
+      5)
+        jq -e '.ceremony == "holdfast-rikune-successor-v5"' \
+          "$backup/successor-authority/successor-policy.json" >/dev/null || \
+          holdfast_die "partial schema-v5 successor policy ceremony differs"
+        load_v5_recovery_completion_authority \
+          "$backup/successor-authority/successor-policy.json"
+        for relative in "$predecessor_recovery_completion_archive" \
+          "$predecessor_recovery_completion_receipt" \
+          "$predecessor_recovery_completion_armed_receipt" \
+          "$predecessor_recovery_completion_failure_receipt"; do
+          require_root_file "$backup/$relative"
+        done
         ;;
       *) holdfast_die "partial successor policy schema is unsupported" ;;
     esac
@@ -726,6 +777,16 @@ predecessor_completion_kind=""
 predecessor_completion_attestation_sha=""
 predecessor_completion_signature_sha=""
 predecessor_completion_public_key_sha=""
+predecessor_recovery_completion_kind=""
+predecessor_recovery_completion_archive=""
+predecessor_recovery_completion_archive_sha=""
+predecessor_recovery_completion_receipt=""
+predecessor_recovery_completion_receipt_sha=""
+predecessor_recovery_completion_armed_receipt=""
+predecessor_recovery_completion_armed_receipt_sha=""
+predecessor_recovery_completion_failure_receipt=""
+predecessor_recovery_completion_failure_receipt_sha=""
+predecessor_recovery_completion_json='{}'
 
 validate_v3_completion_receipt_namespace() {
   local receipt=$1 observed
@@ -743,6 +804,136 @@ validate_no_predecessor_completion_namespace() {
     holdfast_die "schema-v4 artifact contains predecessor completion authority: $artifact"
 }
 
+load_v5_recovery_completion_authority() {
+  local policy=$1 values value
+  values=$(jq -er '
+    .predecessor.recovery_completion |
+    select(keys == ["archive","archive_sha256","armed_receipt","armed_receipt_sha256","failure_receipt","failure_receipt_sha256","kind","receipt","receipt_sha256"]) |
+    [.kind,.archive,.archive_sha256,.receipt,.receipt_sha256,
+     .armed_receipt,.armed_receipt_sha256,.failure_receipt,
+     .failure_receipt_sha256] | @tsv
+  ' "$policy") || holdfast_die "schema-v5 policy lacks exact recovery completion authority"
+  IFS=$'\t' read -r predecessor_recovery_completion_kind \
+    predecessor_recovery_completion_archive \
+    predecessor_recovery_completion_archive_sha \
+    predecessor_recovery_completion_receipt \
+    predecessor_recovery_completion_receipt_sha \
+    predecessor_recovery_completion_armed_receipt \
+    predecessor_recovery_completion_armed_receipt_sha \
+    predecessor_recovery_completion_failure_receipt \
+    predecessor_recovery_completion_failure_receipt_sha <<<"$values"
+  [[ "$predecessor_recovery_completion_kind" == \
+    "holdfast-rikune-recovery-resume-completion-v1" ]] || \
+    holdfast_die "schema-v5 recovery completion kind differs"
+  for value in "$predecessor_recovery_completion_archive" \
+    "$predecessor_recovery_completion_receipt" \
+    "$predecessor_recovery_completion_armed_receipt" \
+    "$predecessor_recovery_completion_failure_receipt"; do
+    [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || \
+      holdfast_die "schema-v5 recovery completion filename is unsafe"
+  done
+  for value in "$predecessor_recovery_completion_archive_sha" \
+    "$predecessor_recovery_completion_receipt_sha" \
+    "$predecessor_recovery_completion_armed_receipt_sha" \
+    "$predecessor_recovery_completion_failure_receipt_sha"; do
+    [[ "$value" =~ ^[0-9a-f]{64}$ ]] || \
+      holdfast_die "schema-v5 recovery completion digest is invalid"
+  done
+  predecessor_recovery_completion_json=$(jq -cn \
+    --arg kind "$predecessor_recovery_completion_kind" \
+    --arg archive "$predecessor_recovery_completion_archive" \
+    --arg archive_sha "$predecessor_recovery_completion_archive_sha" \
+    --arg receipt "$predecessor_recovery_completion_receipt" \
+    --arg receipt_sha "$predecessor_recovery_completion_receipt_sha" \
+    --arg armed "$predecessor_recovery_completion_armed_receipt" \
+    --arg armed_sha "$predecessor_recovery_completion_armed_receipt_sha" \
+    --arg failure "$predecessor_recovery_completion_failure_receipt" \
+    --arg failure_sha "$predecessor_recovery_completion_failure_receipt_sha" '
+    {
+      predecessor_recovery_completion_kind:$kind,
+      predecessor_recovery_completion_archive:$archive,
+      predecessor_recovery_completion_archive_sha256:$archive_sha,
+      predecessor_recovery_completion_receipt:$receipt,
+      predecessor_recovery_completion_receipt_sha256:$receipt_sha,
+      predecessor_recovery_completion_armed_receipt:$armed,
+      predecessor_recovery_completion_armed_receipt_sha256:$armed_sha,
+      predecessor_recovery_completion_failure_receipt:$failure,
+      predecessor_recovery_completion_failure_receipt_sha256:$failure_sha
+    }
+  ')
+}
+
+append_v5_recovery_completion_lineage() {
+  [[ "$successor_recovery" == "true" && "$successor_policy_version" == "5" ]] || return 0
+  jq -r 'to_entries[] | "\(.key)=\(.value)"' \
+    <<<"$predecessor_recovery_completion_json"
+}
+
+validate_v5_recovery_completion_namespace() {
+  local artifact=$1 observed expected
+  require_root_file "$artifact"
+  observed=$(awk -F= '
+    $1 ~ /^predecessor_recovery_completion_/ { print $1 }
+  ' "$artifact" | sort)
+  expected=$(jq -r 'keys[]' <<<"$predecessor_recovery_completion_json" | sort)
+  [[ "$observed" == "$expected" ]] || \
+    holdfast_die "schema-v5 recovery completion namespace differs: $artifact"
+}
+
+validate_v5_recovery_completion_lineage() {
+  local artifact=$1 expected key value
+  validate_v5_recovery_completion_namespace "$artifact"
+  while IFS= read -r expected; do
+    key=${expected%%=*}
+    value=${expected#*=}
+    [[ "$(holdfast_receipt_value "$artifact" "$key")" == "$value" ]] || \
+      holdfast_die "schema-v5 recovery completion lineage differs: $key"
+  done < <(append_v5_recovery_completion_lineage)
+  ! grep -Eq '^predecessor_apply_receipt_sha256=' "$artifact" || \
+    holdfast_die "schema-v5 lineage contains ordinary APPLY authority"
+  ! grep -Eq '^predecessor_completion_' "$artifact" || \
+    holdfast_die "schema-v5 lineage contains signed completion authority"
+}
+
+validate_v5_recovery_completion_evidence() {
+  local evidence=$1
+  require_root_file "$evidence"
+  jq -e \
+    --arg kind "$predecessor_recovery_completion_kind" \
+    --arg archive "$predecessor_recovery_completion_archive" \
+    --arg archive_sha "$predecessor_recovery_completion_archive_sha" \
+    --arg receipt "$predecessor_recovery_completion_receipt" \
+    --arg receipt_sha "$predecessor_recovery_completion_receipt_sha" \
+    --arg armed "$predecessor_recovery_completion_armed_receipt" \
+    --arg armed_sha "$predecessor_recovery_completion_armed_receipt_sha" \
+    --arg failure "$predecessor_recovery_completion_failure_receipt" \
+    --arg failure_sha "$predecessor_recovery_completion_failure_receipt_sha" '
+    .predecessor_binding.recovery_completion == {
+      kind:$kind,archive:$archive,archive_sha256:$archive_sha,
+      receipt:$receipt,receipt_sha256:$receipt_sha,
+      armed_receipt:$armed,armed_receipt_sha256:$armed_sha,
+      failure_receipt:$failure,failure_receipt_sha256:$failure_sha
+    } and
+    (.predecessor_binding | has("apply_receipt_sha256") | not) and
+    (.predecessor_binding | has("completion") | not)
+  ' "$evidence" >/dev/null || \
+    holdfast_die "schema-v5 RELEASE-EVIDENCE recovery completion differs"
+}
+
+validate_v5_recovery_completion_artifacts() {
+  local root=$1 relative expected
+  while IFS=$'\t' read -r relative expected; do
+    require_root_file "$root/$relative"
+    [[ "$(holdfast_sha256 "$root/$relative")" == "$expected" ]] || \
+      holdfast_die "schema-v5 recovery completion artifact differs: $relative"
+  done <<EOF
+$predecessor_recovery_completion_archive	$predecessor_recovery_completion_archive_sha
+$predecessor_recovery_completion_receipt	$predecessor_recovery_completion_receipt_sha
+$predecessor_recovery_completion_armed_receipt	$predecessor_recovery_completion_armed_receipt_sha
+$predecessor_recovery_completion_failure_receipt	$predecessor_recovery_completion_failure_receipt_sha
+EOF
+}
+
 validate_recovery_route_contract() {
   local receipt=$1 label=$2 schema expected key value
   schema=$(holdfast_receipt_value "$receipt" schema_version)
@@ -755,8 +946,8 @@ validate_recovery_route_contract() {
   done
   case "$schema" in
     2)
-      [[ "$successor_policy_version" != "4" ]] || \
-        holdfast_die "$label schema-v2 route contract is invalid for schema-v4 successor policy"
+      [[ "$successor_policy_version" != "4" && "$successor_policy_version" != "5" ]] || \
+        holdfast_die "$label schema-v2 route contract is invalid for advanced successor policy"
       [[ "$(holdfast_receipt_value "$receipt" public_host)" == \
         "analyze.w33d.xyz" ]] || \
         holdfast_die "$label schema-v2 public host differs"
@@ -767,8 +958,8 @@ validate_recovery_route_contract() {
       ;;
     3)
       [[ "$successor_recovery" == "true" && \
-        "$successor_policy_version" == "4" ]] || \
-        holdfast_die "$label schema-v3 route contract lacks schema-v4 successor authority"
+        ( "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ) ]] || \
+        holdfast_die "$label schema-v3 route contract lacks advanced successor authority"
       for expected in \
         "route_conflict_cleanup=same-name-or-rikune-root-or-analyze-host" \
         "public_host=rikune.w33d.xyz" \
@@ -788,7 +979,7 @@ validate_recovery_route_contract() {
 
 recovery_receipt_schema_version() {
   if [[ "$successor_recovery" == "true" && \
-    "$successor_policy_version" == "4" ]]; then
+    ( "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ) ]]; then
     printf '3\n'
   else
     printf '2\n'
@@ -1300,6 +1491,95 @@ validate_recovered_successor_authority() {
   fi
 }
 
+load_recovered_successor_v5_authority() {
+  local pointer=$1 policy=$2 expected key value pointer_sha
+  pointer_sha=$(holdfast_sha256 "$pointer")
+  load_v5_recovery_completion_authority "$policy"
+  validate_v5_recovery_completion_artifacts "$backup"
+  predecessor_backup=$(jq -er '.backup_dir' "$predecessor_current_file")
+  holdfast_require_absolute "$predecessor_backup"
+  require_canonical_root_dir "$predecessor_backup"
+  [[ ! -e "$predecessor_backup/APPLY.receipt" && \
+    ! -L "$predecessor_backup/APPLY.receipt" ]] || \
+    holdfast_die "schema-v5 recovered predecessor contains ordinary APPLY.receipt"
+  python3 "$script_dir/successor_binding.py" \
+    --validate-gen5-lineage \
+    --policy "$policy" \
+    --current-state "$predecessor_current_file" \
+    --estate-root "$estate_root" \
+    --recovery-completion-root "$backup" || \
+    holdfast_die "schema-v5 predecessor recovery lineage differs"
+  predecessor_control_sha=$(holdfast_sha256 "$predecessor_backup/CONTROL.sha256")
+  predecessor_apply_sha=""
+  predecessor_release_sha=$(holdfast_sha256 "$predecessor_backup/RELEASE-EVIDENCE.json")
+  predecessor_runtime_receipt_sha=$(holdfast_sha256 "$predecessor_backup/runtime/BACKUP.receipt")
+  predecessor_runtime_manifest_sha=$(holdfast_sha256 "$predecessor_backup/runtime/SHA256SUMS")
+  predecessor_generation=$(jq -er '.release_generation' "$predecessor_current_file")
+  release_generation=$(holdfast_receipt_value "$successor_armed_receipt" release_generation)
+  [[ "$predecessor_generation" == "5" && "$release_generation" == "6" ]] || \
+    holdfast_die "schema-v5 successor recovery generation linkage is not exact 5 -> 6"
+  [[ "$(holdfast_receipt_value "$successor_armed_receipt" successor_policy_sha256)" == \
+    "$(holdfast_sha256 "$policy")" ]] || \
+    holdfast_die "schema-v5 successor recovery arm points to another policy"
+  for expected in \
+    "schema_version=1" "successor_backup_dir=$backup" \
+    "predecessor_current_file=PREDECESSOR-CURRENT.json" \
+    "predecessor_current_sha256=$predecessor_current_sha" \
+    "predecessor_backup_dir=$predecessor_backup" \
+    "predecessor_control_sha256=$predecessor_control_sha" \
+    "predecessor_release_evidence_sha256=$predecessor_release_sha" \
+    "predecessor_runtime_backup_receipt_sha256=$predecessor_runtime_receipt_sha" \
+    "predecessor_runtime_backup_manifest_sha256=$predecessor_runtime_manifest_sha" \
+    "predecessor_release_generation=5" "release_generation=6" \
+    "route_database_state=absent" "public_ipv4_ipv6_closed_status=404" \
+    "predecessor_runtime_verified=true" "ingress_opened=false"; do
+    key=${expected%%=*}
+    value=${expected#*=}
+    [[ "$(holdfast_receipt_value "$successor_armed_receipt" "$key")" == "$value" ]] || \
+      holdfast_die "schema-v5 successor recovery arm differs: $key"
+  done
+  validate_v5_recovery_completion_lineage "$successor_armed_receipt"
+  validate_v5_recovery_completion_lineage "$backup/DRY-RUN.receipt"
+  validate_v5_recovery_completion_lineage \
+    "$backup/RUNTIME-BACKUP-CALLER-ARMED.receipt"
+  if [[ -f "$backup/APPLY-ARMED.receipt" && ! -L "$backup/APPLY-ARMED.receipt" ]]; then
+    validate_v5_recovery_completion_lineage "$backup/APPLY-ARMED.receipt"
+  fi
+  validate_v5_recovery_completion_evidence "$backup/RELEASE-EVIDENCE.json"
+  jq -e \
+    --arg successor_sha "$successor_armed_sha" \
+    --arg predecessor_sha "$predecessor_current_sha" \
+    --arg predecessor_backup "$predecessor_backup" \
+    --arg predecessor_control "$predecessor_control_sha" \
+    --arg predecessor_release "$predecessor_release_sha" \
+    --arg predecessor_runtime_receipt "$predecessor_runtime_receipt_sha" \
+    --arg predecessor_runtime_manifest "$predecessor_runtime_manifest_sha" \
+    --argjson lineage "$predecessor_recovery_completion_json" '
+    .successor == true and
+    .successor_armed_receipt == "SUCCESSOR-ARMED.receipt" and
+    .successor_armed_receipt_sha256 == $successor_sha and
+    .predecessor_current_file == "PREDECESSOR-CURRENT.json" and
+    .predecessor_current_sha256 == $predecessor_sha and
+    .predecessor_backup_dir == $predecessor_backup and
+    .predecessor_control_sha256 == $predecessor_control and
+    .predecessor_release_evidence_sha256 == $predecessor_release and
+    .predecessor_runtime_backup_receipt_sha256 == $predecessor_runtime_receipt and
+    .predecessor_runtime_backup_manifest_sha256 == $predecessor_runtime_manifest and
+    .predecessor_release_generation == 5 and .release_generation == 6 and
+    (. * $lineage) == . and
+    ([keys[] | select(startswith("predecessor_recovery_completion_"))] | sort) ==
+      ($lineage | keys | sort) and
+    (has("predecessor_apply_receipt_sha256") | not) and
+    ([keys[] | select(startswith("predecessor_completion_"))] | length) == 0
+  ' "$pointer" >/dev/null || \
+    holdfast_die "schema-v5 successor recovery CURRENT linkage differs"
+  if [[ -f "$backup/CONTROL.sha256" && ! -L "$backup/CONTROL.sha256" ]]; then
+    validate_successor_completion_namespace "$backup/successor-authority"
+  fi
+  [[ "$(holdfast_sha256 "$pointer")" == "$pointer_sha" ]] || \
+    holdfast_die "schema-v5 successor recovery pointer changed during validation"
+}
+
 load_successor_authority() {
   local pointer=$1 expected key value predecessor_apply predecessor_file
   local successor_armed_at normalized_successor_armed_at
@@ -1347,6 +1627,10 @@ load_successor_authority() {
     fi
     [[ "$(holdfast_sha256 "$pointer")" == "$pointer_sha" ]] || \
       holdfast_die "schema-v3 successor recovery pointer changed during validation"
+    return 0
+  fi
+  if [[ "$successor_policy_version" == "5" ]]; then
+    load_recovered_successor_v5_authority "$pointer" "$policy"
     return 0
   fi
   [[ "$successor_policy_version" == "1" || "$successor_policy_version" == "2" || \
@@ -1641,6 +1925,8 @@ append_successor_lineage_receipt_fields() {
     printf 'predecessor_completion_attestation_sha256=%s\n' "$predecessor_completion_attestation_sha"
     printf 'predecessor_completion_signature_sha256=%s\n' "$predecessor_completion_signature_sha"
     printf 'predecessor_completion_public_key_sha256=%s\n' "$predecessor_completion_public_key_sha"
+  elif [[ "$successor_policy_version" == "5" ]]; then
+    append_v5_recovery_completion_lineage
   else
     printf 'predecessor_apply_receipt_sha256=%s\n' "$predecessor_apply_sha"
   fi
@@ -1666,6 +1952,9 @@ validate_successor_lineage_receipt() {
     validate_v3_completion_receipt_namespace "$receipt"
     ! grep -Eq '^predecessor_apply_receipt_sha256=' "$receipt" || \
       holdfast_die "schema-v3 successor recovery receipt contains legacy APPLY authority"
+  elif [[ "$successor_policy_version" == "5" ]]; then
+    mapfile -t lineage_authority < <(append_v5_recovery_completion_lineage)
+    validate_v5_recovery_completion_lineage "$receipt"
   else
     lineage_authority=("predecessor_apply_receipt_sha256=$predecessor_apply_sha")
     if [[ "$successor_policy_version" == "4" ]]; then
@@ -1717,7 +2006,7 @@ validate_successor_persisted_supply_chain() {
   [[ "$successor_recovery" == "true" ]] || return 0
   authority_dir="$backup/successor-authority"
   require_canonical_root_dir "$authority_dir"
-  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
     v3_anchor_files=(
       "$authority_dir/successor-policy.json"
       "$authority_dir/Dockerfile.analyzer"
@@ -1741,6 +2030,13 @@ validate_successor_persisted_supply_chain() {
         "$backup/RECOVERY-COMPLETION-ATTESTATION.json"
         "$backup/RECOVERY-COMPLETION-ATTESTATION.sig"
         "$backup/RECOVERY-COMPLETION-ATTESTATION.pub"
+      )
+    elif [[ "$successor_policy_version" == "5" ]]; then
+      v3_anchor_files+=(
+        "$backup/$predecessor_recovery_completion_archive"
+        "$backup/$predecessor_recovery_completion_receipt"
+        "$backup/$predecessor_recovery_completion_armed_receipt"
+        "$backup/$predecessor_recovery_completion_failure_receipt"
       )
     fi
     if [[ "$require_control" == "true" ]]; then
@@ -1772,7 +2068,7 @@ validate_successor_persisted_supply_chain() {
       holdfast_die "successor render-input authority repeats a path"
     seen_authorities[$relative]=1
     require_root_file "$authority_dir/$relative"
-    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
       if [[ "$require_control" == "false" ]]; then
         [[ "$(stat -c '%a' -- "$authority_dir/$relative")" == "600" ]] || \
           holdfast_die "partial schema-v3 generation authority must have mode 0600: $relative"
@@ -1809,7 +2105,7 @@ validate_successor_persisted_supply_chain() {
         holdfast_die "successor CONTROL omits route authority: $relative"
     fi
   done
-  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
     for route_field in route_up_sha256 route_down_sha256; do
       case "$route_field" in
         route_up_sha256) route_relative=20260823_rikune_root_up.sql ;;
@@ -1838,7 +2134,7 @@ validate_successor_persisted_supply_chain() {
     [[ ! -e "$backup/CONTROL.sha256" && ! -L "$backup/CONTROL.sha256" ]] || \
       holdfast_die "partial successor supply-chain authority unexpectedly has CONTROL"
   fi
-  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
     release_validator=$(test_override \
       HOLDFAST_RELEASE_VALIDATOR_BIN "$script_dir/validate_release_evidence.py")
     run_python_tool "$release_validator" "$script_dir/validate_release_evidence.py" \
@@ -1876,7 +2172,7 @@ validate_successor_persisted_supply_chain() {
       "$(holdfast_sha256 "$authority_dir/successor-policy.json")" ]] || \
       holdfast_die "partial successor signed authority changed during validation"
   fi
-  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
     for file in "${!v3_anchor_hashes[@]}"; do
       require_root_file "$file"
       [[ "$(holdfast_sha256 "$file")" == "${v3_anchor_hashes[$file]}" && \
@@ -1894,7 +2190,7 @@ revalidate_v3_successor_authority() {
   pointer_sha=$(holdfast_sha256 "$pointer")
   load_successor_authority "$pointer"
   [[ "$successor_policy_version" == "$expected_policy_version" && \
-    ( "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ) ]] || \
+    ( "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ) ]] || \
     holdfast_die "frozen successor recovery authority schema changed"
   validate_successor_persisted_supply_chain
   [[ "$(holdfast_sha256 "$pointer")" == "$pointer_sha" ]] || \
@@ -2066,7 +2362,7 @@ completed_state_match=""
 if [[ "$backup_expected_successor" == "true" ]]; then
   require_root_file "$backup/successor-authority/successor-policy.json"
   if [[ "$(jq -er '.schema_version' \
-    "$backup/successor-authority/successor-policy.json")" =~ ^(3|4)$ ]]; then
+    "$backup/successor-authority/successor-policy.json")" =~ ^(3|4|5)$ ]]; then
     successor_recovery_v3="true"
     if [[ "$v3_completed_terminal_candidate_scan_active" != "true" ]]; then
       snapshot_v3_completed_terminal_candidate_namespace
@@ -2213,7 +2509,7 @@ validate_runtime_caller_authority() {
      .stop_authority_contract == "absence-means-stop-not-started" and .ingress_opened == false' \
     "$pointer" >/dev/null || holdfast_die "runtime backup caller state differs from its authority"
   load_successor_authority "$pointer"
-  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
     if [[ -f "$backup/CONTROL.sha256" && ! -L "$backup/CONTROL.sha256" ]]; then
       validate_successor_persisted_supply_chain true
     else
@@ -2386,7 +2682,7 @@ restore_runtime_prior_subset() {
   local compose=("$docker_bin" compose -f "$config")
   local ids=() excluded=() stop_services=(rikune-volume-init)
   "${compose[@]}" config --quiet
-  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
     validate_v3_partial_backup_snapshot
   fi
   for service in strad rikune-analyzer; do
@@ -2396,12 +2692,12 @@ restore_runtime_prior_subset() {
     fi
   done
   "${compose[@]}" stop -t 120 "${stop_services[@]}" >/dev/null
-  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+  if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
     validate_v3_partial_backup_snapshot
   fi
   if ((${#runtime_prior_services[@]})); then
     "${compose[@]}" start "${runtime_prior_services[@]}" >/dev/null
-    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
       validate_v3_partial_backup_snapshot
     fi
   fi
@@ -2575,6 +2871,8 @@ validate_runtime_recovery_completion() {
         [[ "$(holdfast_receipt_value "$runtime_recovery_receipt" "$key")" == "$value" ]] || \
           holdfast_die "runtime backup recovery completion lineage differs: $key"
       done
+    elif [[ "$successor_policy_version" == "5" ]]; then
+      validate_v5_recovery_completion_lineage "$runtime_recovery_receipt"
     else
       if [[ "$successor_policy_version" == "4" ]]; then
         validate_no_predecessor_completion_namespace "$runtime_recovery_receipt"
@@ -2669,6 +2967,8 @@ complete_runtime_caller_recovery() {
           printf 'predecessor_completion_attestation_sha256=%s\n' "$predecessor_completion_attestation_sha"
           printf 'predecessor_completion_signature_sha256=%s\n' "$predecessor_completion_signature_sha"
           printf 'predecessor_completion_public_key_sha256=%s\n' "$predecessor_completion_public_key_sha"
+        elif [[ "$successor_policy_version" == "5" ]]; then
+          append_v5_recovery_completion_lineage
         else
           printf 'predecessor_apply_receipt_sha256=%s\n' "$predecessor_apply_sha"
         fi
@@ -2701,7 +3001,7 @@ if [[ "$verify_completed" != "true" && \
     [[ "$mode" == "restore" && "$legacy_empty_strad" == "false" ]] || \
       holdfast_die "runtime backup recovery completion requires non-legacy restore mode"
     validate_runtime_caller_authority "$runtime_recovery_archive"
-    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
       validate_v3_partial_backup_namespace
     fi
     if [[ "$successor_recovery" == "true" ]]; then
@@ -2718,7 +3018,7 @@ if [[ "$verify_completed" != "true" && \
       "$backup/RUNTIME-BACKUP-CALLER-CLEANUP.receipt" runtime_stop_authority)
     [[ "$runtime_arm_state" == "present" || "$runtime_arm_state" == "not-created" ]] || \
       holdfast_die "runtime backup recovery cleanup has an invalid stop authority"
-    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
       validate_runtime_partial_boundary_authority "$runtime_arm_state"
     fi
     record_runtime_caller_cleanup "$runtime_arm_state"
@@ -2726,7 +3026,7 @@ if [[ "$verify_completed" != "true" && \
       complete_runtime_caller_recovery "$runtime_arm_state"
     fi
     validate_runtime_recovery_completion
-    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
       snapshot_v3_partial_backup_authority
       runtime_terminal_receipt_sha=$(holdfast_sha256 "$runtime_recovery_receipt")
       runtime_terminal_archive_sha=$(holdfast_sha256 "$runtime_recovery_archive")
@@ -2736,7 +3036,7 @@ if [[ "$verify_completed" != "true" && \
     fi
     verify_closed_bracket
     validate_runtime_caller_authority "$runtime_recovery_archive"
-    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
       validate_runtime_partial_boundary_authority "$runtime_arm_state"
       validate_v3_partial_backup_snapshot
       [[ "$runtime_terminal_receipt_sha" == \
@@ -2775,7 +3075,7 @@ if [[ "$verify_completed" != "true" && ( -e "$state_file" || -L "$state_file" ) 
     partial_caller_identity=""
     partial_arm_sha="not-created"
     partial_arm_identity="not-created"
-    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
       snapshot_v3_partial_backup_authority
       require_root_file "$state_file"
       require_root_file "$runtime_caller_receipt"
@@ -2792,7 +3092,7 @@ if [[ "$verify_completed" != "true" && ( -e "$state_file" || -L "$state_file" ) 
     fi
     verify_closed_bracket
     validate_runtime_caller_authority "$state_file"
-    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
       validate_v3_partial_backup_snapshot
       require_root_file "$state_file"
       require_root_file "$runtime_caller_receipt"
@@ -2814,11 +3114,11 @@ if [[ "$verify_completed" != "true" && ( -e "$state_file" || -L "$state_file" ) 
     if [[ "$runtime_arm_state" == "present" ]]; then
       validate_runtime_caller_authority "$state_file"
       validate_runtime_partial_boundary_authority "$runtime_arm_state"
-      if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+      if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
         validate_v3_partial_backup_snapshot
       fi
       restore_runtime_prior_subset
-      if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+      if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
         validate_v3_partial_backup_snapshot
       fi
     else
@@ -2827,7 +3127,7 @@ if [[ "$verify_completed" != "true" && ( -e "$state_file" || -L "$state_file" ) 
     fi
     verify_closed_bracket
     validate_runtime_caller_authority "$state_file"
-    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+    if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
       validate_runtime_partial_boundary_authority "$runtime_arm_state"
       validate_v3_partial_backup_snapshot
       require_root_file "$state_file"
@@ -3104,7 +3404,7 @@ fi
 if [[ -n "$completed_state_match" && "$backup_expected_successor" == "true" ]]; then
   require_root_file "$backup/successor-authority/successor-policy.json"
   if [[ "$(jq -er '.schema_version' \
-    "$backup/successor-authority/successor-policy.json")" =~ ^(3|4)$ ]]; then
+    "$backup/successor-authority/successor-policy.json")" =~ ^(3|4|5)$ ]]; then
     successor_recovery_v3="true"
     snapshot_v3_completed_terminal_authority
   fi
@@ -3199,17 +3499,19 @@ fi
 validate_successor_persisted_supply_chain
 validate_v3_completed_terminal_core_fence \
   "$v3_completed_terminal_current_sha" "$v3_completed_terminal_current_identity"
-if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" ]]; then
+if [[ "$successor_policy_version" == "3" || "$successor_policy_version" == "4" || "$successor_policy_version" == "5" ]]; then
   successor_recovery_v3="true"
   case "${failure_name:-none}" in
     APPLY-RECOVERY-FAILED-*)
       validate_successor_lineage_receipt "$state_dir/$failure_name"
       ;;
     APPLY-ACTIVATION-FAILED-*|APPLY-ESTATE-FAILED-*)
-      [[ "$successor_policy_version" == "3" ]] || \
-        validate_no_predecessor_completion_namespace "$state_dir/$failure_name"
       if [[ "$successor_policy_version" == "3" ]]; then
-      validate_v3_apply_failure_completion_receipt "$state_dir/$failure_name"
+        validate_v3_apply_failure_completion_receipt "$state_dir/$failure_name"
+      elif [[ "$successor_policy_version" == "5" ]]; then
+        validate_v5_recovery_completion_lineage "$state_dir/$failure_name"
+      else
+        validate_no_predecessor_completion_namespace "$state_dir/$failure_name"
       fi
       ;;
   esac

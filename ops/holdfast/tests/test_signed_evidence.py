@@ -608,7 +608,8 @@ class SignedEvidenceTests(unittest.TestCase):
         )
         policy["schema_version"] = 3
         policy["ceremony"] = "holdfast-rikune-successor-v3"
-        policy["predecessor"].pop("apply_receipt_sha256")
+        policy["predecessor"].pop("apply_receipt_sha256", None)
+        policy["predecessor"].pop("recovery_completion", None)
         policy["predecessor"]["completion"] = {
             "kind": "recovery-completion-attestation-v1",
             "attestation_sha256": "9" * 64,
@@ -1535,14 +1536,25 @@ class SignedEvidenceTests(unittest.TestCase):
         self.assertNotEqual(invalid.returncode, 0)
         self.assertIn("route close, grant revoke", invalid.stderr)
 
-    def make_preopen_fixture(self):
+    def make_preopen_fixture(
+        self,
+        *,
+        successor_policy: Path | None = None,
+        release_generation: int | None = None,
+    ):
         release_env = self.root / "edge.release.env"
         release_env.write_text(
             f"AUTHORITY_PUBLIC_KEY_SHA256={sha256(self.public_key)}\n", encoding="utf-8"
         )
         release_evidence = self.root / "edge-release-evidence.json"
-        successor_policy = OPS_ROOT / "successor-policy.json"
+        successor_policy = successor_policy or OPS_ROOT / "successor-policy.json"
         policy = json.loads(successor_policy.read_text(encoding="utf-8"))
+        if release_generation is None:
+            release_generation = (
+                policy["schema_version"] + 1
+                if policy["schema_version"] in (4, 5)
+                else 5
+            )
         release_evidence.write_text(
             json.dumps(
                 {
@@ -1565,7 +1577,7 @@ class SignedEvidenceTests(unittest.TestCase):
                 (
                     "schema_version=3",
                     "prepared_at=2026-08-22T02:00:00Z",
-                    "release_generation=5",
+                    f"release_generation={release_generation}",
                     f"release_evidence_sha256={sha256(release_evidence)}",
                     f"open_evidence_sha256={sha256(open_evidence)}",
                     "source_grant_id=source-grant-0001",
@@ -1756,6 +1768,54 @@ class SignedEvidenceTests(unittest.TestCase):
         rolled_back = self.run_signed_edge(rollback_value, rollback_evidence, rollback_command)
         self.assertEqual(rolled_back.returncode, 0, rolled_back.stdout + rolled_back.stderr)
 
+    def test_schema5_policy_reuses_dual_host_v3_for_gen6(self) -> None:
+        policy_path = self.root / "successor-policy-v5.json"
+        policy = json.loads(
+            (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
+        )
+        policy["schema_version"] = 5
+        policy["ceremony"] = "holdfast-rikune-successor-v5"
+        policy["predecessor"].pop("apply_receipt_sha256", None)
+        policy["predecessor"]["recovery_completion"] = {
+            "kind": "holdfast-rikune-recovery-resume-completion-v1",
+            "archive": "APPLY-RECOVERY-COMPLETE-20260830T120000Z-6.json",
+            "archive_sha256": "1" * 64,
+            "receipt": "APPLY-RECOVERY-COMPLETE-20260830T120000Z-6.receipt",
+            "receipt_sha256": "2" * 64,
+            "armed_receipt": "APPLY-RECOVERY-ARMED-20260830T120000Z-6.receipt",
+            "armed_receipt_sha256": "3" * 64,
+            "failure_receipt": "APPLY-ACTIVATION-FAILED-20260830T115900Z-5.receipt",
+            "failure_receipt_sha256": "4" * 64,
+        }
+        policy_path.write_text(
+            json.dumps(policy, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        value, evidence, command, *_ = self.make_preopen_fixture(
+            successor_policy=policy_path,
+            release_generation=6,
+        )
+        valid = self.run_signed_edge(value, evidence, command)
+        self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+        self.assertIn("rikune-dual-v3", valid.stdout)
+
+        prepare_receipt = Path(
+            command[command.index("--prepare-receipt") + 1]
+        )
+        prepare_receipt.write_text(
+            prepare_receipt.read_text(encoding="utf-8").replace(
+                "release_generation=6", "release_generation=5"
+            ),
+            encoding="utf-8",
+        )
+        value["open_prepare_receipt_sha256"] = sha256(prepare_receipt)
+        wrong_generation = self.run_signed_edge(value, evidence, command)
+        self.assertNotEqual(wrong_generation.returncode, 0)
+        self.assertIn(
+            "dual-host open prepare receipt does not prove the exact closed edge",
+            wrong_generation.stderr,
+        )
+
     def test_legacy_v2_analyze_only_preopen_and_route_close_remain_valid(self) -> None:
         release_env = self.root / "legacy-edge.release.env"
         release_env.write_text(
@@ -1768,7 +1828,8 @@ class SignedEvidenceTests(unittest.TestCase):
         )
         legacy_policy_value["schema_version"] = 3
         legacy_policy_value["ceremony"] = "holdfast-rikune-successor-v3"
-        legacy_policy_value["predecessor"].pop("apply_receipt_sha256")
+        legacy_policy_value["predecessor"].pop("apply_receipt_sha256", None)
+        legacy_policy_value["predecessor"].pop("recovery_completion", None)
         legacy_policy_value["predecessor"]["completion"] = {
             "kind": "recovery-completion-attestation-v1",
             "attestation_sha256": "a" * 64,
@@ -2014,7 +2075,8 @@ class SignedEvidenceTests(unittest.TestCase):
         )
         legacy_policy_value["schema_version"] = 3
         legacy_policy_value["ceremony"] = "holdfast-rikune-successor-v3"
-        legacy_policy_value["predecessor"].pop("apply_receipt_sha256")
+        legacy_policy_value["predecessor"].pop("apply_receipt_sha256", None)
+        legacy_policy_value["predecessor"].pop("recovery_completion", None)
         legacy_policy_value["predecessor"]["completion"] = {
             "kind": "recovery-completion-attestation-v1",
             "attestation_sha256": "a" * 64,
@@ -2270,7 +2332,7 @@ class SignedEvidenceTests(unittest.TestCase):
         ]
         self.assertIn("successor-policy.json", armed_contract)
         self.assertIn("frozen route assets differ from release evidence", armed_contract)
-        self.assertIn('policy_schema" == "4', armed_contract)
+        self.assertIn('policy_schema" -ge 4', armed_contract)
         self.assertIn(
             '.open_armed_public_host == "rikune.w33d.xyz"', armed_contract
         )

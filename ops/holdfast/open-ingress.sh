@@ -3222,7 +3222,7 @@ validate_armed_open_contract() {
     validator_args+=(--successor-policy "$frozen_policy")
     policy_schema=$(jq -er '
       .schema_version |
-      select(type == "number" and floor == . and . >= 1 and . <= 4)
+      select(type == "number" and floor == . and . >= 1 and . <= 5)
     ' "$frozen_policy") || holdfast_die "armed open frozen policy schema is invalid"
   fi
   python3 "$script_dir/validate_release_evidence.py" "${validator_args[@]}" \
@@ -3250,12 +3250,12 @@ validate_armed_open_contract() {
       holdfast_die "armed open frozen route assets differ from release evidence"
   fi
 
-  if [[ "$policy_schema" == "4" ]]; then
+  if [[ "$policy_schema" -ge 4 ]]; then
     jq -e '
       .open_armed_public_host == "rikune.w33d.xyz" and
       .open_armed_legacy_public_host == "analyze.w33d.xyz"
     ' "$state_file" >/dev/null || \
-      holdfast_die "schema-v4 armed open host namespace differs"
+      holdfast_die "dual-host armed open host namespace differs"
   else
     jq -e '
       .open_armed_public_host == "analyze.w33d.xyz" and
@@ -3323,9 +3323,9 @@ if jq -e '.schema_version == 2 and .release_mode == "successor"' \
       "$(holdfast_sha256 "$release_evidence")" ]] || \
     holdfast_die "open release evidence differs from the frozen successor release"
   frozen_policy_schema=$(jq -er \
-    '.schema_version | select(type == "number" and floor == . and . >= 1 and . <= 4)' \
+    '.schema_version | select(type == "number" and floor == . and . >= 1 and . <= 5)' \
     "$frozen_successor_policy") || holdfast_die "frozen successor policy schema is invalid"
-  if [[ "$frozen_policy_schema" == "4" ]]; then
+  if [[ "$frozen_policy_schema" -ge 4 ]]; then
     open_edge_contract="rikune-dual-v3"
   fi
   release_validator_args+=(--successor-policy "$frozen_successor_policy")
@@ -3355,8 +3355,9 @@ if [[ "$phase" == "prepare" ]]; then
     select(type == "number" and floor == . and . >= 1)
   ' "$state_file") || holdfast_die "active release generation is invalid"
   if [[ "$open_edge_contract" == "rikune-dual-v3" ]]; then
-    [[ "$active_release_generation" == "5" ]] || \
-      holdfast_die "schema-v4 dual-host open requires release generation 5"
+    expected_release_generation=$((frozen_policy_schema + 1))
+    [[ "$active_release_generation" == "$expected_release_generation" ]] || \
+      holdfast_die "dual-host open release generation differs from frozen policy"
     {
       printf 'schema_version=3\n'
       printf 'prepared_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"

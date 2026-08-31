@@ -57,6 +57,7 @@ class SuccessorBindingTests(unittest.TestCase):
         predecessor = legacy["predecessor"]
         assert isinstance(predecessor, dict)
         predecessor.pop("completion", None)
+        predecessor.pop("recovery_completion", None)
         predecessor["apply_receipt_sha256"] = hashlib.sha256(
             b"holdfast-test-legacy-apply-receipt"
         ).hexdigest()
@@ -273,6 +274,7 @@ class SuccessorBindingTests(unittest.TestCase):
         predecessor = policy["predecessor"]
         assert isinstance(predecessor, dict)
         predecessor.pop("apply_receipt_sha256", None)
+        predecessor.pop("recovery_completion", None)
         predecessor["access_build_input_schema"] = successor_binding.BUILD_INPUT_V2
         predecessor["completion"] = completion or {
             "kind": recovery_completion_attestation.KIND,
@@ -293,6 +295,7 @@ class SuccessorBindingTests(unittest.TestCase):
         assert isinstance(predecessor, dict)
         assert isinstance(successor, dict)
         predecessor.pop("completion", None)
+        predecessor.pop("recovery_completion", None)
         predecessor.setdefault("apply_receipt_sha256", "d" * 64)
         predecessor["access_build_input_schema"] = successor_binding.BUILD_INPUT_V2
         if successor["source_access_build_input_sha256"] == predecessor[
@@ -560,9 +563,9 @@ class SuccessorBindingTests(unittest.TestCase):
         hybrid["predecessor"]["apply_receipt_sha256"] = "d" * 64
         cases.append(("hybrid", hybrid, "predecessor policy field set"))
         unknown = self.v3_policy()
-        unknown["schema_version"] = 5
-        unknown["ceremony"] = "holdfast-rikune-successor-v5"
-        cases.append(("unknown-v5", unknown, "version or ceremony"))
+        unknown["schema_version"] = 6
+        unknown["ceremony"] = "holdfast-rikune-successor-v6"
+        cases.append(("unknown-v6", unknown, "version or ceremony"))
         for name, candidate, error in cases:
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
                 successor_binding.validate_policy(
@@ -622,6 +625,135 @@ class SuccessorBindingTests(unittest.TestCase):
                 successor_binding.validate_policy(
                     self.write_policy(candidate, f"v4-{name}.json")
                 )
+
+    def test_schema_v5_policy_binds_exact_gen5_recovery_and_nine_path_delta(
+        self,
+    ) -> None:
+        policy = self.current_policy()
+        validated = successor_binding.validate_policy(
+            self.write_policy(policy, "successor-v5.json")
+        )
+        predecessor = validated["predecessor"]
+        completion = predecessor["recovery_completion"]
+        self.assertEqual(validated["schema_version"], 5)
+        self.assertEqual(
+            set(predecessor), successor_binding.GEN5_RECOVERED_PREDECESSOR_FIELDS
+        )
+        self.assertNotIn("apply_receipt_sha256", predecessor)
+        self.assertEqual(
+            set(completion),
+            successor_binding.GEN5_RECOVERY_COMPLETION_BINDING_FIELDS,
+        )
+        self.assertEqual(len(validated["overlay"]), 9)
+        self.assertEqual(
+            [item["path"] for item in validated["overlay"]],
+            sorted(item["path"] for item in validated["overlay"]),
+        )
+
+        cases: list[tuple[str, dict[str, object], str]] = []
+        missing = copy.deepcopy(policy)
+        del missing["predecessor"]["recovery_completion"]["archive_sha256"]
+        cases.append(("missing", missing, "field set"))
+        hybrid = copy.deepcopy(policy)
+        hybrid["predecessor"]["apply_receipt_sha256"] = "a" * 64
+        cases.append(("hybrid", hybrid, "predecessor policy field set"))
+        wrong_kind = copy.deepcopy(policy)
+        wrong_kind["predecessor"]["recovery_completion"]["kind"] = "future"
+        cases.append(("kind", wrong_kind, "kind differs"))
+        wrong_attempt = copy.deepcopy(policy)
+        wrong_attempt["predecessor"]["recovery_completion"]["armed_receipt"] = (
+            "APPLY-RECOVERY-ARMED-20260830T152436Z-9.receipt"
+        )
+        cases.append(("attempt", wrong_attempt, "attempt linkage"))
+        unknown = copy.deepcopy(policy)
+        unknown["schema_version"] = 6
+        unknown["ceremony"] = "holdfast-rikune-successor-v6"
+        cases.append(("unknown", unknown, "version or ceremony"))
+        for name, candidate, error in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                successor_binding.validate_policy(
+                    self.write_policy(candidate, f"v5-{name}.json")
+                )
+
+    def test_gen5_current_contract_is_exact_and_fixed_to_resume_four_to_five(
+        self,
+    ) -> None:
+        estate = self.root / "gen5-estate"
+        backup = self.root / "gen5-backup"
+        current: dict[str, object] = {
+            field: "fixture"
+            for field in successor_binding.GEN5_RECOVERED_CURRENT_FIELDS
+        }
+        for field in successor_binding.GEN5_RECOVERED_CURRENT_FIELDS:
+            if field.endswith("_sha256"):
+                current[field] = "a" * 64
+        attempt = "20260830T152436Z-2647919"
+        current.update(
+            {
+                "schema_version": 2,
+                "state": "applied_ingress_closed",
+                "apply_armed_at": "2026-08-30T15:21:00Z",
+                "estate_root": str(estate),
+                "backup_dir": str(backup),
+                "ingress_opened": False,
+                "successor": True,
+                "successor_armed_receipt": "SUCCESSOR-ARMED.receipt",
+                "predecessor_current_file": "PREDECESSOR-CURRENT.json",
+                "predecessor_backup_dir": str(self.root / "gen4-backup"),
+                "predecessor_release_generation": 4,
+                "release_generation": 5,
+                "apply_failure_receipt": (
+                    "APPLY-ACTIVATION-FAILED-20260830T152125Z-2600245.receipt"
+                ),
+                "recovery_prior_state": "apply_activation_failed",
+                "recovery_mode": "resume",
+                "recovery_attempt_id": attempt,
+                "recovery_armed_receipt": (
+                    f"APPLY-RECOVERY-ARMED-{attempt}.receipt"
+                ),
+                "restore_running_writers_manifest": "not-applicable",
+                "restore_running_writers_sha256": "none",
+                "legacy_empty_strad": False,
+                "pre_restored_retry": False,
+                "pre_restored_source_attempt": "none",
+                "pre_restored_runtime_snapshot_sha256": "none",
+                "pre_restored_estate_snapshot_sha256": "none",
+                "pre_restored_superseded_attempt": "none",
+                "pre_restored_superseded_failure_receipt_sha256": "none",
+                "pre_restored_superseded_state_sha256": "none",
+                "pre_restored_runtime_disposition": "not-applicable",
+                "writer_set_reconciled": False,
+                "writer_set_source_attempt": "none",
+                "writer_set_source_failure_receipt_sha256": "none",
+                "writer_set_source_state_sha256": "none",
+                "writer_set_source_manifest_sha256": "none",
+                "writer_set_preimage_compose_sha256": "none",
+                "writer_set_quarantined": "none",
+                "recovery_receipt": (
+                    f"APPLY-RECOVERY-COMPLETE-{attempt}.receipt"
+                ),
+                "services_activated": True,
+                "runtime_verified": True,
+            }
+        )
+        validated = successor_binding.validate_gen5_current(
+            current, estate=estate, backup=backup
+        )
+        self.assertEqual(validated["release_generation"], 5)
+
+        for field, value, error in (
+            ("release_generation", 6, "release_generation"),
+            ("recovery_mode", "restore", "recovery_mode"),
+            ("services_activated", False, "services_activated"),
+        ):
+            candidate = dict(current)
+            candidate[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, error):
+                successor_binding.validate_gen5_current(candidate)
+        missing = dict(current)
+        del missing["recovery_receipt_sha256"]
+        with self.assertRaisesRegex(ValueError, "field set"):
+            successor_binding.validate_gen5_current(missing)
 
     def test_schema_v4_apply_receipt_is_completion_and_gen3_trio_is_history(
         self,
@@ -2219,6 +2351,83 @@ class SuccessorBindingTests(unittest.TestCase):
         )
         for name in successor_binding.RECOVERY_COMPLETION_NAMES:
             self.assertEqual(stage.joinpath(name).read_bytes(), source["bytes"][name])
+
+    def test_schema_v5_successor_stage_copies_exact_gen5_recovery_bytes(
+        self,
+    ) -> None:
+        (
+            authority,
+            estate,
+            predecessor_candidate,
+            policy,
+            preimages,
+            static_targets,
+            supporting_targets,
+        ) = self.make_successor_copy_fixture(
+            overlay_count=2, promote_static_asset=False
+        )
+        attempt = "20260830T152436Z-2647919"
+        source: dict[str, object] = {
+            "archive": b'{"state":"apply_recovered_resumed"}\n',
+            "receipt": b"schema_version=3\n",
+            "armed_receipt": b"schema_version=3\n",
+            "failure_receipt": b"phase=activation\n",
+        }
+        completion = {
+            "kind": successor_binding.GEN5_RECOVERY_COMPLETION_KIND,
+            "archive": f"APPLY-RECOVERY-COMPLETE-{attempt}.json",
+            "archive_sha256": hashlib.sha256(source["archive"]).hexdigest(),
+            "receipt": f"APPLY-RECOVERY-COMPLETE-{attempt}.receipt",
+            "receipt_sha256": hashlib.sha256(source["receipt"]).hexdigest(),
+            "armed_receipt": f"APPLY-RECOVERY-ARMED-{attempt}.receipt",
+            "armed_receipt_sha256": hashlib.sha256(
+                source["armed_receipt"]
+            ).hexdigest(),
+            "failure_receipt": (
+                "APPLY-ACTIVATION-FAILED-20260830T152125Z-2600245.receipt"
+            ),
+            "failure_receipt_sha256": hashlib.sha256(
+                source["failure_receipt"]
+            ).hexdigest(),
+        }
+        policy["schema_version"] = 5
+        policy["ceremony"] = "holdfast-rikune-successor-v5"
+        policy["predecessor"] = {"recovery_completion": completion}
+        stage = self.root / "stage-v5"
+        render.copy_successor_stage(
+            estate,
+            predecessor_candidate,
+            stage,
+            True,
+            policy,
+            preimages,
+            static_targets,
+            authority,
+            source,
+        )
+        render.validate_successor_snapshot(
+            stage, policy, preimages, supporting_targets, True
+        )
+        render_input_binding.validate_adjacent_recovery_completion(
+            stage,
+            policy["predecessor"],
+            5,
+            None,
+            True,
+        )
+        for field in ("archive", "receipt", "armed_receipt", "failure_receipt"):
+            self.assertEqual(
+                (stage / completion[field]).read_bytes(), source[field]
+            )
+        (stage / completion["receipt"]).write_bytes(b"tampered\n")
+        with self.assertRaisesRegex(RuntimeError, "differs: receipt"):
+            render_input_binding.validate_adjacent_recovery_completion(
+                stage,
+                policy["predecessor"],
+                5,
+                None,
+                True,
+            )
 
     def test_schema_v1_static_transition_requires_the_exact_legacy_change(
         self,

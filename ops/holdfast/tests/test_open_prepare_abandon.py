@@ -105,6 +105,9 @@ class OpenPrepareAbandonTests(unittest.TestCase):
         policy = json.loads(
             (OPS_ROOT / "successor-policy.json").read_text(encoding="utf-8")
         )
+        policy["schema_version"] = 4
+        policy["ceremony"] = "holdfast-rikune-successor-v4"
+        policy["predecessor"].pop("recovery_completion", None)
         policy["predecessor"].update(
             {
                 "current_state_sha256": sha256(self.predecessor_current),
@@ -2339,6 +2342,23 @@ class OpenPrepareAbandonTests(unittest.TestCase):
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("exact closed successor CURRENT", rejected.stderr)
         self.assertTrue(self.prepare.is_file())
+
+    def test_schema5_open_reuses_dual_host_contract_without_widening_abandon(
+        self,
+    ) -> None:
+        script = (OPS_ROOT / "open-ingress.sh").read_text(encoding="utf-8")
+        normal_open = script[script.index("validate_armed_open_contract()") :]
+        self.assertIn('.schema_version | select(type == "number"', normal_open)
+        self.assertIn(". >= 1 and . <= 5", normal_open)
+        self.assertIn('policy_schema" -ge 4', normal_open)
+        self.assertIn('frozen_policy_schema" -ge 4', normal_open)
+        self.assertIn(
+            "expected_release_generation=$((frozen_policy_schema + 1))",
+            normal_open,
+        )
+        self.assertIn('open_edge_contract="rikune-dual-v3"', normal_open)
+
+        self.assertIn("validate_schema4_successor_policy", script)
 
     def test_schema4_arm_requires_successor_policy_hash(self) -> None:
         lines = self.successor_arm.read_text(encoding="utf-8").splitlines()

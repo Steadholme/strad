@@ -446,6 +446,20 @@ class RecoveryCompletionAttestationTests(unittest.TestCase):
                 self.assertIn(error, rejected.stderr)
                 self.replace_signed_attestation(self.canonical_bytes(original))
 
+    def test_producer_recovery_lineage_does_not_widen_signed_attestation_v1(
+        self,
+    ) -> None:
+        for predecessor, generation in ((4, 5), (5, 6)):
+            with self.subTest(lineage=f"{predecessor}->{generation}"):
+                command = self.issue_command()
+                command[command.index("--predecessor-release-generation") + 1] = str(
+                    predecessor
+                )
+                command[command.index("--release-generation") + 1] = str(generation)
+                result = self.run_command(command)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("current-production successor generation", result.stderr)
+
     def test_signature_key_and_file_boundaries_fail_closed(self) -> None:
         self.assertEqual(self.issue().returncode, 0)
         signature = self.release / SIGNATURE

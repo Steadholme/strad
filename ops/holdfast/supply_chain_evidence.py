@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import Any, NoReturn
 from urllib.parse import parse_qsl, urlsplit
 
-from successor_binding import validate_policy as validate_successor_policy
+from successor_binding import (
+    validate_policy as validate_successor_policy,
+    validate_recovery_completion_binding_v5,
+)
 from validate_release_evidence import BASE_RELEASE_KEYS, SUCCESSOR_RELEASE_KEYS
 
 
@@ -242,7 +245,7 @@ def cosign_signature(
     common_fields = additional_fields or set()
     keyed_fields = common_fields | COSIGN_KEY_FIELDS
     if (
-        schema_version in (3, 4)
+        schema_version in (3, 4, 5)
         and isinstance(value, dict)
         and set(value) == keyed_fields
     ):
@@ -255,7 +258,7 @@ def cosign_signature(
 
 
 def valid_rekor_log_index(value: object, schema_version: int) -> bool:
-    if schema_version in (3, 4):
+    if schema_version in (3, 4, 5):
         return type(value) is int and value >= 0
     return isinstance(value, int) and value >= 0
 
@@ -466,16 +469,25 @@ def validate_document(
         "analyzer_overlay",
         "access_candidate",
     }
-    if schema_version in (2, 3, 4):
+    if schema_version in (2, 3, 4, 5):
         expected_root.add("waivers")
-    if schema_version in (3, 4):
+    if schema_version in (3, 4, 5):
         expected_root.add("successor_binding")
-    if schema_version == 4:
+    if schema_version in (4, 5):
         expected_root.add("fresh_image_bindings")
+    if schema_version == 5:
+        expected_root.update(
+            {
+                "predecessor_current_sha256",
+                "predecessor_recovery_completion",
+                "predecessor_release_generation",
+                "release_generation",
+            }
+        )
     exact_keys(value, expected_root, "evidence")
     if (
         type(schema_version) is not int
-        or schema_version not in (1, 2, 3, 4)
+        or schema_version not in (1, 2, 3, 4, 5)
         or value["platform"] != "linux/amd64"
     ):
         fail("unsupported supply-chain schema or platform")
@@ -487,12 +499,12 @@ def validate_document(
         validate_waivers(
             value["waivers"], release, datetime.now(timezone.utc), schema_version
         )
-        if schema_version in (2, 3, 4)
+        if schema_version in (2, 3, 4, 5)
         else {}
     )
     consumed_waivers: set[tuple[str, str]] = set()
 
-    if schema_version in (3, 4):
+    if schema_version in (3, 4, 5):
         if successor_policy is None:
             fail(
                 f"schema {schema_version} supply-chain evidence requires "
@@ -530,6 +542,29 @@ def validate_document(
         ):
             if release.get(release_key) != predecessor_policy[predecessor_key]:
                 fail(f"Access successor catalog differs from the predecessor: {release_key}")
+        if schema_version == 5:
+            recovery_completion = validate_recovery_completion_binding_v5(
+                predecessor_policy.get("recovery_completion")
+            )
+            evidence_completion = validate_recovery_completion_binding_v5(
+                value["predecessor_recovery_completion"]
+            )
+            if (
+                require_hex(
+                    value["predecessor_current_sha256"],
+                    "Gen5 predecessor CURRENT",
+                )
+                != predecessor_policy["current_state_sha256"]
+                or evidence_completion != recovery_completion
+            ):
+                fail("schema-v5 predecessor recovery authority differs")
+            if (
+                type(value["predecessor_release_generation"]) is not int
+                or value["predecessor_release_generation"] != 5
+                or type(value["release_generation"]) is not int
+                or value["release_generation"] != 6
+            ):
+                fail("schema-v5 release generation linkage must be exactly 5 -> 6")
 
     registry = exact_keys(
         value["registry_verification"], {"verified_at", "verifier", "images"}, "registry"
@@ -537,7 +572,7 @@ def validate_document(
     if not isinstance(registry["verified_at"], str) or not registry["verified_at"].endswith("Z"):
         fail("registry verification timestamp is invalid")
     schema4_manifest_sha256: str | None = None
-    if schema_version == 4:
+    if schema_version in (4, 5):
         schema4_manifest_sha256 = validate_schema4_registry_verifier(
             registry["verifier"]
         )
@@ -634,7 +669,7 @@ def validate_document(
     ):
         fail("analyzer overlay revision differs from release")
 
-    if schema_version in (3, 4):
+    if schema_version in (3, 4, 5):
         access = exact_keys(
             value["access_candidate"],
             {
@@ -680,7 +715,7 @@ def validate_document(
         if access[key] != expected:
             fail(f"Access candidate build input differs: {key}")
 
-    if schema_version == 4:
+    if schema_version in (4, 5):
         validate_schema4_fresh_signer_roles(images)
         fresh = exact_keys(
             value["fresh_image_bindings"],
@@ -757,7 +792,7 @@ def validate_local_binding(
         release_evidence = load_json(args.release_evidence)
         selected_keys = (
             SUCCESSOR_RELEASE_KEYS
-            if value.get("schema_version") in (3, 4)
+            if value.get("schema_version") in (3, 4, 5)
             else BASE_RELEASE_KEYS
         )
         missing = sorted(selected_keys - set(release))
@@ -789,7 +824,7 @@ def validate_local_binding(
         for field, wanted in expected.items():
             if binding.get(field) != wanted:
                 fail(f"supply chain and RELEASE-EVIDENCE differ: {field}")
-        if value.get("schema_version") in (3, 4):
+        if value.get("schema_version") in (3, 4, 5):
             if (
                 release_evidence.get("schema_version") != 2
                 or release_evidence.get("release_mode") != "successor"
@@ -908,7 +943,7 @@ def main() -> int:
             if release.get(key) != observed:
                 fail(f"{key} differs from the release pin")
         successor_policy = None
-        if document.get("schema_version") in (3, 4):
+        if document.get("schema_version") in (3, 4, 5):
             if args.successor_policy is None:
                 fail("successor supply-chain evidence requires --successor-policy")
             successor_policy = validate_successor_policy(
