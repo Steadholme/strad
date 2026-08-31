@@ -13,6 +13,7 @@ from unittest import mock
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = OPS_ROOT.parents[1]
 
 import sys
 
@@ -28,6 +29,22 @@ def image(name: str, digit: str) -> str:
 
 class SupplyChainV5AssemblerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(
+            prefix="holdfast-supply-v5-test-", dir="/root"
+        )
+        self.root = Path(self.temp.name)
+        source_root = self.root / "sources"
+        source_root.mkdir(mode=0o700)
+        self.dockerfile = source_root / "Dockerfile.analyzer"
+        self.dockerfile.write_bytes(
+            (REPOSITORY_ROOT / "Dockerfile.analyzer").read_bytes()
+        )
+        self.dockerfile.chmod(0o644)
+        self.bridge_lock = source_root / "bridge-package-lock.json"
+        self.bridge_lock.write_bytes(
+            (REPOSITORY_ROOT / "bridge/package-lock.json").read_bytes()
+        )
+        self.bridge_lock.chmod(0o644)
         self.revision = "c" * 40
         self.issued_at = (
             datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=1)
@@ -96,6 +113,9 @@ class SupplyChainV5AssemblerTests(unittest.TestCase):
             "holdfast_release_tool_revision": self.revision,
             "provenance_builder_id": access_builder,
         }
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
 
     def make_previous_release(self) -> dict[str, str]:
         release = {
@@ -196,6 +216,8 @@ class SupplyChainV5AssemblerTests(unittest.TestCase):
                 f"trusted_root_sha256={validator.SIGSTORE_TRUSTED_ROOT_SHA256};"
                 f"strad_release_manifest_sha256={'9' * 64}"
             ),
+            dockerfile=self.dockerfile,
+            bridge_lock=self.bridge_lock,
         )
 
     def test_positive_assembly_binds_gen5_recovery_and_gen6_generation(self) -> None:
@@ -524,8 +546,8 @@ class SupplyChainV5AssemblerTests(unittest.TestCase):
                 signature=signature,
                 public_key=public_key,
                 successor_policy=OPS_ROOT / "successor-policy.json",
-                dockerfile=assembler.DEFAULT_DOCKERFILE,
-                bridge_lock=assembler.DEFAULT_BRIDGE_LOCK,
+                dockerfile=self.dockerfile,
+                bridge_lock=self.bridge_lock,
                 output_release_env=output,
             )
             with mock.patch.object(assembler, "validate_checkout_revision"):
