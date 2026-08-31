@@ -168,7 +168,8 @@ if jq -e '.predecessor_binding.recovery_completion? != null' \
   }
   for recovery_file in "${recovery_completion_files[@]}"; do
     [[ "$recovery_file" == "${recovery_file##*/}" && \
-       "$recovery_file" =~ ^APPLY-[A-Z0-9][A-Z0-9._-]{0,199}$ ]] || {
+       "${#recovery_file}" -le 200 && \
+       "$recovery_file" =~ ^APPLY-[A-Z0-9][A-Z0-9._-]*$ ]] || {
       echo "snapshotted Gen5 recovery completion filename is invalid" >&2
       exit 1
     }
