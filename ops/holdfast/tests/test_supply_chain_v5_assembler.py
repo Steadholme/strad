@@ -35,6 +35,11 @@ class SupplyChainV5AssemblerTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         source_root = self.root / "sources"
         source_root.mkdir(mode=0o700)
+        self.successor_policy = source_root / "successor-policy.json"
+        self.successor_policy.write_bytes(
+            (OPS_ROOT / "successor-policy.json").read_bytes()
+        )
+        self.successor_policy.chmod(0o644)
         self.dockerfile = source_root / "Dockerfile.analyzer"
         self.dockerfile.write_bytes(
             (REPOSITORY_ROOT / "Dockerfile.analyzer").read_bytes()
@@ -545,7 +550,7 @@ class SupplyChainV5AssemblerTests(unittest.TestCase):
                 evidence=evidence,
                 signature=signature,
                 public_key=public_key,
-                successor_policy=OPS_ROOT / "successor-policy.json",
+                successor_policy=self.successor_policy,
                 dockerfile=self.dockerfile,
                 bridge_lock=self.bridge_lock,
                 output_release_env=output,
