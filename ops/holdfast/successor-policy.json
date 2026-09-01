@@ -28,8 +28,8 @@
   "successor": {
     "generator": "holdfast-rikune-estate/2.0.0",
     "access_build_input_schema": "access-build-input/2",
-    "source_access_build_input_sha256": "5330052d462fb8192c5137272557f3cd81e20fc4bd1e9f70c0b005eb715155bd",
-    "access_build_input_sha256": "5330052d462fb8192c5137272557f3cd81e20fc4bd1e9f70c0b005eb715155bd",
+    "source_access_build_input_sha256": "518d15ae06c9df1ea5d7025fc85be09e2e25a3c7397dd6e07dbf2e536d63b948",
+    "access_build_input_sha256": "518d15ae06c9df1ea5d7025fc85be09e2e25a3c7397dd6e07dbf2e536d63b948",
     "preimages_manifest": "successor-preimages.sha256",
     "absent_manifest": "successor-absent.paths",
     "static_targets_manifest": "successor-static-targets.sha256",
@@ -40,7 +40,7 @@
     {
       "path": "access-governance/migrations/0017_rikune_system_authority_v2.sql",
       "before_sha256": null,
-      "after_sha256": "5e1ddda956f5c647c36914386ffa54cff8b93534d5826ae0bb320a1589c3d86a"
+      "after_sha256": "22cad993e52e7431a2f7e4f87d03e59df38ccfad567b180790ec56a4dce7a90e"
     },
     {
       "path": "access-governance/src/lib.rs",
@@ -50,7 +50,7 @@
     {
       "path": "access-governance/src/main.rs",
       "before_sha256": "813f87111816a0bfab2698c100b82fe82f013450719adeacc78c5868ed2ee592",
-      "after_sha256": "3f8044695eb52f97faaf9698c175abadf91c07377f9fcf3333533d9cb57ba094"
+      "after_sha256": "b827f7a1b9c2bc4fa825b8c7f0ba210871818ddf40f120720413899deaaf92da"
     },
     {
       "path": "access-governance/src/repository/mod.rs",
@@ -60,22 +60,22 @@
     {
       "path": "access-governance/src/repository/postgres.rs",
       "before_sha256": "4d34e00e6579d8eb29b6ad2b08d035cd4bd43feee7cb3416a7eb03fa64016baa",
-      "after_sha256": "f75db7ac987725313e8025f159e23cf55916c9f2388c6b9c19b7802e75905d58"
+      "after_sha256": "d45917b772aad5182967cdbd2a863611ccdd174b00bbd3a4e4f23d47dc9f9bff"
     },
     {
       "path": "access-governance/src/system_authority.rs",
       "before_sha256": "8cc722aaf6113e4f0235cd8e0a8f4cd022b482b421c49292de0a772f27fb20a1",
-      "after_sha256": "4782ede0cc2b920e7445461cd1c282c4a2e4e58bd4ebb8bef5ecb3b1ef8a1946"
+      "after_sha256": "3709a0337e47bb5138f91a6e4ab16522ee74d7416c66e470424246f3e03c67eb"
     },
     {
       "path": "access-governance/tests/explicit_migration_gate.rs",
       "before_sha256": "b32e299413b45385f5328ea58f45911d30111d177a68b9944fccb1b926127b3e",
-      "after_sha256": "fad155ab0dac2af30fd04e793731deba34c21e5012d57013d39d6977bf866940"
+      "after_sha256": "5b5d9025c73a9c27e207b49e2dd9f2e97f41dfce70d4e65968d1e3cdd718dbe9"
     },
     {
       "path": "access-governance/tests/postgres_operator_package_grant.rs",
       "before_sha256": "2590db036a2676e75af4a1f9d38c2ab62aecad86295cc075a659897588a0e292",
-      "after_sha256": "7a7d3de93ac7ea09c0b6ff29ff181cc011459e8e30d04687a127b2d3eb06caaa"
+      "after_sha256": "914c9abb20f2923b0f1a165c96658f9096371080bc00796538c8fe1b3b22ddb9"
     },
     {
       "path": "access-governance/tests/postgres_rikune_system_authority_migration.rs",
