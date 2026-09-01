@@ -1033,6 +1033,7 @@ class OpenPrepareAbandonTests(unittest.TestCase):
         (estate / "tree/deploy").mkdir(parents=True, mode=0o700)
         project_tree = estate / "tree/access-governance"
         project_tree.mkdir(mode=0o755)
+        project_tree.chmod(0o755)
         project_file = project_tree / "README.fixture"
         write_private(project_file, "captured project payload\n")
         project_file.chmod(0o644)
