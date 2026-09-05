@@ -449,6 +449,10 @@ impl UploadService {
     }
 
     pub async fn reconcile_uncertain(&self) -> Result<u64> {
+        // A disconnected HTTP caller can drop finalize while it is forwarding.
+        // Recover expired leases on every sweep, not only at process startup;
+        // the durable bridge journal remains the sole source of its outcome.
+        self.store.recover_expired_upload_leases().await?;
         let uploads = self.store.uncertain_uploads(16).await?;
         let mut progressed = 0;
         for upload in uploads {

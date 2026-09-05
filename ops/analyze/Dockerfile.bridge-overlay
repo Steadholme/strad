@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1.7
+# Closed acceptance overlay: retain the pinned static backend and dependency
+# versions while replacing the compiled bridge from the current source.
+ARG ANALYZER_BASE
+FROM ${ANALYZER_BASE}
+ARG ANALYZER_BASE
+ARG BRIDGE_SOURCE_SHA256
+ARG BRIDGE_PACKAGE_SHA256
+USER 0:0
+RUN case "${ANALYZER_BASE}" in *@sha256:*) ;; *) exit 64 ;; esac \
+ && test "$(cat /app/.rikune-static-profile)" = static \
+ && test "$(sha256sum /opt/strad-bridge/package.json | cut -d' ' -f1)" = "${BRIDGE_PACKAGE_SHA256}" \
+ && test "${#BRIDGE_SOURCE_SHA256}" -eq 64 \
+ && ! printf '%s' "${BRIDGE_SOURCE_SHA256}" | grep -q '[^0-9a-f]'
+COPY --from=bridge_dist --chown=0:0 --chmod=0444 src/ /opt/strad-bridge/dist/src/
+LABEL xyz.w33d.analyze.bridge.source-sha256="${BRIDGE_SOURCE_SHA256}"
+USER 1000:1000

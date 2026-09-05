@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.7
+ARG STRAD_NODE_BUILDER_IMAGE
+
+FROM ${STRAD_NODE_BUILDER_IMAGE} AS builder
+ARG STRAD_NODE_BUILDER_IMAGE
+RUN case "${STRAD_NODE_BUILDER_IMAGE}" in *@sha256:*) ;; *) exit 64 ;; esac \
+ && builder_digest="${STRAD_NODE_BUILDER_IMAGE##*@sha256:}" \
+ && test "${#builder_digest}" -eq 64 \
+ && ! printf '%s' "${builder_digest}" | grep -q '[^0-9a-f]'
+
+WORKDIR /facade
+COPY facade/package.json facade/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY facade/tsconfig.json ./
+COPY facade/src/ ./src/
+COPY facade/migrations/ ./migrations/
+RUN npm run build \
+ && npm prune --omit=dev --no-audit --no-fund \
+ && test -f /facade/dist/src/index.js \
+ && test -f /facade/dist/src/healthcheck.js
+
+FROM ${STRAD_NODE_BUILDER_IMAGE} AS runtime
+LABEL org.opencontainers.image.title="Strad Analyze MCP facade" \
+      org.opencontainers.image.description="Authenticated public MCP and upload facade for Strad"
+WORKDIR /facade
+ENV NODE_ENV=production
+COPY --from=builder --chown=1000:1000 /facade/package.json /facade/package.json
+COPY --from=builder --chown=1000:1000 /facade/node_modules/ /facade/node_modules/
+COPY --from=builder --chown=1000:1000 /facade/dist/ /facade/dist/
+COPY --from=builder --chown=1000:1000 /facade/migrations/ /facade/migrations/
+USER 1000:1000
+EXPOSE 18120
+ENTRYPOINT ["node", "/facade/dist/src/index.js"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["node", "/facade/dist/src/healthcheck.js"]

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "service_ready": true,
+  "passwd_home": "/home/rikune",
+  "image_id": "sha256:1521481d72f72ce486b0ad368b9a56fd700be8224f86bbb4907fe77f43575604",
+  "sample": {
+    "kind": "image_usr_bin_true_elf",
+    "upload_path": "bridge_internal_v1_samples_upload",
+    "sha256": "c79bf44242829108e323378531f4ac839513ca1fba45efd6583643526e1e9fd2",
+    "bytes": 35664
+  },
+  "workflow": {
+    "plan_id": "68fe43a7-a5d9-4f7b-ae42-eea77017f7c9",
+    "function_map_status": "completed",
+    "function_index_ready": true
+  },
+  "ghidra": {
+    "functions_sha256": "5cd2d14dd8ce7332d5729e07af42c56f06bddb0280263c68936d5b1d8e9f56b7",
+    "function_count": 185,
+    "project_file_count": 1,
+    "log_file_count": 8
+  },
+  "completed_at": "2026-09-02T08:25:17Z"
+}

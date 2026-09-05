@@ -7,7 +7,12 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    config::{CHUNK_BYTES, MAX_ANALYSES, MAX_IN_FLIGHT, OWNER_BYTES},
+    application_facade::{
+        is_public_tool, ApplicationReconciliationRequest, AuthorizationAuditRequest,
+        ExecutionEnvelopeV1, FacadeToolRequest,
+    },
+    audit::ApplicationAuditEvent,
+    config::{APPLICATION_OWNER_BYTES, CHUNK_BYTES, MAX_ANALYSES, MAX_IN_FLIGHT, OWNER_BYTES},
     error::{AppError, Result},
     models::{
         Analysis, AnalysisEvent, Artifact, ByteRange, Conversation, Message, Turn, UploadChunk,
@@ -29,6 +34,17 @@ const ARTIFACT_COLUMNS: &str = "id,analysis_id,owner_sub,upstream_artifact_id,ar
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: PgPool,
+}
+
+struct TurnAdmission<'a> {
+    owner_sub: &'a str,
+    analysis_id: Uuid,
+    conversation_id: Uuid,
+    operation_id: Uuid,
+    client_seq: i64,
+    request_sha256: &'a str,
+    model_alias: &'a str,
+    message: &'a str,
 }
 
 #[derive(Debug)]
@@ -114,6 +130,29 @@ pub struct OwnerQuota {
     pub analysis_limit: i32,
 }
 
+#[derive(Clone, Debug, serde::Serialize, sqlx::FromRow)]
+pub struct ApplicationQuotaSnapshot {
+    pub rate_limit: i32,
+    pub rate_remaining: i32,
+    pub rate_reset: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApplicationOperationReplay {
+    pub status: i32,
+    pub body: serde_json::Value,
+    pub quota: ApplicationQuotaSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub enum ApplicationOperationClaim {
+    Claimed {
+        lease_token: Uuid,
+        quota: ApplicationQuotaSnapshot,
+    },
+    Replay(ApplicationOperationReplay),
+}
+
 impl Store {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -160,6 +199,14 @@ impl Store {
         operation_id: Uuid,
         request_sha256: &str,
     ) -> Result<CreatedUpload> {
+        if !valid_owner_sub(owner_sub) {
+            return Err(AppError::api(
+                axum::http::StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "Owner identity is not canonical.",
+                false,
+            ));
+        }
         let upload_id = Uuid::new_v4();
         let analysis_id = Uuid::new_v4();
         let staging_key = Uuid::new_v4();
@@ -204,6 +251,18 @@ impl Store {
         let used: i64 = quota.get("used_bytes");
         let reserved: i64 = quota.get("reserved_bytes");
         let count: i32 = quota.get("analysis_count");
+        let application_rate: Option<(i32, i32, i64)> = if owner_sub.starts_with("application:") {
+            sqlx::query_as(
+                "SELECT rate_limit,rate_remaining,rate_reset FROM application_operations \
+                 WHERE application_sub=$1 AND canonical_tool='analysis.create' AND operation_id=$2",
+            )
+            .bind(owner_sub)
+            .bind(operation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
         let in_flight: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM analyses WHERE owner_sub=$1 AND state IN \
              ('created','uploading','uploaded','starting','start_uncertain','analyzing','promoting')",
@@ -211,23 +270,46 @@ impl Store {
         .bind(owner_sub)
         .fetch_one(&mut *tx)
         .await?;
+        let byte_limit = if owner_sub.starts_with("application:") {
+            APPLICATION_OWNER_BYTES
+        } else {
+            OWNER_BYTES
+        };
         if total_bytes <= 0
-            || used.saturating_add(reserved).saturating_add(total_bytes) > OWNER_BYTES
+            || used.saturating_add(reserved).saturating_add(total_bytes) > byte_limit
         {
-            return Err(AppError::api(
-                axum::http::StatusCode::TOO_MANY_REQUESTS,
-                "quota_exceeded",
-                "Storage quota would be exceeded.",
-                false,
-            ));
+            return Err(match application_rate {
+                Some((limit, remaining, reset)) => AppError::quota(
+                    "Storage quota would be exceeded.",
+                    limit,
+                    remaining,
+                    reset,
+                    60,
+                ),
+                None => AppError::api(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "quota_exceeded",
+                    "Storage quota would be exceeded.",
+                    false,
+                ),
+            });
         }
         if count >= MAX_ANALYSES || in_flight >= MAX_IN_FLIGHT {
-            return Err(AppError::api(
-                axum::http::StatusCode::TOO_MANY_REQUESTS,
-                "quota_exceeded",
-                "Analysis quota would be exceeded.",
-                false,
-            ));
+            return Err(match application_rate {
+                Some((limit, remaining, reset)) => AppError::quota(
+                    "Analysis quota would be exceeded.",
+                    limit,
+                    remaining,
+                    reset,
+                    1,
+                ),
+                None => AppError::api(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "quota_exceeded",
+                    "Analysis quota would be exceeded.",
+                    false,
+                ),
+            });
         }
         sqlx::query(
             "UPDATE owner_quotas SET reserved_bytes=reserved_bytes+$2, \
@@ -264,6 +346,19 @@ impl Store {
         .bind(filename)
         .execute(&mut *tx)
         .await?;
+        if owner_sub.starts_with("application:") {
+            sqlx::query(
+                "INSERT INTO application_upload_bindings(upload_id,application_sub,\
+                 finalize_operation_id,cancel_operation_id,reservation_state) \
+                 VALUES($1,$2,$3,$4,'reserved')",
+            )
+            .bind(upload_id)
+            .bind(owner_sub)
+            .bind(finalize_operation_id)
+            .bind(cancel_operation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "UPDATE idempotency_operations SET state='completed',lease_token=NULL,leased_at=NULL,\
              lease_until=NULL,resource_location=$4,response_status=201,response_body=$5,updated_at=now() \
@@ -691,6 +786,14 @@ impl Store {
         .ok_or(AppError::Invariant(
             "owner quota would underflow on finalize",
         ))?;
+        sqlx::query(
+            "UPDATE application_upload_bindings SET reservation_state='committed',updated_at=now() \
+             WHERE upload_id=$1 AND application_sub=$2 AND reservation_state='reserved'",
+        )
+        .bind(upload_id)
+        .bind(owner_sub)
+        .execute(&mut *tx)
+        .await?;
         if file_type == "unknown" {
             sqlx::query(
                 "UPDATE upload_sessions SET state='finalized',sample_id=$3,lease_token=NULL,leased_at=NULL,\
@@ -1310,6 +1413,14 @@ impl Store {
         .bind(owner_sub)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE application_upload_bindings SET reservation_state='released',updated_at=now() \
+             WHERE upload_id=$1 AND application_sub=$2 AND reservation_state='reserved'",
+        )
+        .bind(upload_id)
+        .bind(owner_sub)
+        .execute(&mut *tx)
+        .await?;
         insert_outbox(
             &mut tx,
             analysis_id,
@@ -1340,22 +1451,668 @@ impl Store {
         .bind(owner_sub)
         .fetch_optional(&self.pool)
         .await?;
+        let byte_limit = if owner_sub.starts_with("application:") {
+            APPLICATION_OWNER_BYTES
+        } else {
+            OWNER_BYTES
+        };
         Ok(match row {
             Some(row) => OwnerQuota {
                 used_bytes: row.get("used_bytes"),
                 reserved_bytes: row.get("reserved_bytes"),
                 analysis_count: row.get("analysis_count"),
-                byte_limit: OWNER_BYTES,
+                byte_limit,
                 analysis_limit: MAX_ANALYSES,
             },
             None => OwnerQuota {
                 used_bytes: 0,
                 reserved_bytes: 0,
                 analysis_count: 0,
-                byte_limit: OWNER_BYTES,
+                byte_limit,
                 analysis_limit: MAX_ANALYSES,
             },
         })
+    }
+
+    pub async fn claim_application_operation(
+        &self,
+        application_sub: &str,
+        canonical_tool: &str,
+        operation_id: Uuid,
+        request_sha256: &str,
+        correlation_id: Uuid,
+    ) -> Result<ApplicationOperationClaim> {
+        if !valid_application_sub(application_sub)
+            || !is_public_tool(canonical_tool)
+            || !is_sha256(request_sha256)
+        {
+            return Err(AppError::invalid(
+                "invalid_request",
+                "Application operation identity is invalid.",
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(824004001)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1||E'\\n'||$2,0))")
+            .bind(application_sub)
+            .bind(canonical_tool)
+            .execute(&mut *tx)
+            .await?;
+        let existing = sqlx::query(
+            "SELECT request_sha256,state,response_status,response_body,rate_limit,rate_remaining,rate_reset \
+             FROM application_operations WHERE application_sub=$1 AND canonical_tool=$2 \
+             AND operation_id=$3 FOR UPDATE",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(existing) = existing {
+            if existing.get::<String, _>("request_sha256") != request_sha256 {
+                return Err(AppError::conflict(
+                    "idempotency_mismatch",
+                    "The operation ID is bound to a different application request.",
+                ));
+            }
+            let state: String = existing.get("state");
+            if state == "completed" {
+                let replay = ApplicationOperationReplay {
+                    status: existing.get::<Option<i32>, _>("response_status").ok_or(
+                        AppError::Invariant("completed application operation omitted status"),
+                    )?,
+                    body: existing
+                        .get::<Option<serde_json::Value>, _>("response_body")
+                        .ok_or(AppError::Invariant(
+                            "completed application operation omitted body",
+                        ))?,
+                    quota: ApplicationQuotaSnapshot {
+                        rate_limit: existing.get("rate_limit"),
+                        rate_remaining: existing.get("rate_remaining"),
+                        rate_reset: existing.get("rate_reset"),
+                    },
+                };
+                tx.commit().await?;
+                return Ok(ApplicationOperationClaim::Replay(replay));
+            }
+            return Err(AppError::conflict(
+                "state_conflict",
+                "The application operation is pending audited reconciliation.",
+            ));
+        }
+
+        let (request_limit, window_seconds, concurrency_limit) =
+            application_tool_quota(canonical_tool)
+                .ok_or(AppError::Invariant("unknown application quota tool"))?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let window_start = now.div_euclid(window_seconds) * window_seconds;
+        let rate_reset = window_start + window_seconds;
+        let active_for_tool: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM application_operations WHERE application_sub=$1 \
+             AND canonical_tool=$2 AND reservation_active=true",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .fetch_one(&mut *tx)
+        .await?;
+        let active_system: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM application_operations WHERE reservation_active=true",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_for_tool >= concurrency_limit || active_system >= 32 {
+            return Err(AppError::quota(
+                "Application concurrency quota is exhausted.",
+                request_limit,
+                0,
+                rate_reset,
+                1,
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO application_quota_windows(application_sub,canonical_tool,window_start,\
+             window_seconds,request_limit) VALUES($1,$2,to_timestamp($3),$4,$5) \
+             ON CONFLICT(application_sub,canonical_tool,window_start) DO NOTHING",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(window_start)
+        .bind(window_seconds as i32)
+        .bind(request_limit)
+        .execute(&mut *tx)
+        .await?;
+        let used: i32 = sqlx::query_scalar(
+            "SELECT request_count FROM application_quota_windows WHERE application_sub=$1 \
+             AND canonical_tool=$2 AND window_start=to_timestamp($3) FOR UPDATE",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(window_start)
+        .fetch_one(&mut *tx)
+        .await?;
+        if used >= request_limit {
+            return Err(AppError::quota(
+                "Application rate quota is exhausted.",
+                request_limit,
+                0,
+                rate_reset,
+                (rate_reset - now).max(1),
+            ));
+        }
+        sqlx::query(
+            "UPDATE application_quota_windows SET request_count=request_count+1,updated_at=now() \
+             WHERE application_sub=$1 AND canonical_tool=$2 AND window_start=to_timestamp($3)",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(window_start)
+        .execute(&mut *tx)
+        .await?;
+        let lease_token = Uuid::new_v4();
+        let quota = ApplicationQuotaSnapshot {
+            rate_limit: request_limit,
+            rate_remaining: request_limit - used - 1,
+            rate_reset,
+        };
+        sqlx::query(
+            "INSERT INTO application_operations(application_sub,canonical_tool,operation_id,\
+             request_sha256,correlation_id,state,lease_token,leased_at,lease_until,\
+             rate_limit,rate_remaining,rate_reset) \
+             VALUES($1,$2,$3,$4,$5,'leased',$6,now(),now()+interval '5 minutes',$7,$8,$9)",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(operation_id)
+        .bind(request_sha256)
+        .bind(correlation_id)
+        .bind(lease_token)
+        .bind(quota.rate_limit)
+        .bind(quota.rate_remaining)
+        .bind(quota.rate_reset)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ApplicationOperationClaim::Claimed { lease_token, quota })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_application_operation(
+        &self,
+        application_sub: &str,
+        canonical_tool: &str,
+        operation_id: Uuid,
+        lease_token: Uuid,
+        response_status: i32,
+        response_body: &serde_json::Value,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE application_operations o SET state='completed',\
+             reservation_active=EXISTS(SELECT 1 FROM application_turn_executions e \
+             JOIN turns t ON t.id=e.turn_id WHERE e.application_operation_id=o.id \
+             AND t.state IN ('accepted','grounding','generating')),\
+             lease_token=NULL,leased_at=NULL,lease_until=NULL,response_status=$5,response_body=$6,\
+             updated_at=now() WHERE application_sub=$1 AND canonical_tool=$2 AND operation_id=$3 \
+             AND lease_token=$4 AND state='leased'",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(operation_id)
+        .bind(lease_token)
+        .bind(response_status)
+        .bind(response_body)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(AppError::conflict(
+                "state_conflict",
+                "The application operation lease changed before completion.",
+            ));
+        }
+        insert_application_operation_audit(
+            &mut tx,
+            application_sub,
+            canonical_tool,
+            operation_id,
+            "completed",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn begin_application_dispatch(
+        &self,
+        application_sub: &str,
+        canonical_tool: &str,
+        operation_id: Uuid,
+        lease_token: Uuid,
+    ) -> Result<()> {
+        let changed = sqlx::query(
+            "UPDATE application_operations SET dispatch_count=1,updated_at=now() \
+             WHERE application_sub=$1 AND canonical_tool=$2 AND operation_id=$3 \
+             AND lease_token=$4 AND state='leased' AND dispatch_count=0",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(operation_id)
+        .bind(lease_token)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(AppError::conflict(
+                "state_conflict",
+                "The application dispatch boundary was already crossed.",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn mark_application_operation_uncertain(
+        &self,
+        application_sub: &str,
+        canonical_tool: &str,
+        operation_id: Uuid,
+        lease_token: Uuid,
+        error_code: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE application_operations SET state='downstream_uncertain',lease_token=NULL,\
+             leased_at=NULL,lease_until=NULL,error_code=$5,updated_at=now() \
+             WHERE application_sub=$1 AND canonical_tool=$2 AND operation_id=$3 \
+             AND lease_token=$4 AND state='leased'",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(operation_id)
+        .bind(lease_token)
+        .bind(error_code)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(AppError::conflict(
+                "state_conflict",
+                "The application operation lease changed before uncertainty was recorded.",
+            ));
+        }
+        insert_application_operation_audit(
+            &mut tx,
+            application_sub,
+            canonical_tool,
+            operation_id,
+            "downstream_uncertain",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn fail_application_operation(
+        &self,
+        application_sub: &str,
+        canonical_tool: &str,
+        operation_id: Uuid,
+        lease_token: Uuid,
+        error_code: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE application_operations SET state='failed',reservation_active=false,\
+             lease_token=NULL,leased_at=NULL,lease_until=NULL,error_code=$5,updated_at=now() \
+             WHERE application_sub=$1 AND canonical_tool=$2 AND operation_id=$3 \
+             AND lease_token=$4 AND state='leased'",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(operation_id)
+        .bind(lease_token)
+        .bind(error_code)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(AppError::conflict(
+                "state_conflict",
+                "The application operation lease changed before failure.",
+            ));
+        }
+        insert_application_operation_audit(
+            &mut tx,
+            application_sub,
+            canonical_tool,
+            operation_id,
+            "failed",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn recover_expired_application_operation_leases(&self) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "UPDATE application_operations SET state='downstream_uncertain',lease_token=NULL,\
+             leased_at=NULL,lease_until=NULL,error_code='lease_expired_after_dispatch_boundary',\
+             updated_at=now() WHERE state='leased' AND lease_until<now() \
+             RETURNING application_sub,canonical_tool,operation_id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in &rows {
+            insert_application_operation_audit(
+                &mut tx,
+                row.get("application_sub"),
+                row.get("canonical_tool"),
+                row.get("operation_id"),
+                "downstream_uncertain",
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(rows.len() as u64)
+    }
+
+    pub async fn reconcile_application_operation(
+        &self,
+        canonical_tool: &str,
+        operation_id: Uuid,
+        request: &ApplicationReconciliationRequest,
+    ) -> Result<()> {
+        let application_sub = request.application_sub.as_str();
+        let reconciliation_id = request.reconciliation_id;
+        let completed = request.completed;
+        let response_status = request.response_status;
+        let response_body = request.response_body.as_ref();
+        if completed != response_status.is_some() || completed != response_body.is_some() {
+            return Err(AppError::invalid(
+                "invalid_request",
+                "Audited reconciliation result is incomplete.",
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE application_operations SET state=CASE WHEN $4 THEN 'completed' ELSE 'failed' END,\
+             reservation_active=false,response_status=$5,response_body=$6,\
+             error_code=CASE WHEN $4 THEN NULL ELSE 'audited_reconciliation_failed' END,updated_at=now() \
+             WHERE application_sub=$1 AND canonical_tool=$2 AND operation_id=$3 \
+             AND state='downstream_uncertain'",
+        )
+        .bind(application_sub)
+        .bind(canonical_tool)
+        .bind(operation_id)
+        .bind(completed)
+        .bind(response_status)
+        .bind(response_body)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            let replay: Option<(String, Option<i32>, Option<serde_json::Value>, String)> =
+                sqlx::query_as(
+                    "SELECT o.state,o.response_status,o.response_body,a.outcome \
+                 FROM application_operations o \
+                 JOIN application_audit_events a ON a.application_sub=o.application_sub \
+                 AND a.operation_id=o.operation_id WHERE o.application_sub=$1 \
+                 AND o.canonical_tool=$2 AND o.operation_id=$3 \
+                 AND a.authorization_event_id=$4 AND a.event_kind='reconciliation'",
+                )
+                .bind(application_sub)
+                .bind(canonical_tool)
+                .bind(operation_id)
+                .bind(reconciliation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let expected_state = if completed { "completed" } else { "failed" };
+            if replay
+                .as_ref()
+                .is_some_and(|(state, status, body, outcome)| {
+                    state == expected_state
+                        && outcome == expected_state
+                        && status == &response_status
+                        && body.as_ref() == response_body
+                })
+            {
+                tx.commit().await?;
+                return Ok(());
+            }
+            return Err(AppError::conflict(
+                "state_conflict",
+                "Only downstream-uncertain operations may be reconciled.",
+            ));
+        }
+        if !completed {
+            compensate_failed_application_upload(
+                &mut tx,
+                application_sub,
+                canonical_tool,
+                operation_id,
+            )
+            .await?;
+        }
+        insert_application_reconciliation_audit(
+            &mut tx,
+            application_sub,
+            canonical_tool,
+            operation_id,
+            reconciliation_id,
+            if completed { "completed" } else { "failed" },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_authorization_audit(
+        &self,
+        request: &AuthorizationAuditRequest,
+    ) -> Result<bool> {
+        request.validate()?;
+        if !valid_application_sub(&request.application_sub) {
+            return Err(AppError::invalid(
+                "invalid_request",
+                "Application subject is invalid.",
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let event_id = Uuid::new_v4();
+        let inserted = sqlx::query(
+            "INSERT INTO application_audit_events(id,application_sub,authorization_event_id,\
+             event_kind,outcome,canonical_tool,operation_id,decision_digest,correlation_id) \
+             VALUES($1,$2,$3,'authorization',$4,$5,$6,$7,$8) \
+             ON CONFLICT(application_sub,authorization_event_id) DO NOTHING",
+        )
+        .bind(event_id)
+        .bind(&request.application_sub)
+        .bind(request.authorization_event_id)
+        .bind(request.outcome.as_str())
+        .bind(request.canonical_tool.as_deref())
+        .bind(request.operation_id)
+        .bind(request.decision_digest.as_deref())
+        .bind(request.correlation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted == 1 {
+            insert_application_audit_outbox(
+                &mut tx,
+                event_id,
+                &request.application_sub,
+                "analyze.authorization.non_allow.v1",
+                json!({
+                    "authorization_event_id": request.authorization_event_id,
+                    "outcome": request.outcome.as_str(),
+                    "canonical_tool": request.canonical_tool,
+                    "operation_id": request.operation_id,
+                    "correlation_id": request.correlation_id
+                }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(inserted == 1)
+    }
+
+    pub async fn application_audit(
+        &self,
+        application_sub: &str,
+        limit: i64,
+    ) -> Result<Vec<ApplicationAuditEvent>> {
+        if !valid_application_sub(application_sub) || !(1..=500).contains(&limit) {
+            return Err(AppError::invalid(
+                "invalid_request",
+                "Application audit query is invalid.",
+            ));
+        }
+        Ok(sqlx::query_as::<_, ApplicationAuditEvent>(
+            "SELECT id,application_sub,authorization_event_id,event_kind,outcome,canonical_tool,\
+             operation_id,decision_digest,correlation_id,details,created_at \
+             FROM application_audit_events WHERE application_sub=$1 AND expires_at>now() \
+             ORDER BY created_at DESC,id DESC LIMIT $2",
+        )
+        .bind(application_sub)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn support_application_audit(
+        &self,
+        application_sub: &str,
+        authorization_event_id: Uuid,
+        correlation_id: Uuid,
+        has_support_capability: bool,
+    ) -> Result<Vec<ApplicationAuditEvent>> {
+        if !has_support_capability {
+            return Err(AppError::api(
+                axum::http::StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                "analyze.audit.support.read is required.",
+                false,
+            ));
+        }
+        let events = self.application_audit(application_sub, 500).await?;
+        let mut tx = self.pool.begin().await?;
+        let event_id = Uuid::new_v4();
+        let inserted = sqlx::query(
+            "INSERT INTO application_audit_events(id,application_sub,authorization_event_id,\
+             event_kind,outcome,correlation_id) VALUES($1,$2,$3,'support_read','support_read',$4) \
+             ON CONFLICT(application_sub,authorization_event_id) DO NOTHING",
+        )
+        .bind(event_id)
+        .bind(application_sub)
+        .bind(authorization_event_id)
+        .bind(correlation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted == 1 {
+            insert_application_audit_outbox(
+                &mut tx,
+                event_id,
+                application_sub,
+                "analyze.audit.support_read.v1",
+                json!({"authorization_event_id":authorization_event_id,"correlation_id":correlation_id}),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(events)
+    }
+
+    pub async fn application_quota_report(
+        &self,
+        application_sub: &str,
+    ) -> Result<serde_json::Value> {
+        if !valid_application_sub(application_sub) {
+            return Err(AppError::invalid(
+                "invalid_request",
+                "Application subject is invalid.",
+            ));
+        }
+        let owner = self.owner_quota(application_sub).await?;
+        let active: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT canonical_tool,count(*) FROM application_operations WHERE application_sub=$1 \
+             AND reservation_active=true GROUP BY canonical_tool ORDER BY canonical_tool",
+        )
+        .bind(application_sub)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(json!({
+            "application_sub": application_sub,
+            "tier": "mvp-default-v1",
+            "storage": owner,
+            "active_reservations": active.into_iter().collect::<std::collections::BTreeMap<_,_>>()
+        }))
+    }
+
+    pub async fn bind_application_upload(
+        &self,
+        application_sub: &str,
+        upload_id: Uuid,
+    ) -> Result<()> {
+        if !valid_application_sub(application_sub) {
+            return Err(AppError::invalid(
+                "invalid_request",
+                "Application subject is invalid.",
+            ));
+        }
+        let upload = self.get_upload(application_sub, upload_id).await?;
+        sqlx::query(
+            "INSERT INTO application_upload_bindings(upload_id,application_sub,finalize_operation_id,\
+             cancel_operation_id,reservation_state) VALUES($1,$2,$3,$4,'reserved') \
+             ON CONFLICT(upload_id) DO NOTHING",
+        )
+        .bind(upload_id)
+        .bind(application_sub)
+        .bind(server_operation_id("upload-finalize", &upload_id.to_string()))
+        .bind(server_operation_id("upload-cancel", &upload_id.to_string()))
+        .execute(&self.pool)
+        .await?;
+        if upload.owner_sub != application_sub {
+            return Err(AppError::not_found());
+        }
+        Ok(())
+    }
+
+    pub async fn assert_application_upload(
+        &self,
+        application_sub: &str,
+        upload_id: Uuid,
+    ) -> Result<()> {
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM application_upload_bindings \
+             WHERE upload_id=$1 AND application_sub=$2)",
+        )
+        .bind(upload_id)
+        .bind(application_sub)
+        .fetch_one(&self.pool)
+        .await?;
+        if !owned {
+            return Err(AppError::not_found());
+        }
+        Ok(())
+    }
+
+    pub async fn application_finalize_operation_id(
+        &self,
+        application_sub: &str,
+        upload_id: Uuid,
+    ) -> Result<Uuid> {
+        sqlx::query_scalar(
+            "SELECT finalize_operation_id FROM application_upload_bindings \
+             WHERE application_sub=$1 AND upload_id=$2",
+        )
+        .bind(application_sub)
+        .bind(upload_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(AppError::not_found)
     }
 
     pub async fn idempotency_replay(
@@ -2088,6 +2845,63 @@ impl Store {
         model_alias: &str,
         message: &str,
     ) -> Result<Turn> {
+        self.create_turn_inner(
+            TurnAdmission {
+                owner_sub,
+                analysis_id,
+                conversation_id,
+                operation_id,
+                client_seq,
+                request_sha256,
+                model_alias,
+                message,
+            },
+            None,
+        )
+        .await
+    }
+
+    pub async fn create_application_turn(
+        &self,
+        request: &FacadeToolRequest,
+        conversation_id: Uuid,
+        client_seq: i64,
+        model_alias: &str,
+        message: &str,
+    ) -> Result<Turn> {
+        let analysis_id = Uuid::parse_str(&request.resource)
+            .map_err(|_| AppError::invalid("invalid_request", "Analysis resource is invalid."))?;
+        self.create_turn_inner(
+            TurnAdmission {
+                owner_sub: &request.application_sub,
+                analysis_id,
+                conversation_id,
+                operation_id: request.operation_id,
+                client_seq,
+                request_sha256: &request.request_sha256,
+                model_alias,
+                message,
+            },
+            Some(&request.execution),
+        )
+        .await
+    }
+
+    async fn create_turn_inner(
+        &self,
+        input: TurnAdmission<'_>,
+        execution: Option<&ExecutionEnvelopeV1>,
+    ) -> Result<Turn> {
+        let TurnAdmission {
+            owner_sub,
+            analysis_id,
+            conversation_id,
+            operation_id,
+            client_seq,
+            request_sha256,
+            model_alias,
+            message,
+        } = input;
         let mut tx = self.pool.begin().await?;
         let conversation = sqlx::query_as::<_, Conversation>(&format!(
             "SELECT {CONVERSATION_COLUMNS} FROM conversations WHERE id=$1 AND analysis_id=$2 AND owner_sub=$3 FOR UPDATE"
@@ -2142,6 +2956,25 @@ impl Store {
         .bind(model_alias)
         .execute(&mut *tx)
         .await?;
+        if let Some(execution) = execution {
+            execution.validate_binding(owner_sub, request_sha256, OffsetDateTime::now_utc())?;
+            let changed = sqlx::query(
+                "INSERT INTO application_turn_executions(turn_id,application_operation_id,execution) \
+                 SELECT $1,id,$2 FROM application_operations WHERE application_sub=$3 \
+                 AND canonical_tool='analysis.conversation' AND operation_id=$4 \
+                 AND request_sha256=$5 AND state='leased' AND dispatch_count=1 AND reservation_active",
+            )
+            .bind(turn_id)
+            .bind(serde_json::to_value(execution).map_err(|_| AppError::Invariant("application execution is not serializable"))?)
+            .bind(owner_sub).bind(operation_id).bind(request_sha256)
+            .execute(&mut *tx).await?.rows_affected();
+            if changed != 1 {
+                return Err(AppError::conflict(
+                    "state_conflict",
+                    "Application turn admission changed.",
+                ));
+            }
+        }
         sqlx::query(
             "INSERT INTO messages(id,turn_id,conversation_id,analysis_id,owner_sub,seq,role,client_seq,status,content) \
              VALUES($1,$2,$3,$4,$5,$6,'user',$7,'committed',$8),\
@@ -2305,6 +3138,11 @@ impl Store {
         let lease = Uuid::new_v4();
         let query = format!(
             "WITH candidate AS (SELECT id FROM turns WHERE state IN ('accepted','grounding','generating') \
+             AND (owner_sub NOT LIKE 'application:%' OR EXISTS(SELECT 1 \
+               FROM application_turn_executions e JOIN application_operations o ON o.id=e.application_operation_id \
+               WHERE e.turn_id=turns.id AND o.application_sub=turns.owner_sub \
+               AND o.operation_id=turns.operation_id AND o.request_sha256=turns.request_sha256 \
+               AND o.state='completed' AND o.reservation_active)) \
              AND (generation_lease_until IS NULL OR generation_lease_until<now()) ORDER BY created_at,id \
              FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE turns t SET generation_lease_token=$1,\
              generation_leased_at=now(),generation_lease_until=now()+interval '5 minutes',\
@@ -2315,6 +3153,51 @@ impl Store {
             .bind(lease)
             .fetch_optional(&self.pool)
             .await?)
+    }
+
+    pub async fn application_turn_execution(
+        &self,
+        turn: &Turn,
+    ) -> Result<Option<(ExecutionEnvelopeV1, String)>> {
+        if !turn.owner_sub.starts_with("application:") {
+            return Ok(None);
+        }
+        let (execution, provider_state): (serde_json::Value, String) = sqlx::query_as(
+            "SELECT e.execution,e.provider_state FROM application_turn_executions e \
+             JOIN application_operations o ON o.id=e.application_operation_id \
+             WHERE e.turn_id=$1 AND o.application_sub=$2 AND o.operation_id=$3 \
+             AND o.canonical_tool='analysis.conversation' AND o.request_sha256=$4",
+        )
+        .bind(turn.id)
+        .bind(&turn.owner_sub)
+        .bind(turn.operation_id)
+        .bind(&turn.request_sha256)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::Invariant(
+            "application turn has no execution binding",
+        ))?;
+        let envelope = serde_json::from_value(execution)
+            .map_err(|_| AppError::Invariant("application turn execution is invalid"))?;
+        Ok(Some((envelope, provider_state)))
+    }
+
+    pub async fn begin_application_turn_dispatch(&self, turn: &Turn) -> Result<()> {
+        let changed = sqlx::query(
+            "UPDATE application_turn_executions e SET provider_state='dispatched',updated_at=now() \
+             FROM turns t,application_operations o WHERE e.turn_id=$1 AND t.id=e.turn_id \
+             AND t.generation_lease_token=$2 AND t.state='generating' AND t.generation_lease_until>now() \
+             AND o.id=e.application_operation_id AND o.application_sub=t.owner_sub \
+             AND o.operation_id=t.operation_id AND o.request_sha256=t.request_sha256 \
+             AND o.state='completed' AND o.reservation_active AND e.provider_state='pending'",
+        ).bind(turn.id).bind(turn.generation_lease_token).execute(&self.pool).await?.rows_affected();
+        if changed != 1 {
+            return Err(AppError::conflict(
+                "state_conflict",
+                "Application turn was already dispatched or its lease changed.",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn assistant_message(&self, turn_id: Uuid) -> Result<Message> {
@@ -2436,6 +3319,50 @@ impl Store {
             .bind(completion_tokens)
             .bind(model)
             .execute(&mut *tx)
+            .await?;
+        }
+        if turn.owner_sub.starts_with("application:") {
+            let binding: Option<(i64, String)> = sqlx::query_as(
+                "SELECT application_operation_id,provider_state FROM application_turn_executions \
+                 WHERE turn_id=$1 FOR UPDATE",
+            )
+            .bind(turn.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let (operation, provider_state) = binding.ok_or(AppError::Invariant(
+                "application turn has no execution binding",
+            ))?;
+            let uncertain = provider_state != "pending" && state != "completed";
+            let changed = sqlx::query(
+                "UPDATE application_operations SET reservation_active=$2,\
+                 state=CASE WHEN $2 THEN 'downstream_uncertain' ELSE state END,\
+                 response_status=CASE WHEN $2 THEN NULL ELSE response_status END,\
+                 response_body=CASE WHEN $2 THEN NULL ELSE response_body END,\
+                 error_code=$3,updated_at=now() WHERE id=$1 AND state='completed' AND reservation_active",
+            ).bind(operation).bind(uncertain).bind(error_code)
+                .execute(&mut *tx).await?.rows_affected();
+            if changed != 1 {
+                return Err(AppError::conflict(
+                    "state_conflict",
+                    "Application turn reservation changed.",
+                ));
+            }
+            sqlx::query("UPDATE application_turn_executions SET provider_state=$2,updated_at=now() WHERE turn_id=$1")
+                .bind(turn.id).bind(if uncertain { "uncertain" } else { "completed" })
+                .execute(&mut *tx).await?;
+            insert_application_operation_audit(
+                &mut tx,
+                &turn.owner_sub,
+                "analysis.conversation",
+                turn.operation_id,
+                if uncertain {
+                    "downstream_uncertain"
+                } else if state == "completed" {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            )
             .await?;
         }
         insert_outbox(
@@ -2574,6 +3501,7 @@ impl Store {
         let message_id: Option<Uuid> = sqlx::query_scalar(
             "SELECT m.id FROM messages m JOIN turns t ON t.id=m.turn_id \
              WHERE m.role='assistant' AND m.content LIKE '%[ref:%' \
+             AND t.owner_sub NOT LIKE 'application:%' \
              AND t.state IN ('completed','partial') AND (\
                (NOT EXISTS(SELECT 1 FROM citations c WHERE c.message_id=m.id) \
                 AND m.updated_at<=now()-interval '30 seconds') OR \
@@ -3321,6 +4249,20 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
+            "DELETE FROM application_operations WHERE expires_at<=now() AND NOT reservation_active",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM application_audit_events WHERE expires_at<=now()")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM application_quota_windows \
+             WHERE window_start + make_interval(secs=>window_seconds)<=now()-interval '1 day'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "DELETE FROM sample_objects WHERE lifecycle='deleted' AND updated_at<=now()-interval '30 days'",
         )
         .execute(&mut *tx)
@@ -3378,6 +4320,288 @@ async fn insert_outbox(
     .bind(payload)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+async fn insert_application_operation_audit(
+    tx: &mut Transaction<'_, Postgres>,
+    application_sub: &str,
+    canonical_tool: &str,
+    operation_id: Uuid,
+    outcome: &str,
+) -> Result<()> {
+    let event_id = Uuid::new_v4();
+    let authorization_event_id = Uuid::new_v4();
+    let correlation_id: Uuid = sqlx::query_scalar(
+        "SELECT correlation_id FROM application_operations WHERE application_sub=$1 \
+         AND canonical_tool=$2 AND operation_id=$3",
+    )
+    .bind(application_sub)
+    .bind(canonical_tool)
+    .bind(operation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO application_audit_events(id,application_sub,authorization_event_id,event_kind,\
+         outcome,canonical_tool,operation_id,correlation_id) \
+         VALUES($1,$2,$3,'operation',$4,$5,$6,$7)",
+    )
+    .bind(event_id)
+    .bind(application_sub)
+    .bind(authorization_event_id)
+    .bind(outcome)
+    .bind(canonical_tool)
+    .bind(operation_id)
+    .bind(correlation_id)
+    .execute(&mut **tx)
+    .await?;
+    insert_application_audit_outbox(
+        tx,
+        event_id,
+        application_sub,
+        "analyze.application.operation.v1",
+        json!({
+            "authorization_event_id": authorization_event_id,
+            "canonical_tool": canonical_tool,
+            "operation_id": operation_id,
+            "outcome": outcome,
+            "correlation_id": correlation_id
+        }),
+    )
+    .await
+}
+
+async fn insert_application_reconciliation_audit(
+    tx: &mut Transaction<'_, Postgres>,
+    application_sub: &str,
+    canonical_tool: &str,
+    operation_id: Uuid,
+    reconciliation_id: Uuid,
+    outcome: &str,
+) -> Result<()> {
+    let event_id = Uuid::new_v4();
+    let correlation_id: Uuid = sqlx::query_scalar(
+        "SELECT correlation_id FROM application_operations WHERE application_sub=$1 \
+         AND canonical_tool=$2 AND operation_id=$3",
+    )
+    .bind(application_sub)
+    .bind(canonical_tool)
+    .bind(operation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO application_audit_events(id,application_sub,authorization_event_id,event_kind,\
+         outcome,canonical_tool,operation_id,correlation_id) \
+         VALUES($1,$2,$3,'reconciliation',$4,$5,$6,$7)",
+    )
+    .bind(event_id)
+    .bind(application_sub)
+    .bind(reconciliation_id)
+    .bind(outcome)
+    .bind(canonical_tool)
+    .bind(operation_id)
+    .bind(correlation_id)
+    .execute(&mut **tx)
+    .await?;
+    insert_application_audit_outbox(
+        tx,
+        event_id,
+        application_sub,
+        "analyze.application.reconciliation.v1",
+        json!({
+            "reconciliation_id": reconciliation_id,
+            "canonical_tool": canonical_tool,
+            "operation_id": operation_id,
+            "outcome": outcome,
+            "correlation_id": correlation_id
+        }),
+    )
+    .await
+}
+
+async fn insert_application_audit_outbox(
+    tx: &mut Transaction<'_, Postgres>,
+    audit_event_id: Uuid,
+    application_sub: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO application_audit_outbox(id,audit_event_id,application_sub,event_type,payload) \
+         VALUES($1,$2,$3,$4,$5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(audit_event_id)
+    .bind(application_sub)
+    .bind(event_type)
+    .bind(payload)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn application_tool_quota(tool: &str) -> Option<(i32, i64, i64)> {
+    match tool {
+        "analysis.create" => Some((4, 3600, 1)),
+        "analysis.read" => Some((120, 60, 8)),
+        "analysis.conversation" => Some((12, 60, 2)),
+        "analysis.upload.cancel" => Some((30, 60, 4)),
+        _ => None,
+    }
+}
+
+fn valid_application_sub(value: &str) -> bool {
+    value.strip_prefix("application:").is_some_and(|opaque| {
+        !opaque.is_empty()
+            && opaque.len() <= 220
+            && opaque
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    })
+}
+
+fn valid_owner_sub(value: &str) -> bool {
+    if valid_application_sub(value) {
+        return true;
+    }
+    value.strip_prefix("user:").is_some_and(|opaque| {
+        !opaque.is_empty()
+            && opaque.len() <= 240
+            && !opaque.starts_with("user:")
+            && !opaque.chars().any(char::is_control)
+    })
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+async fn compensate_failed_application_upload(
+    tx: &mut Transaction<'_, Postgres>,
+    application_sub: &str,
+    canonical_tool: &str,
+    operation_id: Uuid,
+) -> Result<()> {
+    if !matches!(canonical_tool, "analysis.create" | "analysis.upload.cancel") {
+        return Ok(());
+    }
+    let binding: Option<(Uuid, String, i64, Uuid, String)> = sqlx::query_as(
+        "SELECT b.upload_id,b.reservation_state,u.total_bytes,u.analysis_id,u.state \
+         FROM application_upload_bindings b JOIN upload_sessions u ON u.id=b.upload_id \
+         WHERE b.application_sub=$1 AND (($2='analysis.create' \
+         AND (b.finalize_operation_id=$3 OR u.operation_id=$3)) \
+         OR ($2='analysis.upload.cancel' AND b.cancel_operation_id=$3)) \
+         FOR UPDATE OF b,u",
+    )
+    .bind(application_sub)
+    .bind(canonical_tool)
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((upload_id, reservation_state, total_bytes, analysis_id, upload_state)) = binding
+    else {
+        return Ok(());
+    };
+    if reservation_state == "committed" {
+        return Err(AppError::conflict(
+            "state_conflict",
+            "A committed upload cannot be compensated as a failed operation.",
+        ));
+    }
+    if reservation_state == "released" {
+        return Ok(());
+    }
+    let released = sqlx::query(
+        "UPDATE owner_quotas SET reserved_bytes=reserved_bytes-$2,updated_at=now() \
+         WHERE owner_sub=$1 AND reserved_bytes >= $2",
+    )
+    .bind(application_sub)
+    .bind(total_bytes)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if released != 1 {
+        return Err(AppError::Invariant(
+            "owner quota would underflow during application reconciliation",
+        ));
+    }
+    let binding_released = sqlx::query(
+        "UPDATE application_upload_bindings SET reservation_state='released',updated_at=now() \
+         WHERE upload_id=$1 AND application_sub=$2 AND reservation_state='reserved'",
+    )
+    .bind(upload_id)
+    .bind(application_sub)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if binding_released != 1 {
+        return Err(AppError::Invariant(
+            "application upload reservation changed during reconciliation",
+        ));
+    }
+    if canonical_tool == "analysis.upload.cancel" {
+        sqlx::query(
+            "UPDATE upload_sessions SET state='cancelled',filename='deleted',sample_id=NULL,\
+             lease_token=NULL,leased_at=NULL,lease_until=NULL,frozen_status=NULL,\
+             frozen_location=NULL,frozen_body=NULL,error_code=NULL,updated_at=now() \
+             WHERE id=$1 AND owner_sub=$2",
+        )
+        .bind(upload_id)
+        .bind(application_sub)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE analyses SET state='failed',display_name='deleted',sample_id=NULL,\
+             updated_at=now() WHERE id=$1 AND owner_sub=$2",
+        )
+        .bind(analysis_id)
+        .bind(application_sub)
+        .execute(&mut **tx)
+        .await?;
+        insert_outbox(
+            tx,
+            analysis_id,
+            application_sub,
+            "upload.cancelled",
+            json!({"analysis_id":analysis_id,"state":"failed"}),
+        )
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE upload_sessions SET state='failed',sample_id=NULL,lease_token=NULL,\
+             leased_at=NULL,lease_until=NULL,frozen_status=NULL,frozen_location=NULL,\
+             frozen_body=NULL,error_code='audited_reconciliation_failed',updated_at=now() \
+             WHERE id=$1 AND owner_sub=$2",
+        )
+        .bind(upload_id)
+        .bind(application_sub)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE analyses SET state='failed',sample_id=NULL,updated_at=now() \
+             WHERE id=$1 AND owner_sub=$2",
+        )
+        .bind(analysis_id)
+        .bind(application_sub)
+        .execute(&mut **tx)
+        .await?;
+        insert_outbox(
+            tx,
+            analysis_id,
+            application_sub,
+            "analysis.failed",
+            json!({
+                "analysis_id":analysis_id,
+                "state":"failed",
+                "error_code":"audited_reconciliation_failed",
+                "previous_upload_state":upload_state
+            }),
+        )
+        .await?;
+    }
     Ok(())
 }
 

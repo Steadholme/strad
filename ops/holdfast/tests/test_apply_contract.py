@@ -451,6 +451,10 @@ class ApplyContractTests(unittest.TestCase):
             key: chr(ord("a") + index) * 32
             for index, key in enumerate(render.SECRET_KEYS)
         }
+        secrets["ANALYZE_REPORTING_URL"] = "https://strad.internal"
+        secrets["ANALYZE_FACADE_REVOCATION_URL"] = (
+            "https://analyze.internal/internal/v1/application-session-revocations"
+        )
 
         render.render_full_env(stage, release, secrets)
 
@@ -529,6 +533,10 @@ class ApplyContractTests(unittest.TestCase):
             rendered,
         )
         self.assertNotIn("ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-5", rendered)
+        self.assertIn(
+            "ensure_dir /data/workspaces/ghidra-projects 1000 1000", rendered
+        )
+        self.assertNotIn("/data/workspaces/.ghidra-projects", rendered)
         self.assertEqual(
             render.parse_checksum_manifest(OPS_ROOT / "static-targets.sha256")[
                 "deploy/docker-compose.yml"

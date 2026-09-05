@@ -30,6 +30,44 @@ pub struct Identity {
     pub request_id: Uuid,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplicationIdentity {
+    pub subject: String,
+}
+
+impl ApplicationIdentity {
+    pub fn parse(raw: &str) -> Result<Self, AppError> {
+        let Some(opaque) = raw.strip_prefix("application:") else {
+            return Err(unauthenticated());
+        };
+        if opaque.is_empty()
+            || opaque.len() > 220
+            || !opaque
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(unauthenticated());
+        }
+        Ok(Self {
+            subject: raw.to_string(),
+        })
+    }
+}
+
+pub fn verify_service_bearer(headers: &HeaderMap, expected: &str) -> Result<(), AppError> {
+    let value = exactly_one(headers, header::AUTHORIZATION.as_str())?;
+    let Some(candidate) = value.strip_prefix(b"Bearer ") else {
+        return Err(unauthenticated());
+    };
+    if candidate.len() != expected.len()
+        || !bool::from(candidate.ct_eq(expected.as_bytes()))
+        || headers.contains_key(header::COOKIE)
+    {
+        return Err(unauthenticated());
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct AuthVerifier {
     identity_key: Vec<u8>,
@@ -479,5 +517,34 @@ mod tests {
             headers.insert(header::ORIGIN, HeaderValue::from_static(legacy.1));
             assert!(verify_same_origin(&headers, "rikune.w33d.xyz").is_err());
         }
+    }
+
+    #[test]
+    fn application_identity_and_service_bearer_are_strictly_separate_from_humans() {
+        assert_eq!(
+            ApplicationIdentity::parse("application:client_A-1")
+                .unwrap()
+                .subject,
+            "application:client_A-1"
+        );
+        for invalid in [
+            "user:client_A-1",
+            "application:",
+            "application:user:client",
+            "application:client/one",
+        ] {
+            assert!(ApplicationIdentity::parse(invalid).is_err());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"),
+        );
+        assert!(verify_service_bearer(&headers, &"q".repeat(32)).is_ok());
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("session=forbidden"),
+        );
+        assert!(verify_service_bearer(&headers, &"q".repeat(32)).is_err());
     }
 }

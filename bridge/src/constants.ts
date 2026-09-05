@@ -60,7 +60,7 @@ export const CHILD_ENV_BASE: Readonly<Record<string, string>> = Object.freeze({
   AUDIT_LOG_PATH: '/data/audit/audit.log',
   GHIDRA_INSTALL_DIR: '/opt/ghidra',
   GHIDRA_PATH: '/opt/ghidra',
-  GHIDRA_PROJECT_ROOT: '/data/workspaces/.ghidra-projects',
+  GHIDRA_PROJECT_ROOT: '/data/workspaces/ghidra-projects',
   GHIDRA_LOG_ROOT: '/data/audit/ghidra',
   RIZIN_PATH: '/opt/rizin/bin/rizin',
   SANDBOX_PYTHON_PATH: '/usr/local/bin/python3',

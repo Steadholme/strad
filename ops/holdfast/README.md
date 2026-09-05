@@ -6,6 +6,13 @@ route database without a separate explicit `--execute` ceremony. The existing W3
 and DNS are observed but never changed by this package. No production secret value belongs here or
 in Git.
 
+## Analyze rollout scope
+
+This runbook describes the existing Rikune release ceremony, where Analyze is a
+closed tombstone. The newer approved Analyze MCP/API rollout is tracked in
+[`../analyze/README.md`](../analyze/README.md) and is not yet implemented by this
+public-open ceremony. Do not treat a successful Rikune open as an Analyze launch.
+
 ## Immutable release inputs
 
 Create a mode-`0600` release env outside the repository from `release.env.example`. Every image,

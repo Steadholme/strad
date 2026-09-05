@@ -14,6 +14,7 @@ pub enum AppError {
         code: &'static str,
         message: &'static str,
         retryable: bool,
+        quota: Option<QuotaHeaders>,
     },
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
@@ -23,6 +24,14 @@ pub enum AppError {
     Upstream,
     #[error("server invariant violated: {0}")]
     Invariant(&'static str),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct QuotaHeaders {
+    pub limit: i32,
+    pub remaining: i32,
+    pub reset: i64,
+    pub retry_after: i64,
 }
 
 #[derive(Serialize)]
@@ -50,6 +59,28 @@ impl AppError {
             code,
             message,
             retryable,
+            quota: None,
+        }
+    }
+
+    pub fn quota(
+        message: &'static str,
+        limit: i32,
+        remaining: i32,
+        reset: i64,
+        retry_after: i64,
+    ) -> Self {
+        Self::Api {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "quota_exceeded",
+            message,
+            retryable: true,
+            quota: Some(QuotaHeaders {
+                limit,
+                remaining,
+                reset,
+                retry_after,
+            }),
         }
     }
 
@@ -101,6 +132,7 @@ impl IntoResponse for AppError {
                 code,
                 message,
                 retryable,
+                ..
             } => (*status, *code, *message, *retryable),
             Self::Database(error) => {
                 tracing::error!(error = %error, "database operation failed");
@@ -152,6 +184,24 @@ impl IntoResponse for AppError {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        }
+        if let Self::Api {
+            quota: Some(quota), ..
+        } = self
+        {
+            for (name, value) in [
+                ("x-ratelimit-limit", quota.limit.to_string()),
+                ("x-ratelimit-remaining", quota.remaining.to_string()),
+                ("x-ratelimit-reset", quota.reset.to_string()),
+                (header::RETRY_AFTER.as_str(), quota.retry_after.to_string()),
+            ] {
+                if let (Ok(name), Ok(value)) = (
+                    axum::http::HeaderName::try_from(name),
+                    HeaderValue::from_str(&value),
+                ) {
+                    response.headers_mut().insert(name, value);
+                }
+            }
         }
         response
     }

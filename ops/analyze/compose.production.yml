@@ -1,0 +1,86 @@
+# Merge with the existing estate Compose file. This overlay does not publish a
+# new port or open a route. Pin every image before rendering a release.
+services:
+  sluice:
+    image: ${ANALYZE_SLUICE_IMAGE:?immutable Analyze Sluice image is required}
+    environment: &application_gateway
+      ACCESS_APPLICATION_INTROSPECTION_URL: http://access-governance:9390/internal/v1/application-credentials/introspect
+      ACCESS_INTROSPECTION_TOKEN: ${ACCESS_INTROSPECTION_TOKEN:?application introspection token is required}
+      SLUICE_APPLICATION_CONTEXT_ACTIVE_KID: ${SLUICE_APPLICATION_CONTEXT_ACTIVE_KID:?application signing KID is required}
+      SLUICE_APPLICATION_CONTEXT_SIGNING_KEYRING: ${SLUICE_APPLICATION_CONTEXT_SIGNING_KEYRING:?application signing keyring is required}
+      TRUSTED_MFA: "on"
+      MFA_ASSERTION_HMAC_KEY: ${MFA_ASSERTION_HMAC_KEY:?existing trusted MFA key is required}
+      KEYSTONE_ASSURANCE_SERVICE_TOKEN: ${KEYSTONE_ASSURANCE_SERVICE_TOKEN:?existing assurance token is required}
+
+  sluice-internal:
+    image: ${ANALYZE_SLUICE_IMAGE:?immutable Analyze Sluice image is required}
+    environment: *application_gateway
+
+  access-governance:
+    image: ${ANALYZE_ACCESS_IMAGE:?immutable Analyze Access image is required}
+    environment:
+      PUBLIC_HOST: access.w33d.xyz
+      GATEWAY_ROUTE_NAME: access-root
+      TRUSTED_MFA: "true"
+      SLUICE_STEP_UP_PATH: /_gw/auth/step-up
+      MFA_ASSERTION_HMAC_KEY: ${MFA_ASSERTION_HMAC_KEY:?existing trusted MFA key is required}
+      ACCESS_ANALYZE_EXTERNAL_ORIGIN: https://analyze.w33d.xyz
+      ACCESS_ANALYZE_STEP_UP_RESUME_PATH: /applications/
+      ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING: ${SLUICE_APPLICATION_CONTEXT_VERIFICATION_KEYRING:?matching public signing keyring is required}
+      ACCESS_ANALYZE_APPROVAL_ACTIVE_KID: ${ACCESS_ANALYZE_APPROVAL_ACTIVE_KID:?approval signing KID is required}
+      ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING: ${ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING:?approval signing keyring is required}
+      ACCESS_APPLICATION_CREDENTIAL_PEPPER: ${ACCESS_APPLICATION_CREDENTIAL_PEPPER:?application credential pepper is required}
+      ACCESS_INTROSPECTION_TOKEN: ${ACCESS_INTROSPECTION_TOKEN:?application introspection token is required}
+      STRAD_ACCESS_EXECUTION_FENCE_TOKEN: ${STRAD_ACCESS_EXECUTION_FENCE_TOKEN:?execution fence token is required}
+      ACCESS_FACADE_REVOCATION_TOKEN: ${ACCESS_FACADE_REVOCATION_TOKEN:?revocation token is required}
+      ANALYZE_FACADE_REVOCATION_URL: https://sso.w33d.xyz/internal/v1/application-session-revocations
+      ANALYZE_REPORTING_URL: https://sso.w33d.xyz/
+      STRAD_GOVERNANCE_REPORTING_TOKEN: ${STRAD_GOVERNANCE_REPORTING_TOKEN:?governance reporting token is required}
+
+  verdict:
+    image: ${ANALYZE_VERDICT_IMAGE:?immutable application-aware Verdict image is required}
+
+  strad:
+    image: ${ANALYZE_STRAD_IMAGE:?immutable application-aware Strad image is required}
+    environment:
+      STRAD_FACADE_TOKEN: ${STRAD_FACADE_TOKEN:?private facade token is required}
+      STRAD_GOVERNANCE_REPORTING_TOKEN: ${STRAD_GOVERNANCE_REPORTING_TOKEN:?governance reporting token is required}
+      STRAD_ACCESS_EXECUTION_FENCE_TOKEN: ${STRAD_ACCESS_EXECUTION_FENCE_TOKEN:?execution fence token is required}
+      ACCESS_EXECUTION_FENCE_URL: https://sso.w33d.xyz/internal/v1/application-execution-fence/check
+    # Reach the existing certificate-valid internal gateway alias, not public DNS.
+    networks: [hf-mgmt]
+
+  rikune-analyzer:
+    image: ${ANALYZE_ANALYZER_IMAGE:?immutable real-Ghidra analyzer image is required}
+
+  analyze-facade:
+    image: ${ANALYZE_FACADE_IMAGE:?immutable Analyze facade image is required}
+    user: "1000:1000"
+    environment:
+      ANALYZE_FACADE_BIND_ADDR: 0.0.0.0:18120
+      FACADE_DATABASE_URL: ${ANALYZE_FACADE_DATABASE_URL:?dedicated facade PostgreSQL database and role are required}
+      ANALYZE_EXTERNAL_ORIGIN: https://analyze.w33d.xyz
+      # Sluice preserves the original Host on the internal revocation route.
+      ANALYZE_FACADE_INTERNAL_HOST: sso.w33d.xyz
+      FACADE_VERDICT_DECISION_URL: https://sso.w33d.xyz/api/v2/application-check
+      VERDICT_DECISION_TOKEN: ${VERDICT_DECISION_TOKEN:?existing Verdict decision token is required}
+      FACADE_STRAD_ORIGIN: https://sso.w33d.xyz/
+      STRAD_FACADE_TOKEN: ${STRAD_FACADE_TOKEN:?private facade token is required}
+      ACCESS_FACADE_REVOCATION_TOKEN: ${ACCESS_FACADE_REVOCATION_TOKEN:?revocation token is required}
+      SLUICE_APPLICATION_CONTEXT_ACTIVE_KID: ${SLUICE_APPLICATION_CONTEXT_ACTIVE_KID:?application signing KID is required}
+      SLUICE_APPLICATION_CONTEXT_VERIFICATION_KEYRING: ${SLUICE_APPLICATION_CONTEXT_VERIFICATION_KEYRING:?matching public signing keyring is required}
+    depends_on:
+      postgres: {condition: service_healthy}
+      strad: {condition: service_started}
+      verdict: {condition: service_started}
+      access-governance: {condition: service_started}
+      sluice-internal: {condition: service_started}
+    networks: [hf-mgmt]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 1
+    mem_limit: 512m
+    pids_limit: 128
+    restart: unless-stopped

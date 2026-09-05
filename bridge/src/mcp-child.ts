@@ -8,7 +8,6 @@ import {
   ACTIVATION_TARGETS,
   BUSINESS_TOOL_NAMES,
   MAX_MCP_RESPONSE_BYTES,
-  REQUIRED_TOOL_NAMES,
 } from './constants.js'
 import type { BridgeConfig } from './config.js'
 import { BridgeError } from './errors.js'
@@ -17,6 +16,7 @@ import {
   validateStaticBackendEnvironment,
 } from './static-lock.js'
 import { validateAndProjectBusinessResult } from './schemas.js'
+import { verifyFrozenToolCatalog } from './tool-catalog.js'
 
 type JsonRecord = Record<string, unknown>
 
@@ -167,6 +167,7 @@ export class RikuneChild implements AnalyzerClient {
   private initialized = false
   private bootVerified = false
   private startPromise: Promise<void> | null = null
+  private toolCatalogFingerprint: string | null = null
 
   constructor(
     private readonly config: BridgeConfig,
@@ -290,14 +291,9 @@ export class RikuneChild implements AnalyzerClient {
   }
 
   private async verifyExactToolSet(): Promise<void> {
-    const result = await this.client.listTools()
-    const names = result.tools.map((tool) => tool.name).sort()
-    if (
-      names.length !== REQUIRED_TOOL_NAMES.length ||
-      names.some((name, index) => name !== REQUIRED_TOOL_NAMES[index])
-    ) {
-      throw new Error('child MCP visible tool set differs from the frozen six-tool contract')
-    }
+    this.toolCatalogFingerprint = await verifyFrozenToolCatalog(
+      this.client, this.toolCatalogFingerprint
+    )
   }
 
   private async passiveStatusProbe(): Promise<void> {

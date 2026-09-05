@@ -14,7 +14,7 @@ test('artifact read request fixes the content prefix bound at 256 KiB', () => {
   }
   const parsed = parseRouteBody('/internal/v1/artifacts/read', request)
 
-  assert.equal(parsed.max_bytes, 256 * 1024)
+  assert.equal(parsed.max_bytes, 1024 * 1024)
   assert.equal(parsed.encoding, 'auto')
   assert.throws(() =>
     parseRouteBody('/internal/v1/artifacts/read', { ...request, max_bytes: 1 })
@@ -142,6 +142,7 @@ test('artifact projection rejects unknown child fields at every frozen boundary'
     tool_version: '1.3.0',
     artifact: {
       id: 'artifact_1',
+      sample_id: sampleId,
       type: 'analysis_profile',
       path: 'artifacts/profile.json',
       sha256: 'b'.repeat(64),
@@ -174,6 +175,14 @@ test('artifact projection rejects unknown child fields at every frozen boundary'
       { sample_id: sampleId, read_mode: 'summary' },
       { ...base, artifact: { ...base.artifact, unexpected_child_field: true } }
     )
+  )
+  assert.throws(() =>
+    validateAndProjectBusinessResult('artifact_read', { sample_id: sampleId, read_mode: 'summary' },
+      { ...base, artifact: { ...base.artifact, sample_id: 'sha256:' + 'f'.repeat(64) } })
+  )
+  assert.throws(() =>
+    validateAndProjectBusinessResult('artifact_read',
+      { sample_id: sampleId, artifact_id: 'a-different-artifact', read_mode: 'summary' }, base)
   )
 })
 

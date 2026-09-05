@@ -17,6 +17,7 @@ pub struct BridgeClient {
     http: reqwest::Client,
     base_url: String,
     token: String,
+    upload_timeout: Duration,
 }
 
 impl std::fmt::Debug for BridgeClient {
@@ -341,6 +342,7 @@ impl BridgeClient {
             http,
             base_url: config.bridge_url.clone(),
             token: config.bridge_token.clone(),
+            upload_timeout: config.bridge_upload_timeout,
         })
     }
 
@@ -467,7 +469,7 @@ impl BridgeClient {
             .header("x-content-sha256", content_sha256)
             .header("x-operation-id", operation_id.to_string())
             .header("x-request-sha256", request_sha)
-            .timeout(Duration::from_secs(900))
+            .timeout(self.upload_timeout)
             .body(reqwest::Body::wrap_stream(stream))
             .send()
             .await

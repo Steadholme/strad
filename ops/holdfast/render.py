@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from render_input_binding import (
     FROZEN_STATIC_PATHS,
@@ -53,6 +54,7 @@ IMAGE_DIGEST = re.compile(r"^[^\s:@]+(?:/[^\s:@]+)+@sha256:[0-9a-f]{64}$")
 RIKUNE_ACCEPTANCE_SUBJECT = re.compile(r"^user:usr_[A-Za-z0-9_-]{43}$")
 MODEL_ALIAS = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 PRIVILEGED_ACCEPTANCE_SUBJECTS = frozenset({"user:u_admin", "user:w33d"})
+ANALYZE_APPROVER_BOOTSTRAP_COMMAND = "system-bootstrap-analyze-approver"
 
 MUTATED_PATHS = (
     "access-governance/catalog/cistern-authz-v1.json",
@@ -80,6 +82,16 @@ SECRET_KEYS = (
     "STRAD_BRIDGE_TOKEN",
     "RIKUNE_FILE_SERVER_API_KEY",
     "STRAD_NEWAPI_KEY",
+    "ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING",
+    "ACCESS_ANALYZE_APPROVAL_ACTIVE_KID",
+    "ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING",
+    "ACCESS_APPLICATION_CREDENTIAL_PEPPER",
+    "ACCESS_INTROSPECTION_TOKEN",
+    "STRAD_ACCESS_EXECUTION_FENCE_TOKEN",
+    "ACCESS_FACADE_REVOCATION_TOKEN",
+    "ANALYZE_FACADE_REVOCATION_URL",
+    "ANALYZE_REPORTING_URL",
+    "STRAD_GOVERNANCE_REPORTING_TOKEN",
 )
 
 RELEASE_KEYS = (
@@ -1158,7 +1170,7 @@ COMPOSE_SERVICES = r'''
         ensure_dir /data/state 1000 1000
         ensure_dir /data/cache 1000 1000
         ensure_dir /data/audit 1000 1000
-        ensure_dir /data/workspaces/.ghidra-projects 1000 1000
+        ensure_dir /data/workspaces/ghidra-projects 1000 1000
         ensure_dir /data/audit/ghidra 1000 1000
     volumes:
       - strad_uploads:/var/lib/strad/uploads
@@ -1309,6 +1321,39 @@ def render_compose(stage_root: Path) -> None:
                 "image: ${SLUICE_IMAGE:?SLUICE_IMAGE immutable digest is required}",
             ),),
         )
+    step_up_marker = (
+        "      SLUICE_STEP_UP_PATH: "
+        "${ACCESS_GOVERNANCE_SLUICE_STEP_UP_PATH:-}"
+    )
+    step_up_count = text.count(step_up_marker)
+    if step_up_count > 1:
+        fail("Access Compose contains duplicate step-up configuration")
+    if step_up_count == 1:
+        text = replace_once(
+            text,
+            step_up_marker,
+            "      SLUICE_STEP_UP_PATH: /_gw/auth/step-up",
+            "Access exact step-up path",
+        )
+        injected_step_up = ""
+    else:
+        injected_step_up = "\n      SLUICE_STEP_UP_PATH: /_gw/auth/step-up"
+    analyze_access_environment = (
+        injected_step_up
+        + "\n      ACCESS_ANALYZE_EXTERNAL_ORIGIN: https://analyze.w33d.xyz\n"
+        "      ACCESS_ANALYZE_STEP_UP_RESUME_PATH: /applications/\n"
+        f"      ACCESS_ANALYZE_APPROVER_BOOTSTRAP_COMMAND: {ANALYZE_APPROVER_BOOTSTRAP_COMMAND}\n"
+        "      ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING: ${ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING:?ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING is required}\n"
+        "      ACCESS_ANALYZE_APPROVAL_ACTIVE_KID: ${ACCESS_ANALYZE_APPROVAL_ACTIVE_KID:?ACCESS_ANALYZE_APPROVAL_ACTIVE_KID is required}\n"
+        "      ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING: ${ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING:?ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING is required}\n"
+        "      ACCESS_APPLICATION_CREDENTIAL_PEPPER: ${ACCESS_APPLICATION_CREDENTIAL_PEPPER:?ACCESS_APPLICATION_CREDENTIAL_PEPPER is required}\n"
+        "      ACCESS_INTROSPECTION_TOKEN: ${ACCESS_INTROSPECTION_TOKEN:?ACCESS_INTROSPECTION_TOKEN is required}\n"
+        "      STRAD_ACCESS_EXECUTION_FENCE_TOKEN: ${STRAD_ACCESS_EXECUTION_FENCE_TOKEN:?STRAD_ACCESS_EXECUTION_FENCE_TOKEN is required}\n"
+        "      ACCESS_FACADE_REVOCATION_TOKEN: ${ACCESS_FACADE_REVOCATION_TOKEN:?ACCESS_FACADE_REVOCATION_TOKEN is required}\n"
+        "      ANALYZE_FACADE_REVOCATION_URL: ${ANALYZE_FACADE_REVOCATION_URL:?ANALYZE_FACADE_REVOCATION_URL is required}\n"
+        "      ANALYZE_REPORTING_URL: ${ANALYZE_REPORTING_URL:?ANALYZE_REPORTING_URL is required}\n"
+        "      STRAD_GOVERNANCE_REPORTING_TOKEN: ${STRAD_GOVERNANCE_REPORTING_TOKEN:?STRAD_GOVERNANCE_REPORTING_TOKEN is required}"
+    )
     text = replace_service(
         text,
         "access-governance",
@@ -1321,10 +1366,24 @@ def render_compose(stage_root: Path) -> None:
             ("GATEWAY_ZONE_HMAC_KEY: ${GATEWAY_ZONE_HMAC_KEY}", "GATEWAY_ZONE_HMAC_KEY: ${GATEWAY_ZONE_HMAC_KEY:?GATEWAY_ZONE_HMAC_KEY is required}"),
             (
                 "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION: ${ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-5}",
-                "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION: ${ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-7}",
+                "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION: ${ACCESS_GOVERNANCE_BOOTSTRAP_VERSION:-7}"
+                + analyze_access_environment,
             ),
         ),
     )
+    access_pattern = re.compile(
+        r"(?ms)^  access-governance:\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)"
+    )
+    access_match = access_pattern.search(text)
+    if access_match is None:
+        fail("Compose service marker is absent: access-governance")
+    access_block = access_match.group(0)
+    if "      - hf-iga\n" in access_block:
+        text = replace_service(
+            text,
+            "access-governance",
+            (("      - hf-iga\n", "      - hf-iga\n      - hf-rikune-authz\n"),),
+        )
     text = replace_once(text, "\n  ark:\n", "\n" + COMPOSE_SERVICES + "  ark:\n", "Compose service insertion")
     network_marker = "  # Access capability snapshots are shared only with managed downstream PEPs.\n  hf-iga:\n    driver: bridge\n    internal: true\n"
     network_add = network_marker + (
@@ -1362,6 +1421,31 @@ def render_full_env(stage_root: Path, release: dict[str, str], secrets: dict[str
     missing_secrets = [key for key in SECRET_KEYS if not secrets.get(key) or secrets[key].startswith("REQUIRED")]
     if missing_secrets:
         fail(f"secret env lacks provisioned keys: {', '.join(missing_secrets)}")
+    revocation_url = urlsplit(secrets["ANALYZE_FACADE_REVOCATION_URL"])
+    reporting_url = urlsplit(secrets["ANALYZE_REPORTING_URL"])
+    if (
+        revocation_url.scheme != "https"
+        or not revocation_url.netloc
+        or revocation_url.username is not None
+        or revocation_url.password is not None
+        or revocation_url.path
+        != "/internal/v1/application-session-revocations"
+        or revocation_url.query
+        or revocation_url.fragment
+    ):
+        fail("ANALYZE_FACADE_REVOCATION_URL must be the exact HTTPS revocation endpoint")
+    if (
+        reporting_url.scheme != "https"
+        or not reporting_url.netloc
+        or reporting_url.username is not None
+        or reporting_url.password is not None
+        or reporting_url.path not in ("", "/")
+        or reporting_url.query
+        or reporting_url.fragment
+        or secrets["ANALYZE_FACADE_REVOCATION_URL"]
+        == secrets["ANALYZE_REPORTING_URL"]
+    ):
+        fail("ANALYZE_REPORTING_URL must be a distinct HTTPS service origin")
     compared = {
         "GATEWAY_HMAC_KEY": current["GATEWAY_HMAC_KEY"],
         "GATEWAY_ZONE_HMAC_KEY": current["GATEWAY_ZONE_HMAC_KEY"],
@@ -1369,6 +1453,19 @@ def render_full_env(stage_root: Path, release: dict[str, str], secrets: dict[str
         "STRAD_BRIDGE_TOKEN": secrets["STRAD_BRIDGE_TOKEN"],
         "RIKUNE_FILE_SERVER_API_KEY": secrets["RIKUNE_FILE_SERVER_API_KEY"],
         "STRAD_NEWAPI_KEY": secrets["STRAD_NEWAPI_KEY"],
+        "ACCESS_APPLICATION_CREDENTIAL_PEPPER": secrets[
+            "ACCESS_APPLICATION_CREDENTIAL_PEPPER"
+        ],
+        "ACCESS_INTROSPECTION_TOKEN": secrets["ACCESS_INTROSPECTION_TOKEN"],
+        "STRAD_ACCESS_EXECUTION_FENCE_TOKEN": secrets[
+            "STRAD_ACCESS_EXECUTION_FENCE_TOKEN"
+        ],
+        "ACCESS_FACADE_REVOCATION_TOKEN": secrets[
+            "ACCESS_FACADE_REVOCATION_TOKEN"
+        ],
+        "STRAD_GOVERNANCE_REPORTING_TOKEN": secrets[
+            "STRAD_GOVERNANCE_REPORTING_TOKEN"
+        ],
     }
     if any(len(value.encode("utf-8")) < 32 for value in compared.values()):
         fail("all Strad/gateway/Verdict secrets must be at least 32 UTF-8 bytes")
@@ -1376,6 +1473,7 @@ def render_full_env(stage_root: Path, release: dict[str, str], secrets: dict[str
         fail("Strad/gateway/Verdict secrets must be pairwise distinct")
     updates = {
         "ACCESS_GOVERNANCE_BOOTSTRAP_VERSION": "7",
+        "ACCESS_ANALYZE_APPROVER_BOOTSTRAP_COMMAND": ANALYZE_APPROVER_BOOTSTRAP_COMMAND,
         "ACCESS_GOVERNANCE_IMAGE": release["ACCESS_GOVERNANCE_IMAGE"],
         "ACCESS_GOVERNANCE_ROLLBACK_IMAGE": release["ACCESS_GOVERNANCE_ROLLBACK_IMAGE"],
         "RIKUNE_ANALYZER_IMAGE": release["RIKUNE_ANALYZER_IMAGE"],

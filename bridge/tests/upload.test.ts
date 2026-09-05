@@ -14,11 +14,60 @@ import { CHILD_ENV_BASE } from '../src/constants.js'
 import { OperationJournal } from '../src/journal.js'
 import {
   completeUploadOperation,
+  parseAnalyzerUploadResponse,
   parseUploadHeaders,
   prepareSpoolRoot,
   reconcileUnknownUploads,
   spoolUpload,
 } from '../src/upload.js'
+
+test('Rikune upload response accepts current and legacy existed shapes without inventing state', () => {
+  const current = {
+    ok: true,
+    data: {
+      sample_id: `sha256:${'a'.repeat(64)}`,
+      filename: 'sample.bin',
+      size: 4,
+      uploaded_at: '2026-09-02T00:00:00.000Z',
+      file_type: 'ELF',
+    },
+  }
+  assert.equal(parseAnalyzerUploadResponse(current).data.existed, undefined)
+  assert.equal(
+    parseAnalyzerUploadResponse({
+      ...current,
+      data: { ...current.data, existed: false },
+    }).data.existed,
+    false
+  )
+  assert.equal(
+    parseAnalyzerUploadResponse({
+      ...current,
+      data: { ...current.data, existed: true },
+    }).data.existed,
+    true
+  )
+})
+
+test('Rikune upload response remains strict across both compatible shapes', () => {
+  const current = {
+    ok: true,
+    data: {
+      sample_id: `sha256:${'a'.repeat(64)}`,
+      filename: 'sample.bin',
+      size: 4,
+      uploaded_at: '2026-09-02T00:00:00.000Z',
+      file_type: 'ELF',
+    },
+  }
+  assert.throws(() =>
+    parseAnalyzerUploadResponse({ ...current, data: { ...current.data, unexpected: true } })
+  )
+  assert.throws(() =>
+    parseAnalyzerUploadResponse({ ...current, data: { ...current.data, existed: 'yes' } })
+  )
+  assert.throws(() => parseAnalyzerUploadResponse({ ...current, ok: false }))
+})
 
 function configFor(spoolRoot: string, journalPath: string): BridgeConfig {
   return {

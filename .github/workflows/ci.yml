@@ -26,7 +26,7 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Run Rust unit tests
-        run: cargo test --locked --lib --bins
+        run: cargo test --locked --lib --bins --test application_facade_contract
 
   node-and-holdfast:
     name: Bridge, frontend, and Holdfast
@@ -49,6 +49,12 @@ jobs:
       - name: Test bridge
         working-directory: bridge
         run: npm test
+      - name: Install Analyze facade dependencies
+        working-directory: facade
+        run: npm ci --ignore-scripts
+      - name: Test Analyze facade with isolated PostgreSQL
+        working-directory: facade
+        run: npm test
       - name: Test frontend contracts
         run: node --test tests/frontend/*.test.js
       - name: Establish Holdfast authority ownership
@@ -57,6 +63,8 @@ jobs:
           "$GITHUB_WORKSPACE/ops/holdfast"
       - name: Test Holdfast tooling
         run: sudo python3 -m unittest discover -s ops/holdfast/tests -v
+      - name: Test Analyze acceptance harness without model calls
+        run: sudo python3 -m unittest discover -s ops/analyze/tests -p 'test_l2_*.py'
 
   postgres-contract:
     name: PostgreSQL / ${{ matrix.test }}
@@ -65,6 +73,18 @@ jobs:
       fail-fast: false
       matrix:
         test:
+          - application_conversation_turn_dispatches_once_and_retains_its_reservation
+          - application_idempotency_key_excludes_digest_and_quota_headers_match
+          - application_owner_resources_are_isolated_and_malformed_owners_fail_closed
+          - cached_application_result_requires_a_current_execution_fence
+          - cached_upload_mutations_recheck_live_authority
+          - strad_readiness_transitively_checks_access_fence_without_a_claim
+          - application_concurrency_never_exceeds_frozen_tool_or_system_reservations
+          - owner_and_support_audit_are_scoped_and_secondary
+          - allow_then_revoke_before_release_dispatches_zero
+          - dispatch_timeout_becomes_downstream_uncertain
+          - response_before_crash_reconciles_without_resend
+          - cleanup_crash_retains_reservation_until_audited_resolution
           - postgres_owner_delete_and_sample_lifecycle_are_transactional
           - postgres_24h_disposition_preserves_spool_authority_until_physical_delete
           - postgres_quota_warning_claims_once_per_owner_and_utc_day
@@ -73,6 +93,15 @@ jobs:
           - postgres_ssr_projection_and_server_operation_claims_are_owner_scoped
           - postgres_artifact_lookup_binds_owner_analysis_and_artifact
           - postgres_schema_v1_turn_models_upgrade_and_ledger_are_fail_closed
+        include:
+          - test: disconnected_finalize_recovers_from_journal_without_restart_or_redispatch
+            target: application_upload_contract
+          - test: private_finalize_requires_single_http_idempotency_key
+            target: application_upload_contract
+          - test: private_upload_handlers_enforce_headers_ranges_digests_and_finalize
+            target: application_upload_contract
+          - test: upload_reservation_chunk_finalize_cancel_contract
+            target: application_upload_contract
     services:
       postgres:
         image: postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
@@ -93,7 +122,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Run isolated PostgreSQL contract
-        run: cargo test --locked --test postgres_contract "${{ matrix.test }}" -- --exact
+        run: cargo test --locked --test "${{ matrix.target || 'postgres_contract' }}" "${{ matrix.test }}" -- --exact
 
   secret-scan:
     name: Secret scan

@@ -1,5 +1,7 @@
 pub mod analysis;
 pub mod app;
+pub mod application_facade;
+pub mod audit;
 pub mod auth;
 pub mod bridge;
 pub mod chat;

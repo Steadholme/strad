@@ -372,6 +372,8 @@ test('spawned child environment satisfies the complete Rikune v1.4.1 backend loc
     RIKUNE_FILE_SERVER_API_KEY: 'f'.repeat(32),
   })
 
+  assert.equal(config.childEnv.GHIDRA_PROJECT_ROOT, '/data/workspaces/ghidra-projects')
+  assert.doesNotMatch(config.childEnv.GHIDRA_PROJECT_ROOT, /(?:^|\/)\.[^/]+/)
   assert.doesNotThrow(() => validateStaticBackendEnvironment(lock, config.childEnv))
   assert.throws(
     () =>

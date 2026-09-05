@@ -103,6 +103,23 @@ STAGE_SEMANTIC_PATHS = {
     "package_catalog_sha256": "access-governance/catalog/packages.snapshot.json",
     "authz_manifest_sha256": "access-governance/catalog/rikune-authz-v1.json",
 }
+ANALYZE_APPROVER_BOOTSTRAP_COMMAND = "system-bootstrap-analyze-approver"
+ANALYZE_ACCESS_COMPOSE_LINES = (
+    "ACCESS_ANALYZE_EXTERNAL_ORIGIN: https://analyze.w33d.xyz",
+    "ACCESS_ANALYZE_STEP_UP_RESUME_PATH: /applications/",
+    f"ACCESS_ANALYZE_APPROVER_BOOTSTRAP_COMMAND: {ANALYZE_APPROVER_BOOTSTRAP_COMMAND}",
+    "SLUICE_STEP_UP_PATH: /_gw/auth/step-up",
+    "ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING: ${ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING:?ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING is required}",
+    "ACCESS_ANALYZE_APPROVAL_ACTIVE_KID: ${ACCESS_ANALYZE_APPROVAL_ACTIVE_KID:?ACCESS_ANALYZE_APPROVAL_ACTIVE_KID is required}",
+    "ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING: ${ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING:?ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING is required}",
+    "ACCESS_APPLICATION_CREDENTIAL_PEPPER: ${ACCESS_APPLICATION_CREDENTIAL_PEPPER:?ACCESS_APPLICATION_CREDENTIAL_PEPPER is required}",
+    "ACCESS_INTROSPECTION_TOKEN: ${ACCESS_INTROSPECTION_TOKEN:?ACCESS_INTROSPECTION_TOKEN is required}",
+    "STRAD_ACCESS_EXECUTION_FENCE_TOKEN: ${STRAD_ACCESS_EXECUTION_FENCE_TOKEN:?STRAD_ACCESS_EXECUTION_FENCE_TOKEN is required}",
+    "ACCESS_FACADE_REVOCATION_TOKEN: ${ACCESS_FACADE_REVOCATION_TOKEN:?ACCESS_FACADE_REVOCATION_TOKEN is required}",
+    "ANALYZE_FACADE_REVOCATION_URL: ${ANALYZE_FACADE_REVOCATION_URL:?ANALYZE_FACADE_REVOCATION_URL is required}",
+    "ANALYZE_REPORTING_URL: ${ANALYZE_REPORTING_URL:?ANALYZE_REPORTING_URL is required}",
+    "STRAD_GOVERNANCE_REPORTING_TOKEN: ${STRAD_GOVERNANCE_REPORTING_TOKEN:?STRAD_GOVERNANCE_REPORTING_TOKEN is required}",
+)
 ROUTE_ASSET_PATHS = {
     "route_up_sha256": "assets/20260823_rikune_root_up.sql",
     "route_down_sha256": "assets/20260823_rikune_root_down.sql",
@@ -491,6 +508,7 @@ def load_object(path: Path, require_root_owner: bool = False) -> dict[str, objec
 def access_build_input_sha(
     stage_root: Path, require_root_owner: bool = False
 ) -> str:
+    validate_analyze_access_compose_contract(stage_root, require_root_owner)
     base = require_directory(stage_root / "access-governance", require_root_owner)
     value = hashlib.sha256()
     files: list[Path] = []
@@ -909,9 +927,36 @@ def access_tree_build_input_sha_v2(
 def access_build_input_sha_v2(
     stage_root: Path, require_root_owner: bool = False
 ) -> str:
+    validate_analyze_access_compose_contract(stage_root, require_root_owner)
     return access_tree_build_input_sha_v2(
         stage_root / "access-governance", require_root_owner
     )
+
+
+def validate_analyze_access_compose_contract(
+    stage_root: Path, require_root_owner: bool = False
+) -> None:
+    compose = stage_root / "deploy/docker-compose.yml"
+    if not compose.exists() and not compose.is_symlink():
+        return
+    require_regular(compose, require_root_owner)
+    text = compose.read_text(encoding="utf-8")
+    marker = "      ACCESS_ANALYZE_EXTERNAL_ORIGIN:"
+    if marker not in text:
+        return
+    start = text.find("\n  access-governance:\n")
+    if start < 0:
+        fail("rendered Compose lacks the Access Governance service")
+    following = re.search(r"\n  [a-z0-9][a-z0-9-]*:\n", text[start + 1 :])
+    end = len(text) if following is None else start + 1 + following.start()
+    service = text[start:end]
+    for expected in ANALYZE_ACCESS_COMPOSE_LINES:
+        if service.count(expected) != 1:
+            fail(f"Analyze Access Compose contract differs: {expected.split(':', 1)[0]}")
+    if "ACCESS_GOVERNANCE_SLUICE_STEP_UP_PATH" in service:
+        fail("Analyze Access Compose retains a variable step-up path")
+    if "      - hf-iga\n" in service and service.count("      - hf-rikune-authz\n") != 1:
+        fail("Analyze Access Compose lacks the private authz network")
 
 
 def access_build_input_sha_for_schema(

@@ -1,0 +1,317 @@
+name: analyze-l2-closed
+
+services:
+  postgres:
+    image: postgres:18-alpine@sha256:1b1689b20d16a014a3d195653381cf2caa75a41a92d93b255a9d6ea29fd353aa
+    environment:
+      POSTGRES_USER: l2
+      POSTGRES_PASSWORD: ${L2_POSTGRES_PASSWORD:?generated L2 PostgreSQL password is required}
+      POSTGRES_DB: postgres
+    volumes:
+      - ./fixtures/initdb.sql:/docker-entrypoint-initdb.d/00-l2-databases.sql:ro
+      - postgres-data:/var/lib/postgresql
+      - postgres-socket:/var/run/postgresql
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U l2 -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    security_opt: [no-new-privileges:true]
+    networks: [closed]
+
+  access:
+    image: ${L2_ACCESS_IMAGE:?current-source Access image is required}
+    user: "1000:1000"
+    environment:
+      ACCESS_GOVERNANCE_STORE: postgres
+      DATABASE_URL: postgresql://l2:${L2_POSTGRES_PASSWORD}@postgres:5432/access_l2
+      BIND_ADDR: 0.0.0.0:9390
+      TRUSTED_MFA: "true"
+      MFA_ASSERTION_HMAC_KEY: ${L2_MFA_ASSERTION_HMAC_KEY:?MFA assertion key is required}
+      MFA_ASSERTION_AUDIENCE: access
+      # Keep the original Access origin configured while the gateway signs the
+      # separate analyze-access route. This exercises the production dual entry.
+      PUBLIC_HOST: access.w33d.xyz
+      ACCESS_GOVERNANCE_BOOTSTRAP_ADMIN_SUB: ${L2_TEST_OWNER_SUBJECT:?closed test owner is required}
+      ACCESS_GOVERNANCE_DEFAULT_APPROVERS: "user:u_admin,user:w33d"
+      ACCESS_GOVERNANCE_CONSEQUENCE_HMAC_KEY: ${L2_CONSEQUENCE_KEY:?closed consequence key is required}
+      KEYSTONE_REGISTRATION_URL: https://closed-registration:9443
+      KEYSTONE_REGISTRATION_MTLS_CA: /run/registration/ca.crt
+      KEYSTONE_REGISTRATION_MTLS_CERT: /run/registration/client.crt
+      KEYSTONE_REGISTRATION_MTLS_KEY: /run/registration/client.key
+      KEYSTONE_REGISTRATION_MAC_KID: ${L2_REGISTRATION_MAC_KID:?closed registration KID is required}
+      KEYSTONE_REGISTRATION_MAC_KEY: ${L2_REGISTRATION_MAC_KEY:?closed registration MAC key is required}
+      KEYSTONE_REGISTRATION_POLL_INTERVAL_SECONDS: "2"
+      ACCESS_EFFECTIVE_LIFECYCLE_WORKER_ENABLED: ${L2_EFFECTIVE_WORKER:-false}
+      ACCESS_REGISTERED_BIRTHRIGHT_ENFORCED: ${L2_BIRTHRIGHT_ENFORCED:-false}
+      ACCESS_PACKAGE_CATALOG_PROMOTION_ENABLED: ${L2_CATALOG_PROMOTED:-false}
+      CENSUS_WORKFORCE_URL: http://closed-lifecycle:9081
+      CENSUS_WORKFORCE_SERVICE_TOKEN: ${L2_CENSUS_TOKEN:?closed workforce token is required}
+      SLUICE_SESSION_REVOCATION_URL: http://closed-lifecycle:9081/sluice
+      SLUICE_SESSION_REVOCATION_TOKEN: ${L2_LIFECYCLE_SLUICE_TOKEN:?closed Sluice lifecycle token is required}
+      NEWAPI_JML_LIFECYCLE_URL: http://closed-lifecycle:9081/newapi
+      NEWAPI_JML_SERVICE_TOKEN: ${L2_LIFECYCLE_NEWAPI_TOKEN:?closed NewAPI lifecycle token is required}
+      KEYSTONE_JML_LIFECYCLE_URL: http://closed-lifecycle:9081/keystone
+      KEYSTONE_JML_SERVICE_TOKEN: ${L2_LIFECYCLE_KEYSTONE_TOKEN:?closed Keystone lifecycle token is required}
+      GATEWAY_HMAC_KEY: ${L2_ACCESS_GATEWAY_KEY:?generated Access gateway key is required}
+      GATEWAY_ZONE_HMAC_KEY: ${L2_ACCESS_ZONE_KEY:?generated Access zone key is required}
+      SLUICE_STEP_UP_PATH: /_gw/auth/step-up
+      VERDICT_URL: http://verdict:9140
+      VERDICT_DECISION_TOKEN: ${L2_VERDICT_DECISION_TOKEN:?generated Verdict decision token is required}
+      VERDICT_PROJECTION_TOKEN: ${L2_VERDICT_PROJECTION_TOKEN:?generated Verdict projection token is required}
+      VERDICT_LIFECYCLE_TOKEN: ${L2_VERDICT_LIFECYCLE_TOKEN:?generated Verdict lifecycle token is required}
+      ACCESS_ANALYZE_EXTERNAL_ORIGIN: https://analyze.w33d.xyz
+      ACCESS_ANALYZE_STEP_UP_RESUME_PATH: /applications/
+      ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING: ${L2_SPONSOR_PUBLIC_KEYRING:?generated Sponsor public keyring is required}
+      ACCESS_ANALYZE_APPROVAL_ACTIVE_KID: approval-l2
+      ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING: ${L2_APPROVAL_SIGNING_KEYRING:?generated approval signing keyring is required}
+      ACCESS_APPLICATION_CREDENTIAL_PEPPER: ${L2_APPLICATION_CREDENTIAL_PEPPER:?generated application pepper is required}
+      ACCESS_INTROSPECTION_TOKEN: ${L2_ACCESS_INTROSPECTION_TOKEN:?generated introspection token is required}
+      STRAD_ACCESS_EXECUTION_FENCE_TOKEN: ${L2_EXECUTION_FENCE_TOKEN:?generated execution fence token is required}
+      ACCESS_FACADE_REVOCATION_TOKEN: ${L2_FACADE_REVOCATION_TOKEN:?generated facade revocation token is required}
+      ANALYZE_FACADE_REVOCATION_URL: https://access.w33d.xyz/internal/v1/application-session-revocations
+      ANALYZE_REPORTING_URL: https://access.w33d.xyz/
+      STRAD_GOVERNANCE_REPORTING_TOKEN: ${L2_GOVERNANCE_REPORTING_TOKEN:?generated governance reporting token is required}
+    depends_on:
+      postgres: {condition: service_healthy}
+      verdict: {condition: service_started}
+      closed-registration: {condition: service_started}
+      closed-lifecycle: {condition: service_started}
+    volumes:
+      - ${L2_WORK_ROOT}/registration/ca.crt:/run/registration/ca.crt:ro
+      - ${L2_WORK_ROOT}/registration/client.crt:/run/registration/client.crt:ro
+      - ${L2_WORK_ROOT}/registration/client.key:/run/registration/client.key:ro
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [closed]
+
+  sluice:
+    image: ${L2_SLUICE_IMAGE:?manifest-pinned Sluice image is required}
+    command: [-config, /app/config.json]
+    environment:
+      SLUICE_STORE: postgres
+      DATABASE_URL: postgresql://l2:${L2_POSTGRES_PASSWORD}@postgres:5432/sluice_l2
+      TLS_MODE: "off"
+      LISTEN_ADDR: 0.0.0.0:9090
+      ACCESS_APPLICATION_INTROSPECTION_URL: http://access:9390/internal/v1/application-credentials/introspect
+      ACCESS_INTROSPECTION_TOKEN: ${L2_ACCESS_INTROSPECTION_TOKEN:?generated introspection token is required}
+      SLUICE_APPLICATION_CONTEXT_ACTIVE_KID: application-l2
+      SLUICE_APPLICATION_CONTEXT_SIGNING_KEYRING: ${L2_APPLICATION_SIGNING_KEYRING:?generated application signing keyring is required}
+      TRUSTED_MFA: "on"
+      GW_SESSION_SECRET: ${L2_SLUICE_SESSION_SECRET:?generated Sluice session secret is required}
+      GATEWAY_HMAC_KEY: ${L2_ACCESS_GATEWAY_KEY}
+      GATEWAY_ZONE_HMAC_KEY: ${L2_ACCESS_ZONE_KEY}
+      MFA_ASSERTION_HMAC_KEY: ${L2_MFA_ASSERTION_HMAC_KEY}
+      KEYSTONE_ASSURANCE_URL: https://id.w33d.xyz/internal/v1/session-assurance
+      KEYSTONE_ASSURANCE_SERVICE_TOKEN: ${L2_ASSURANCE_TOKEN:?closed issuer assurance token is required}
+      GW_OIDC: "on"
+      KEYSTONE_ISSUER: https://id.w33d.xyz
+      OIDC_ISSUER: https://id.w33d.xyz
+      OIDC_DISCOVERY_URL: https://id.w33d.xyz/.well-known/openid-configuration
+      JWKS_FETCH_URL: https://id.w33d.xyz/jwks
+      GW_CLIENT_ID: access-governance
+      GW_CLIENT_SECRET: ${L2_OIDC_CLIENT_SECRET:?closed issuer client secret is required}
+      GW_TOKEN_URL: https://id.w33d.xyz/token
+      GW_REDIRECT_URI: https://id.w33d.xyz/_gw/auth/callback
+      SSL_CERT_FILE: /run/l2/test.crt
+    volumes:
+      - ${L2_WORK_ROOT}/sluice.json:/app/config.json:ro
+      - ${L2_WORK_ROOT}/test.crt:/run/l2/test.crt:ro
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+      access: {condition: service_started}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [closed]
+
+  verdict:
+    image: ${L2_VERDICT_IMAGE:?manifest-pinned Verdict image is required}
+    environment:
+      VERDICT_STORE: postgres
+      DATABASE_URL: postgresql://l2:${L2_POSTGRES_PASSWORD}@postgres:5432/verdict_l2
+      VERDICT_DECISION_TOKEN: ${L2_VERDICT_DECISION_TOKEN:?generated Verdict decision token is required}
+      VERDICT_PROJECTION_TOKEN: ${L2_VERDICT_PROJECTION_TOKEN:?generated Verdict projection token is required}
+      VERDICT_LIFECYCLE_TOKEN: ${L2_VERDICT_LIFECYCLE_TOKEN:?generated Verdict lifecycle token is required}
+      BIND_ADDR: 0.0.0.0:9140
+      AUDIT_ENABLED: "false"
+    depends_on:
+      postgres: {condition: service_healthy}
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [closed]
+
+  facade:
+    image: ${L2_FACADE_IMAGE:?current-source Facade image is required}
+    environment:
+      ANALYZE_FACADE_BIND_ADDR: 0.0.0.0:18120
+      FACADE_DATABASE_URL: postgresql://l2:${L2_POSTGRES_PASSWORD}@postgres:5432/facade_l2
+      ANALYZE_FACADE_INTERNAL_HOST: facade:18120
+      FACADE_VERDICT_DECISION_URL: https://access.w33d.xyz/api/v2/application-check
+      VERDICT_DECISION_TOKEN: ${L2_VERDICT_DECISION_TOKEN:?generated Verdict decision token is required}
+      FACADE_STRAD_ORIGIN: https://access.w33d.xyz/
+      STRAD_FACADE_TOKEN: ${L2_STRAD_FACADE_TOKEN:?generated Strad facade token is required}
+      ACCESS_FACADE_REVOCATION_TOKEN: ${L2_FACADE_REVOCATION_TOKEN:?generated facade revocation token is required}
+      SLUICE_APPLICATION_CONTEXT_ACTIVE_KID: application-l2
+      SLUICE_APPLICATION_CONTEXT_VERIFICATION_KEYRING: ${L2_APPLICATION_VERIFICATION_KEYRING:?generated application verification keyring is required}
+    depends_on:
+      postgres: {condition: service_healthy}
+      verdict: {condition: service_started}
+      strad: {condition: service_started}
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [closed]
+
+  strad:
+    image: ${L2_STRAD_IMAGE:?current-source Strad image is required}
+    environment:
+      STRAD_DATABASE_URL: postgresql://l2:${L2_POSTGRES_PASSWORD}@postgres:5432/strad_l2
+      STRAD_BIND_ADDR: 0.0.0.0:9360
+      GATEWAY_HMAC_KEY: ${L2_STRAD_GATEWAY_KEY:?generated Strad gateway key is required}
+      GATEWAY_ZONE_HMAC_KEY: ${L2_STRAD_ZONE_KEY:?generated Strad zone key is required}
+      VERDICT_URL: http://verdict:9140/api/v2/check
+      VERDICT_DECISION_TOKEN: ${L2_VERDICT_DECISION_TOKEN:?generated Verdict decision token is required}
+      STRAD_BRIDGE_URL: http://rikune-analyzer:18090
+      STRAD_BRIDGE_TOKEN: ${L2_BRIDGE_TOKEN:?generated analyzer bridge token is required}
+      RIKUNE_FILE_SERVER_API_KEY: ${L2_FILE_SERVER_KEY:?generated analyzer file-server key is required}
+      STRAD_NEWAPI_URL: ${L2_NEWAPI_URL:?existing configured NewAPI path is required}
+      STRAD_NEWAPI_KEY: ${L2_NEWAPI_KEY:?existing Strad NewAPI credential is required}
+      STRAD_NEWAPI_MODEL: ${L2_NEWAPI_MODEL:?existing dynamic NewAPI model is required}
+      STRAD_NEWAPI_CONTEXT_TOKENS: ${L2_NEWAPI_CONTEXT_TOKENS:?existing context limit is required}
+      STRAD_TOKENIZER_VOCAB_SHA256: 223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7 # gitleaks:allow public vocabulary checksum, not a credential
+      STRAD_FACADE_TOKEN: ${L2_STRAD_FACADE_TOKEN:?generated Strad facade token is required}
+      STRAD_GOVERNANCE_REPORTING_TOKEN: ${L2_GOVERNANCE_REPORTING_TOKEN:?generated governance reporting token is required}
+      STRAD_ACCESS_EXECUTION_FENCE_TOKEN: ${L2_EXECUTION_FENCE_TOKEN:?generated execution fence token is required}
+      ACCESS_EXECUTION_FENCE_URL: https://access.w33d.xyz/internal/v1/application-execution-fence/check
+      STRAD_UPLOAD_ROOT: /var/lib/strad/uploads
+      STRAD_TEMPLATE_ROOT: /app/templates
+    depends_on:
+      postgres: {condition: service_healthy}
+      analyzer: {condition: service_healthy}
+      verdict: {condition: service_started}
+    volumes: ["${L2_WORK_ROOT}/uploads:/var/lib/strad/uploads"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [closed, ai]
+
+  analyzer:
+    image: ${L2_ANALYZER_IMAGE:?digest-pinned analyzer image is required}
+    environment:
+      STRAD_BRIDGE_HOST: 0.0.0.0
+      STRAD_BRIDGE_PORT: "18090"
+      STRAD_BRIDGE_TOKEN: ${L2_BRIDGE_TOKEN:?generated analyzer bridge token is required}
+      RIKUNE_FILE_SERVER_API_KEY: ${L2_FILE_SERVER_KEY:?generated analyzer file-server key is required}
+      STRAD_BRIDGE_STATE_ROOT: /data/state
+      STRAD_BRIDGE_SPOOL_ROOT: /data/storage/bridge-ingest
+      RIKUNE_STATIC_LOCK_PATH: /app/static-profile.lock.json
+    volumes:
+      - ${L2_WORK_ROOT}/analyzer/workspaces:/data/workspaces
+      - ${L2_WORK_ROOT}/analyzer/storage:/data/storage
+      - ${L2_WORK_ROOT}/analyzer/state:/data/state
+      - ${L2_WORK_ROOT}/analyzer/cache:/data/cache
+      - ${L2_WORK_ROOT}/analyzer/audit:/data/audit
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=1000,mode=0700"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, /usr/local/bin/node, /opt/strad-bridge/dist/src/healthcheck.js]
+      interval: 5s
+      timeout: 5s
+      start_period: 120s
+      retries: 36
+    networks:
+      closed:
+        aliases: [rikune-analyzer]
+
+  closed-lifecycle:
+    image: ${L2_NODE_IMAGE:?digest-pinned Node image is required}
+    user: "65532:65532"
+    command: [node, /app/closed-lifecycle.mjs]
+    environment:
+      L2_REGISTRATION_SUBJECTS_JSON: ${L2_REGISTRATION_SUBJECTS_JSON:?explicit synthetic humans are required}
+      L2_CENSUS_TOKEN: ${L2_CENSUS_TOKEN}
+      L2_LIFECYCLE_SLUICE_TOKEN: ${L2_LIFECYCLE_SLUICE_TOKEN}
+      L2_LIFECYCLE_NEWAPI_TOKEN: ${L2_LIFECYCLE_NEWAPI_TOKEN}
+      L2_LIFECYCLE_KEYSTONE_TOKEN: ${L2_LIFECYCLE_KEYSTONE_TOKEN}
+    volumes:
+      - ./closed-lifecycle.mjs:/app/closed-lifecycle.mjs:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [closed]
+
+  closed-registration:
+    image: ${L2_NODE_IMAGE:?digest-pinned Node image is required}
+    user: "65532:65532"
+    command: [node, /app/closed-registration.mjs]
+    environment:
+      L2_REGISTRATION_MAC_KID: ${L2_REGISTRATION_MAC_KID:?closed registration KID is required}
+      L2_REGISTRATION_MAC_KEY: ${L2_REGISTRATION_MAC_KEY:?closed registration MAC key is required}
+      L2_REGISTRATION_SUBJECTS_JSON: ${L2_REGISTRATION_SUBJECTS_JSON:?explicit synthetic humans are required}
+      L2_REGISTRATION_TLS_CA: /run/registration/ca.crt
+      L2_REGISTRATION_TLS_CERT: /run/registration/server.crt
+      L2_REGISTRATION_TLS_KEY: /run/registration/server.key
+    volumes:
+      - ./closed-registration.mjs:/app/closed-registration.mjs:ro
+      - ${L2_WORK_ROOT}/registration/ca.crt:/run/registration/ca.crt:ro
+      - ${L2_WORK_ROOT}/registration/server.crt:/run/registration/server.crt:ro
+      - ${L2_WORK_ROOT}/registration/server.key:/run/registration/server.key:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [closed]
+
+  acceptance:
+    image: ${L2_NODE_IMAGE:?digest-pinned Node image is required}
+    user: "65532:65532"
+    command: [node, /app/closed-peer.mjs]
+    environment:
+      L2_ASSURANCE_TOKEN: ${L2_ASSURANCE_TOKEN}
+      L2_OIDC_CLIENT_SECRET: ${L2_OIDC_CLIENT_SECRET}
+      L2_TEST_SUBJECT: ${L2_TEST_SUBJECT:?closed test subject is required}
+    volumes:
+      - ./closed-peer.mjs:/app/closed-peer.mjs:ro
+      - ./decision-faults.mjs:/app/decision-faults.mjs:ro
+      - ${L2_WORK_ROOT}/decision-fault.json:/run/l2/decision-fault.json:ro
+      - ${L2_WORK_ROOT}/test.crt:/run/l2/test.crt:ro
+      - ${L2_WORK_ROOT}/test.key:/run/l2/test.key:ro
+      - ${L2_ACCESS_TLS_BUNDLE}:/run/l2/access.pem:ro
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks:
+      closed:
+        aliases: [access.w33d.xyz, analyze.w33d.xyz, id.w33d.xyz]
+
+networks:
+  closed:
+    internal: true
+  ai:
+    external: true
+    name: ${L2_NEWAPI_NETWORK:-steadholme_hf-ai}
+
+volumes:
+  postgres-data:
+  postgres-socket:
+  strad-uploads:
+  analyzer-workspaces:
+  analyzer-storage:
+  analyzer-state:
+  analyzer-cache:
+  analyzer-audit:

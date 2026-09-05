@@ -1,0 +1,8 @@
+CREATE DATABASE access_l2;
+CREATE DATABASE sluice_l2;
+CREATE DATABASE verdict_l2;
+CREATE DATABASE facade_l2;
+CREATE DATABASE strad_l2;
+CREATE DATABASE access_test_l2;
+CREATE DATABASE strad_test_l2;
+CREATE DATABASE facade_test_l2;

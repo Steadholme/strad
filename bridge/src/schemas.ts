@@ -4,7 +4,10 @@ const SAMPLE_ID = /^sha256:[0-9a-f]{64}$/
 const SHA256 = /^[0-9a-f]{64}$/
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const ARTIFACT_READ_MAX_BYTES = 256 * 1024
+// A normal Ghidra function index can exceed 256 KiB. Keep reads bounded
+// inside the existing 2 MiB response envelope, but allow complete small
+// analysis artifacts so consumers can verify their full SHA256.
+const ARTIFACT_READ_MAX_BYTES = 1024 * 1024
 const safeText = (max: number) => z.string().trim().min(1).max(max)
 
 const startSchema = z
@@ -226,6 +229,7 @@ const artifactReadResultSchema = z
     artifact: z
       .object({
         id: safeText(512),
+        sample_id: z.string().regex(SAMPLE_ID),
         type: safeText(512),
         path: z.string().min(1).max(4096),
         sha256: z.string().regex(SHA256),
@@ -414,6 +418,8 @@ export function validateAndProjectBusinessResult(
   if (tool === 'artifact_read') {
     const parsed = artifactReadResultSchema.parse(value)
     requireEqual(parsed.sample_id, args.sample_id, 'artifact sample ID')
+    requireEqual(parsed.artifact.sample_id, args.sample_id, 'artifact owner sample ID')
+    if (args.artifact_id !== undefined) requireEqual(parsed.artifact.id, args.artifact_id, 'artifact ID')
     requireEqual(parsed.read_mode, args.read_mode, 'artifact read mode')
     if (parsed.bytes_read > parsed.total_size) throw new Error('artifact byte counts are invalid')
     return parsed

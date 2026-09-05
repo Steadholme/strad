@@ -3,9 +3,10 @@ use std::{net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 pub const MAX_FILE_BYTES: i64 = 524_288_000;
 pub const CHUNK_BYTES: i64 = 8_388_608;
 pub const OWNER_BYTES: i64 = 10 * 1024 * 1024 * 1024;
+pub const APPLICATION_OWNER_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_ANALYSES: i32 = 25;
 pub const MAX_IN_FLIGHT: i64 = 3;
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 pub const CANONICAL_HOST: &str = "rikune.w33d.xyz";
 pub const CANONICAL_ROUTE: &str = "rikune-root";
 pub const TOKENIZER_NAME: &str = "cl100k_base";
@@ -23,11 +24,16 @@ pub struct Config {
     pub verdict_url: String,
     pub bridge_token: String,
     pub bridge_url: String,
+    pub bridge_upload_timeout: Duration,
     pub newapi_key: String,
     pub newapi_url: String,
     pub newapi_model: String,
     pub newapi_context_tokens: u32,
     pub rikune_file_server_api_key: String,
+    pub facade_token: String,
+    pub governance_reporting_token: String,
+    pub access_execution_fence_token: String,
+    pub access_execution_fence_url: String,
     pub upload_root: PathBuf,
     pub template_root: PathBuf,
     pub canonical_host: String,
@@ -45,6 +51,10 @@ impl std::fmt::Debug for Config {
             .field("bridge_url", &self.bridge_url)
             .field("newapi_url", &self.newapi_url)
             .field("newapi_model", &self.newapi_model)
+            .field(
+                "access_execution_fence_url",
+                &self.access_execution_fence_url,
+            )
             .field("upload_root", &self.upload_root)
             .field("template_root", &self.template_root)
             .field("canonical_host", &self.canonical_host)
@@ -62,7 +72,12 @@ impl Config {
         let bridge_token = required_secret_string("STRAD_BRIDGE_TOKEN")?;
         let newapi_key = required_secret_string("STRAD_NEWAPI_KEY")?;
         let rikune_file_server_api_key = required_secret_string("RIKUNE_FILE_SERVER_API_KEY")?;
-        let values: [(&str, &[u8]); 6] = [
+        let facade_token = required_secret_string("STRAD_FACADE_TOKEN")?;
+        let governance_reporting_token =
+            required_secret_string("STRAD_GOVERNANCE_REPORTING_TOKEN")?;
+        let access_execution_fence_token =
+            required_secret_string("STRAD_ACCESS_EXECUTION_FENCE_TOKEN")?;
+        let values: [(&str, &[u8]); 9] = [
             ("GATEWAY_HMAC_KEY", &gateway_hmac_key),
             ("GATEWAY_ZONE_HMAC_KEY", &gateway_zone_hmac_key),
             ("VERDICT_DECISION_TOKEN", verdict_decision_token.as_bytes()),
@@ -71,6 +86,15 @@ impl Config {
             (
                 "RIKUNE_FILE_SERVER_API_KEY",
                 rikune_file_server_api_key.as_bytes(),
+            ),
+            ("STRAD_FACADE_TOKEN", facade_token.as_bytes()),
+            (
+                "STRAD_GOVERNANCE_REPORTING_TOKEN",
+                governance_reporting_token.as_bytes(),
+            ),
+            (
+                "STRAD_ACCESS_EXECUTION_FENCE_TOKEN",
+                access_execution_fence_token.as_bytes(),
             ),
         ];
         for (index, (left_name, left)) in values.iter().enumerate() {
@@ -126,6 +150,10 @@ impl Config {
         if !template_root.is_absolute() {
             return Err("STRAD_TEMPLATE_ROOT must be absolute".to_string());
         }
+        let access_execution_fence_url = exact_https_url(
+            "ACCESS_EXECUTION_FENCE_URL",
+            "/internal/v1/application-execution-fence/check",
+        )?;
 
         Ok(Self {
             bind_addr,
@@ -136,11 +164,16 @@ impl Config {
             verdict_url,
             bridge_token,
             bridge_url,
+            bridge_upload_timeout: Duration::from_secs(900),
             newapi_key,
             newapi_url,
             newapi_model,
             newapi_context_tokens,
             rikune_file_server_api_key,
+            facade_token,
+            governance_reporting_token,
+            access_execution_fence_token,
+            access_execution_fence_url,
             upload_root,
             template_root,
             canonical_host: CANONICAL_HOST.to_string(),
@@ -162,11 +195,17 @@ impl Config {
             verdict_url: "http://verdict:9140/api/v2/check".into(),
             bridge_token: "b".repeat(32),
             bridge_url: "http://rikune-analyzer:18090".into(),
+            bridge_upload_timeout: Duration::from_secs(900),
             newapi_key: "n".repeat(32),
             newapi_url: "http://newapi:9080/v1/chat/completions".into(),
             newapi_model: "test-model".into(),
             newapi_context_tokens: 32_768,
             rikune_file_server_api_key: "f".repeat(32),
+            facade_token: "q".repeat(32),
+            governance_reporting_token: "r".repeat(32),
+            access_execution_fence_token: "x".repeat(32),
+            access_execution_fence_url:
+                "https://access.w33d.xyz/internal/v1/application-execution-fence/check".into(),
             upload_root: root.clone(),
             template_root: root,
             canonical_host: CANONICAL_HOST.into(),
@@ -275,6 +314,25 @@ fn exact_base_url(
     Ok(raw.trim_end_matches('/').to_string())
 }
 
+fn exact_https_url(name: &str, expected_path: &str) -> std::result::Result<String, String> {
+    let raw = required(name)?;
+    let parsed = reqwest::Url::from_str(&raw).map_err(|_| format!("{name} is invalid"))?;
+    if parsed.scheme() != "https"
+        || parsed.path() != expected_path
+        || parsed.host_str() != Some("access.w33d.xyz")
+        || parsed.port_or_known_default() != Some(443)
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+    {
+        return Err(format!(
+            "{name} must be an exact HTTPS execution-fence endpoint"
+        ));
+    }
+    Ok(raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +374,24 @@ mod tests {
         assert!(!valid_model_alias("model?query"));
         assert!(!valid_model_alias("模型"));
         assert!(!valid_model_alias(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn execution_fence_requires_exact_https_without_redirectable_components() {
+        assert!(exact_https_url(
+            "TEST_FENCE",
+            "/internal/v1/application-execution-fence/check"
+        )
+        .is_err());
+        for hostile in [
+            "http://access/internal/v1/application-execution-fence/check",
+            "https://user@access.w33d.xyz/internal/v1/application-execution-fence/check",
+            "https://access.w33d.xyz/internal/v1/application-execution-fence/check?next=x",
+        ] {
+            let parsed = reqwest::Url::parse(hostile).unwrap();
+            assert!(
+                parsed.scheme() != "https" || parsed.username() != "" || parsed.query().is_some()
+            );
+        }
     }
 }

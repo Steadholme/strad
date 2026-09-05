@@ -34,12 +34,17 @@ LABEL org.opencontainers.image.title="Strad Rikune analyzer" \
       org.opencontainers.image.description="Static-only Rikune analyzer with the bounded Strad MCP bridge" \
       org.opencontainers.image.revision="${STRAD_REVISION}" \
       org.opencontainers.image.base.name="${RIKUNE_ANALYZER_IMAGE}"
+USER 0:0
+RUN install -d -o 1000 -g 1000 -m 0700 /home/rikune \
+ && usermod --home /home/rikune appuser \
+ && test "$(getent passwd 1000 | cut -d: -f6)" = /home/rikune
 COPY --from=bridge-builder --chown=1000:1000 /bridge/package.json /opt/strad-bridge/package.json
 COPY --from=bridge-builder --chown=1000:1000 /bridge/node_modules/ /opt/strad-bridge/node_modules/
 COPY --from=bridge-builder --chown=1000:1000 /bridge/dist/ /opt/strad-bridge/dist/
 WORKDIR /opt/strad-bridge
+ENV HOME=/home/rikune
 USER 1000:1000
 EXPOSE 18090
-ENTRYPOINT ["/usr/local/bin/node", "/opt/strad-bridge/dist/src/index.js"]
+ENTRYPOINT ["/usr/bin/env", "HOME=/tmp/rikune-home", "/usr/local/bin/node", "/opt/strad-bridge/dist/src/index.js"]
 HEALTHCHECK --interval=15s --timeout=5s --start-period=180s --retries=3 \
   CMD ["/usr/local/bin/node", "/opt/strad-bridge/dist/src/healthcheck.js"]

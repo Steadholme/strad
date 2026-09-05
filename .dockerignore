@@ -3,8 +3,9 @@
 .claude
 .workflow
 target
-bridge/node_modules
+**/node_modules
 bridge/dist
+facade/dist
 ops
 tests
 **/*.log

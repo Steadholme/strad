@@ -38,12 +38,16 @@ const uploadResponseSchema = z
         filename: z.string(),
         size: z.number().int().min(1).max(MAX_UPLOAD_BYTES),
         uploaded_at: z.string(),
-        existed: z.boolean(),
+        existed: z.boolean().optional(),
         file_type: z.string().min(1).max(128),
       })
       .strict(),
   })
   .strict()
+
+export function parseAnalyzerUploadResponse(value: unknown) {
+  return uploadResponseSchema.parse(value)
+}
 
 const sampleLookupResponseSchema = z
   .object({
@@ -320,7 +324,9 @@ async function sendMultipartToChild(
               'Analyzer upload response is not JSON'
             )
           }
-          const parsed = uploadResponseSchema.parse(JSON.parse(bytes.toString('utf8')) as unknown)
+          const parsed = parseAnalyzerUploadResponse(
+            JSON.parse(bytes.toString('utf8')) as unknown
+          )
           if (
             parsed.data.sample_id !== `sha256:${upload.contentSha256}` ||
             parsed.data.size !== upload.contentLength

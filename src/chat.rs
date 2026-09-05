@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 
 use crate::{
+    application_facade::ExecutionFenceClient,
     bridge::{BridgeClient, ContextPackRequest},
     citation,
     error::{AppError, Result},
@@ -20,6 +21,7 @@ pub struct ChatEngine {
     bridge: BridgeClient,
     newapi: NewApiClient,
     budgeter: TokenBudgeter,
+    execution_fence: Option<ExecutionFenceClient>,
 }
 
 impl ChatEngine {
@@ -34,7 +36,31 @@ impl ChatEngine {
             bridge,
             newapi,
             budgeter,
+            execution_fence: None,
         }
+    }
+
+    pub fn with_execution_fence(mut self, execution_fence: ExecutionFenceClient) -> Self {
+        self.execution_fence = Some(execution_fence);
+        self
+    }
+
+    async fn check_application_authority(&self, turn: &Turn) -> Result<()> {
+        let Some((execution, _)) = self.store.application_turn_execution(turn).await? else {
+            return Ok(());
+        };
+        execution.validate_binding(
+            &turn.owner_sub,
+            &turn.request_sha256,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.execution_fence
+            .as_ref()
+            .ok_or(AppError::Invariant(
+                "application turn requires the execution fence",
+            ))?
+            .check(&execution)
+            .await
     }
 
     pub async fn run_once(&self) -> Result<bool> {
@@ -46,6 +72,27 @@ impl ChatEngine {
             return Ok(true);
         };
         let assistant = self.store.assistant_message(turn.id).await?;
+        if let Some((_, provider_state)) = self.store.application_turn_execution(&turn).await? {
+            if provider_state != "pending" {
+                let partial = !assistant.content.is_empty();
+                self.store
+                    .finish_turn(
+                        &turn,
+                        if partial { "partial" } else { "failed" },
+                        if partial { "partial" } else { "failed" },
+                        Some("generation_interrupted"),
+                        0,
+                        assistant.token_count,
+                        &turn.model_alias,
+                    )
+                    .await?;
+                return Ok(true);
+            }
+            if let Err(error) = self.check_application_authority(&turn).await {
+                self.fail_claimed_turn(&turn, error.code(), 0).await?;
+                return Ok(true);
+            }
+        }
         if !assistant.content.is_empty() {
             self.store
                 .finish_turn(
@@ -254,21 +301,32 @@ impl ChatEngine {
         prompt_tokens: usize,
         effective_attempt: i32,
     ) -> Result<()> {
-        let response = match self.newapi.send_stream(request).await {
+        let application_turn = turn.owner_sub.starts_with("application:");
+        let response = match self
+            .newapi
+            .send_stream_guarded(request, async {
+                if application_turn {
+                    self.check_application_authority(turn).await?;
+                    self.store.begin_application_turn_dispatch(turn).await?;
+                }
+                Ok(())
+            })
+            .await
+        {
             Ok(response) => response,
-            Err(_) if effective_attempt < 2 => {
+            Err(_) if effective_attempt < 2 && !application_turn => {
                 self.store
                     .release_turn_for_retry(turn, "assistant_unavailable")
                     .await?;
                 return Ok(());
             }
-            Err(_) => {
+            Err(error) => {
                 self.store
                     .finish_turn(
                         turn,
                         "failed",
                         "failed",
-                        Some("assistant_unavailable"),
+                        Some(error.code()),
                         prompt_tokens as i32,
                         0,
                         &request.model,
@@ -342,7 +400,7 @@ impl ChatEngine {
                 break 'provider;
             }
         }
-        if content.is_empty() && !done && effective_attempt < 2 {
+        if content.is_empty() && !done && effective_attempt < 2 && !application_turn {
             self.store
                 .release_turn_for_retry(turn, "assistant_interrupted")
                 .await?;
@@ -367,7 +425,7 @@ impl ChatEngine {
             )
             .await?;
         let assistant = self.store.assistant_message(turn.id).await?;
-        if !assistant.content.is_empty() {
+        if !assistant.content.is_empty() && !application_turn {
             if let Err(error) = citation::resolve(&self.store, &self.bridge, turn, &assistant).await
             {
                 tracing::warn!(turn_id = %turn.id, code = error.code(), "citation resolution failed");

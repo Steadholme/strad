@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1.7
+# Apply already-built core modules to a digest-pinned static analyzer. This
+# preserves its audited backend binaries and bridge instead of reinstalling them.
+ARG ANALYZER_BASE
+FROM ${ANALYZER_BASE}
+ARG ANALYZER_BASE
+ARG RIKUNE_REVISION
+USER 0:0
+RUN case "${ANALYZER_BASE}" in *@sha256:*) ;; *) exit 64 ;; esac \
+ && test "$(cat /app/.rikune-static-profile)" = static \
+ && test "${#RIKUNE_REVISION}" -eq 40 \
+ && ! printf '%s' "${RIKUNE_REVISION}" | grep -q '[^0-9a-f]'
+COPY --from=rikune_core --chown=0:0 --chmod=0444 \
+    core/tool-executor.js core/tool-executor.js.map core/tool-executor.d.ts \
+    core/tool-name-normalization.js core/tool-name-normalization.js.map core/tool-name-normalization.d.ts \
+    /app/dist/core/
+LABEL org.opencontainers.image.rikune.core.revision="${RIKUNE_REVISION}"
+USER 1000:1000

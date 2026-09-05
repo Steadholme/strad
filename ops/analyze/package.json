@@ -1,0 +1,14 @@
+{
+  "name": "@w33d/analyze-ops-contract",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "validate:l2": "ajv validate --spec=draft2020 --strict=true -s l2-receipt.schema.json -d evidence/l2-acceptance-v1.json"
+  },
+  "devDependencies": {
+    "ajv": "8.17.1",
+    "ajv-cli": "5.0.0"
+  }
+}

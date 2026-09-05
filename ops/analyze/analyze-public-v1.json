@@ -1,0 +1,281 @@
+{
+  "schema_version": 1,
+  "external_origin": "https://analyze.w33d.xyz",
+  "sso": {
+    "issuer": "https://id.w33d.xyz",
+    "callback": "https://id.w33d.xyz/_gw/auth/callback",
+    "state_required": true,
+    "nonce_required": true,
+    "cookie": {
+      "name": "__Secure-gw",
+      "domain": ".w33d.xyz",
+      "path": "/",
+      "secure": true,
+      "http_only": true,
+      "same_site": "Lax"
+    }
+  },
+  "csrf": {
+    "cookie": {
+      "name": "__Host-csrf",
+      "path": "/",
+      "secure": true,
+      "http_only": true,
+      "same_site": "Strict"
+    },
+    "json_header": "X-CSRF-Token",
+    "html_field": "csrf_token"
+  },
+  "step_up_resume_path": "/applications/",
+  "control_plane": {
+    "ui": "/applications/",
+    "routes": [
+      "POST /api/v1/application-requests",
+      "POST /api/v1/application-requests/{id}/submit",
+      "GET /api/v1/application-requests/{id}",
+      "POST /api/v1/application-requests/{id}/cancel"
+    ],
+    "create_fields": [
+      "name",
+      "purpose",
+      "package_id",
+      "scopes",
+      "credential_ttl_seconds",
+      "quota_tier",
+      "justification"
+    ],
+    "mutation_fields": ["expected_version"],
+    "states": [
+      "draft",
+      "pending_approval",
+      "approved",
+      "rejected",
+      "expired",
+      "cancelled"
+    ]
+  },
+  "mcp": {
+    "protocol_version": "2025-11-25",
+    "path": "/mcp",
+    "package_id": "pkg_analyze_mcp_client",
+    "tools": [
+      {"name": "analysis.create", "scope": "analysis.create"},
+      {"name": "analysis.read", "scope": "analysis.read"},
+      {"name": "analysis.conversation", "scope": "analysis.conversation"},
+      {"name": "analysis.upload.cancel", "scope": "analysis.upload.cancel"}
+    ]
+  },
+  "errors": {
+    "invalid_request": {"http": 400, "json_rpc": -32602, "retryable": false},
+    "unauthenticated": {"http": 401, "json_rpc": -32001, "retryable": false},
+    "authentication_unavailable": {"http": 503, "json_rpc": -32002, "retryable": true},
+    "insufficient_scope": {"http": 403, "json_rpc": -32003, "retryable": false},
+    "authorization_denied": {"http": 403, "json_rpc": -32004, "retryable": false},
+    "authorization_unavailable": {"http": 503, "json_rpc": -32005, "retryable": true},
+    "invalid_session": {"http": 404, "json_rpc": -32006, "retryable": false},
+    "replay_detected": {"http": 409, "json_rpc": -32007, "retryable": false},
+    "quota_exceeded": {"http": 429, "json_rpc": -32008, "retryable": true},
+    "idempotency_mismatch": {"http": 409, "json_rpc": -32009, "retryable": false},
+    "not_found": {"http": 404, "json_rpc": -32010, "retryable": false},
+    "analyzer_unavailable": {"http": 503, "json_rpc": -32011, "retryable": true},
+    "dependency_unavailable": {"http": 503, "json_rpc": -32012, "retryable": true}
+  },
+  "quota": {
+    "tier": "mvp-default-v1",
+    "tools": {
+      "analysis.create": {"requests": 4, "window_seconds": 3600, "concurrency": 1},
+      "analysis.read": {"requests": 120, "window_seconds": 60, "concurrency": 8},
+      "analysis.conversation": {"requests": 12, "window_seconds": 60, "concurrency": 2},
+      "analysis.upload.cancel": {"requests": 30, "window_seconds": 60, "concurrency": 4}
+    },
+    "storage_bytes_per_application": 2147483648,
+    "file_bytes": 524288000,
+    "system_concurrency": 32,
+    "retry_after": {
+      "rate": "ceil(reset_at-now)",
+      "concurrency_seconds": 1,
+      "storage_seconds": 60
+    },
+    "headers": [
+      "X-RateLimit-Limit",
+      "X-RateLimit-Remaining",
+      "X-RateLimit-Reset"
+    ],
+    "header_values": "integers"
+  },
+  "audit": {
+    "retention_days": 180,
+    "sponsor_visibility": "application owner only",
+    "support_capability": "analyze.audit.support.read",
+    "support_read_secondary_audit": true
+  },
+  "public_upload": {
+    "rest": [
+      "POST /v1/uploads/{upload_id}/chunks/{chunk_index}",
+      "POST /v1/uploads/{upload_id}/finalize"
+    ],
+    "external_chunk_url": "https://analyze.w33d.xyz/v1/uploads/{upload_id}/chunks/{chunk_index}",
+    "external_finalize_url": "https://analyze.w33d.xyz/v1/uploads/{upload_id}/finalize",
+    "chunk_max_bytes": 8388608,
+    "chunk_headers": ["Content-Range", "X-Chunk-Sha256"],
+    "chunk_sha256_pattern": "^[0-9a-f]{64}$",
+    "finalize_idempotency_header": "Idempotency-Key",
+    "finalize_idempotency_value": "finalize_operation_id",
+    "redirects": false,
+    "cancel_via": "MCP analysis.upload.cancel only",
+    "public_cancel_status": [404, 405]
+  },
+  "idempotency": {
+    "unique": ["application_sub", "canonical_tool", "operation_id"],
+    "request_sha256_role": "comparison_only"
+  },
+  "approval": {
+    "policy_id": "analyze-application-approval-v1",
+    "request_expiry_seconds": 604800,
+    "slots": ["human_sponsor_confirmation", "system_policy_decision"],
+    "binding_fields": [
+      "request_id",
+      "request_version",
+      "package_revision_digest",
+      "scopes_digest",
+      "quota_tier",
+      "expires_at"
+    ],
+    "sponsor_visibility": "application owner only",
+    "system": {
+      "principal": "service:access-governance-analyze-approval",
+      "decision_type": "SystemPolicyDecisionV1",
+      "decision_ttl_seconds": 300,
+      "single_consume": true,
+      "login_enabled": false,
+      "credential_issuance": false,
+      "no_default_permissions": true,
+      "authorization": "exact-package-revision-scopes-quota-only",
+      "active_kid_env": "ACCESS_ANALYZE_APPROVAL_ACTIVE_KID",
+      "signing_keyring_env": "ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING",
+      "outbox_event": "analyze.application.approval.requested.v1",
+      "idempotency_fields": ["request_id", "request_version", "inputs_digest", "policy_id"],
+      "retry_seconds": [1, 5, 15, 60],
+      "max_attempts": 8,
+      "exhaustion": "fail_closed"
+    },
+    "bootstrap": {
+      "purpose": "create_system_approver_and_signer_only",
+      "may_consume_application_request": false
+    }
+  },
+  "sponsor_assertion": {
+    "version": 1,
+    "issuer": "https://id.w33d.xyz",
+    "audience": "access-governance",
+    "max_auth_age_seconds": 300,
+    "ttl_seconds": 300,
+    "session_binding_pattern": "^[0-9a-f]{64}$",
+    "producer": "sluice_live_trusted_mfa",
+    "single_consume": true,
+    "filesystem_input": false
+  },
+  "principal": {
+    "subject_pattern": "^application:[A-Za-z0-9_-]+$",
+    "transitions": {
+      "pending": ["active", "revoked", "expired"],
+      "active": ["suspended", "revoked", "expired"],
+      "suspended": ["active", "revoked", "expired"],
+      "revoked": [],
+      "expired": []
+    },
+    "terminal_states": ["revoked", "expired"],
+    "monotonic_fields": ["version", "policy_epoch", "revocation_epoch"],
+    "active_introspection_requires": ["sub==application_sub", "policy_epoch_equal", "revocation_epoch_equal"]
+  },
+  "credential": {
+    "token_pattern": "^app_v1_[A-Za-z0-9_-]{43}$",
+    "random_bytes": 32,
+    "encoding": "base64url-no-padding",
+    "lookup": "HMAC-SHA-256",
+    "lookup_encoding": "lowercase-hex",
+    "domain": "access.application-credential.v1",
+    "pepper_env": "ACCESS_APPLICATION_CREDENTIAL_PEPPER",
+    "pepper_min_bytes": 32,
+    "plaintext_persistence": false,
+    "plaintext_display": "once",
+    "ttl_choices_seconds": [900, 86400, 604800],
+    "expiry_clipped_to_source": true,
+    "lineage_fields": ["root_credential_id", "parent_credential_id", "generation"],
+    "last_used_at": true,
+    "states": ["active", "overlap", "revoked", "expired"],
+    "rotation_overlap_seconds": 300,
+    "emergency_overlap_seconds": 0,
+    "revoke_deadline_seconds": 30,
+    "cascade_on_grant_end": ["principal", "credentials", "facade_sessions"]
+  },
+  "verdict": {
+    "request_type": "RequestV2",
+    "request_fields": [
+      "v",
+      "application_sub",
+      "client_id",
+      "credential_id",
+      "credential_version",
+      "grant_id",
+      "package_id",
+      "package_revision_digest",
+      "scopes",
+      "canonical_tool",
+      "resource",
+      "session_id",
+      "request_sha256",
+      "policy_epoch",
+      "revocation_epoch",
+      "correlation_id"
+    ]
+  },
+  "authorization": {
+    "non_allow_audit_exactly_once": true,
+    "non_allow_dispatch_count": 0
+  },
+  "signing": {
+    "algorithm": "Ed25519",
+    "context_active_kid_env": "SLUICE_APPLICATION_CONTEXT_ACTIVE_KID",
+    "context_keyring_env": "SLUICE_APPLICATION_CONTEXT_SIGNING_KEYRING",
+    "context_ttl_seconds": 30,
+    "clock_skew_seconds": 5,
+    "key_overlap_seconds": 300,
+    "replay_key": ["issuer", "jti"]
+  },
+  "execution": {
+    "envelope_type": "ExecutionEnvelopeV1",
+    "envelope_fields": [
+      "version",
+      "decision_id",
+      "decision_digest",
+      "subject_version",
+      "application_sub",
+      "credential_id",
+      "credential_version",
+      "policy_epoch",
+      "revocation_epoch",
+      "request_sha256",
+      "mcp_session_digest",
+      "issued_at",
+      "expires_at"
+    ],
+    "final_fence": "POST /internal/v1/application-execution-fence/check",
+    "final_fence_auth_env": "STRAD_ACCESS_EXECUTION_FENCE_TOKEN"
+  },
+  "sessions": {
+    "binding_fields": [
+      "application_sub",
+      "client_id",
+      "credential_id",
+      "credential_version",
+      "grant_id",
+      "revocation_epoch"
+    ],
+    "signed_context_fields": ["mcp_session_digest", "credential_state", "overlap_until"],
+    "rotation_transfers_session": false,
+    "revocation_event": "analyze.application.sessions.revoked.v1",
+    "revocation_ingress": "POST /internal/v1/application-session-revocations",
+    "revocation_auth_env": "ACCESS_FACADE_REVOCATION_TOKEN"
+  }
+}

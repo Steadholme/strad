@@ -20,6 +20,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "turn_model_alias",
         sql: include_str!("../migrations/0002_turn_model_alias.sql"),
     },
+    Migration {
+        version: 3,
+        name: "application_owner_operations",
+        sql: include_str!("../migrations/0003_application_owner_operations.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "application_turn_executions",
+        sql: include_str!("../migrations/0004_application_turn_executions.sql"),
+    },
 ];
 
 pub async fn run(database_url: &str) -> std::result::Result<(), String> {
@@ -66,7 +76,7 @@ async fn run_locked(connection: &mut PgConnection) -> std::result::Result<(), St
         .last()
         .map(|row| row.get::<i64, _>("version"))
         .unwrap_or(0);
-    if current != 0 && !(CURRENT_SCHEMA_VERSION - 1..=CURRENT_SCHEMA_VERSION).contains(&current) {
+    if current != 0 && !(1..=CURRENT_SCHEMA_VERSION).contains(&current) {
         return Err(format!(
             "database schema version {current} is incompatible with application schema {CURRENT_SCHEMA_VERSION}"
         ));
@@ -246,10 +256,39 @@ mod tests {
     #[test]
     fn turn_model_migration_is_additive_and_bounded() {
         let sql = MIGRATIONS[1].sql;
-        assert_eq!(MIGRATIONS[1].version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(MIGRATIONS[1].version, 2);
         assert!(sql.contains("ALTER TABLE turns ADD COLUMN model_alias text"));
         assert!(sql.contains("ALTER COLUMN model_alias SET NOT NULL"));
         assert!(sql.contains("turns_model_alias_valid"));
         assert!(sql.contains("openai/gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn application_owner_migration_preserves_humans_and_freezes_operation_identity() {
+        let sql = MIGRATIONS[2].sql;
+        assert_eq!(MIGRATIONS[2].version, 3);
+        assert!(sql.contains("^user:"));
+        assert!(sql.contains("^application:"));
+        assert!(sql.contains("UNIQUE(application_sub, canonical_tool, operation_id)"));
+        assert!(
+            !sql.contains("UNIQUE(application_sub, canonical_tool, operation_id, request_sha256)")
+        );
+    }
+
+    #[test]
+    fn application_turn_migration_binds_execution_without_changing_human_turns() {
+        let migration = MIGRATIONS.last().unwrap();
+        assert_eq!(migration.version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(migration.version, 4);
+        assert!(migration
+            .sql
+            .contains("turn_id uuid PRIMARY KEY REFERENCES turns(id)"));
+        assert!(migration
+            .sql
+            .contains("UNIQUE REFERENCES application_operations(id)"));
+        assert!(migration
+            .sql
+            .contains("'pending','dispatched','completed','uncertain'"));
+        assert!(!migration.sql.contains("ALTER TABLE turns"));
     }
 }

@@ -384,12 +384,21 @@ impl NewApiClient {
         &self,
         frozen: &FrozenChatRequest,
     ) -> Result<reqwest::Response, AppError> {
+        self.send_stream_guarded(frozen, async { Ok(()) }).await
+    }
+
+    pub(crate) async fn send_stream_guarded(
+        &self,
+        frozen: &FrozenChatRequest,
+        before_send: impl std::future::Future<Output = Result<(), AppError>>,
+    ) -> Result<reqwest::Response, AppError> {
         if frozen.max_tokens != OUTPUT_BUDGET || !frozen.stream {
             return Err(AppError::Invariant(
                 "frozen chat request violates response policy",
             ));
         }
         self.validate_model(&frozen.model).await?;
+        before_send.await?;
         self.send(frozen).await
     }
 

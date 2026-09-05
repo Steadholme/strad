@@ -18,9 +18,15 @@ use uuid::Uuid;
 
 use crate::{
     analysis::AnalysisController,
+    application_facade::{
+        canonical_application_request_sha, is_public_tool, ApplicationReconciliationRequest,
+        AuthorizationAuditRequest, ExecutionFenceClient, FacadeToolRequest,
+        FacadeUploadChunkRequest, FacadeUploadMutationRequest,
+    },
     auth::{
         csrf_cookie, csrf_from_headers, existing_or_new_csrf, identity_middleware,
-        security_headers, verify_csrf, AuthVerifier, Identity,
+        security_headers, verify_csrf, verify_service_bearer, ApplicationIdentity, AuthVerifier,
+        Identity,
     },
     bridge::{ArtifactReadRequest, ArtifactReadResult, BridgeClient},
     chat::ChatEngine,
@@ -33,7 +39,10 @@ use crate::{
         CreateTurnInput, UpdatePersonaInput,
     },
     newapi::{NewApiClient, TokenBudgeter},
-    store::{canonical_request_sha, server_operation_id, CreatedUpload, IdempotencyReplay, Store},
+    store::{
+        canonical_request_sha, server_operation_id, ApplicationOperationClaim,
+        ApplicationQuotaSnapshot, CreatedUpload, IdempotencyReplay, Store,
+    },
     templates::{TemplateName, TemplateRenderer},
     upload::{ContentRange, FinalizeOutcome, UploadService},
     verdict::{Risk, VerdictClient},
@@ -72,6 +81,7 @@ pub struct AppState {
     pub bridge: BridgeClient,
     pub newapi: NewApiClient,
     pub templates: TemplateRenderer,
+    pub execution_fence: ExecutionFenceClient,
 }
 
 impl AppState {
@@ -85,6 +95,7 @@ impl AppState {
         let newapi = NewApiClient::new(&config)?;
         let templates = TemplateRenderer::new(config.template_root.clone())
             .map_err(|_| "failed to initialize SSR renderer".to_string())?;
+        let execution_fence = ExecutionFenceClient::new(&config)?;
         let upload = UploadService::new(&config, store.clone(), bridge.clone())
             .await
             .map_err(|_| "failed to initialize upload storage".to_string())?;
@@ -100,6 +111,10 @@ impl AppState {
             .recover_sample_delete_leases()
             .await
             .map_err(|_| "sample deletion lease recovery failed".to_string())?;
+        store
+            .recover_expired_application_operation_leases()
+            .await
+            .map_err(|_| "application operation lease recovery failed".to_string())?;
         upload
             .recover_filesystem()
             .await
@@ -109,7 +124,8 @@ impl AppState {
             .await
             .map_err(|_| "NewAPI startup probe failed".to_string())?;
         let analysis = AnalysisController::new(store.clone(), bridge.clone());
-        let chat = ChatEngine::new(store.clone(), bridge.clone(), newapi.clone(), budgeter);
+        let chat = ChatEngine::new(store.clone(), bridge.clone(), newapi.clone(), budgeter)
+            .with_execution_fence(execution_fence.clone());
         let cleanup = CleanupService::new(&config, store.clone(), bridge.clone())
             .map_err(|_| "failed to anchor cleanup storage".to_string())?;
         Ok(Self {
@@ -123,6 +139,7 @@ impl AppState {
             bridge,
             newapi,
             templates,
+            execution_fence,
         })
     }
 }
@@ -176,11 +193,47 @@ pub fn router(state: AppState) -> Router {
             verifier,
             identity_middleware,
         ));
+    let facade = Router::new()
+        .route(
+            "/internal/v1/facade/tools/{canonical_tool}",
+            post(facade_tool),
+        )
+        .route(
+            "/internal/v1/facade/uploads/{upload_id}/chunks/{chunk_index}",
+            post(facade_upload_chunk),
+        )
+        .route(
+            "/internal/v1/facade/uploads/{upload_id}/finalize",
+            post(facade_upload_finalize),
+        )
+        .route(
+            "/internal/v1/facade/uploads/{upload_id}/cancel",
+            post(facade_upload_cancel),
+        )
+        .route(
+            "/internal/v1/facade/audit/authorization",
+            post(facade_authorization_audit),
+        )
+        .route(
+            "/internal/v1/facade/operations/{canonical_tool}/{operation_id}/reconcile",
+            post(facade_reconcile_application_operation),
+        );
+    let governance = Router::new()
+        .route(
+            "/internal/v1/governance/applications/{application_sub}/quota",
+            get(governance_application_quota),
+        )
+        .route(
+            "/internal/v1/governance/applications/{application_sub}/audit",
+            get(governance_application_audit),
+        );
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/static/{*path}", get(static_asset))
         .merge(private)
+        .merge(facade)
+        .merge(governance)
         .layer(middleware::from_fn_with_state(
             error_state,
             html_error_middleware,
@@ -188,6 +241,930 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(MULTIPART_LIMIT))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+async fn facade_tool(
+    State(state): State<AppState>,
+    Path(canonical_tool): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<FacadeToolRequest>,
+) -> Result<Response> {
+    verify_service_bearer(&headers, &state.config.facade_token)?;
+    if !is_public_tool(&canonical_tool) {
+        return Err(AppError::not_found());
+    }
+    ApplicationIdentity::parse(&request.application_sub)?;
+    let computed = canonical_application_request_sha(
+        &request.application_sub,
+        &canonical_tool,
+        &request.resource,
+        &request.body,
+    )?;
+    if computed != request.request_sha256 {
+        return Err(AppError::conflict(
+            "idempotency_mismatch",
+            "The application request digest does not match its body.",
+        ));
+    }
+    request.execution.validate_binding(
+        &request.application_sub,
+        &request.request_sha256,
+        time::OffsetDateTime::now_utc(),
+    )?;
+    let claim = match state
+        .store
+        .claim_application_operation(
+            &request.application_sub,
+            &canonical_tool,
+            request.operation_id,
+            &request.request_sha256,
+            request.correlation_id,
+        )
+        .await
+    {
+        Ok(claim) => claim,
+        Err(error) if error.code() == "quota_exceeded" => {
+            return Ok(application_error_response(error, request.correlation_id))
+        }
+        Err(error) => return Err(error),
+    };
+    let (lease_token, quota) = match claim {
+        ApplicationOperationClaim::Replay(replay) => {
+            preflight_application_dispatch(&state, &canonical_tool, &request).await?;
+            return application_response(replay.status, replay.body, &replay.quota);
+        }
+        ApplicationOperationClaim::Claimed { lease_token, quota } => (lease_token, quota),
+    };
+
+    if let Err(error) = preflight_application_dispatch(&state, &canonical_tool, &request).await {
+        state
+            .store
+            .fail_application_operation(
+                &request.application_sub,
+                &canonical_tool,
+                request.operation_id,
+                lease_token,
+                error.code(),
+            )
+            .await?;
+        return Err(error);
+    }
+    state
+        .store
+        .begin_application_dispatch(
+            &request.application_sub,
+            &canonical_tool,
+            request.operation_id,
+            lease_token,
+        )
+        .await?;
+
+    let dispatched = dispatch_application_tool(&state, &canonical_tool, &request).await;
+    let (status, body) = match dispatched {
+        Ok(result) => result,
+        Err(error) => {
+            let uncertain = error.retryable();
+            if uncertain {
+                state
+                    .store
+                    .mark_application_operation_uncertain(
+                        &request.application_sub,
+                        &canonical_tool,
+                        request.operation_id,
+                        lease_token,
+                        error.code(),
+                    )
+                    .await?;
+            } else {
+                state
+                    .store
+                    .fail_application_operation(
+                        &request.application_sub,
+                        &canonical_tool,
+                        request.operation_id,
+                        lease_token,
+                        error.code(),
+                    )
+                    .await?;
+            }
+            if error.code() == "quota_exceeded" {
+                return Ok(application_error_response(error, request.correlation_id));
+            }
+            return Err(error);
+        }
+    };
+    complete_application_dispatch(
+        &state,
+        &request.application_sub,
+        &canonical_tool,
+        request.operation_id,
+        lease_token,
+        status.as_u16().into(),
+        &body,
+    )
+    .await?;
+    application_response(status.as_u16().into(), body, &quota)
+}
+
+async fn preflight_application_dispatch(
+    state: &AppState,
+    canonical_tool: &str,
+    request: &FacadeToolRequest,
+) -> Result<()> {
+    // Check current authority before looking up an object, marking dispatch, or
+    // releasing cached data. A policy grant does not imply object ownership.
+    state.execution_fence.check(&request.execution).await?;
+    match canonical_tool {
+        "analysis.create" => Ok(()),
+        "analysis.read" | "analysis.conversation" => {
+            let id = Uuid::parse_str(&request.resource).map_err(|_| {
+                AppError::invalid("invalid_request", "Analysis resource is invalid.")
+            })?;
+            state
+                .store
+                .get_analysis(&request.application_sub, id)
+                .await?;
+            Ok(())
+        }
+        "analysis.upload.cancel" => {
+            let id = Uuid::parse_str(&request.resource)
+                .map_err(|_| AppError::invalid("invalid_request", "Upload resource is invalid."))?;
+            state
+                .store
+                .assert_application_upload(&request.application_sub, id)
+                .await
+        }
+        _ => Err(AppError::not_found()),
+    }
+}
+
+async fn dispatch_application_tool(
+    state: &AppState,
+    canonical_tool: &str,
+    request: &FacadeToolRequest,
+) -> Result<(StatusCode, Value)> {
+    match canonical_tool {
+        "analysis.create" => {
+            if request.resource != "collection" {
+                return Err(AppError::invalid(
+                    "invalid_request",
+                    "analysis.create resource must be collection.",
+                ));
+            }
+            let input: CreateAnalysisInput =
+                serde_json::from_value(request.body.clone()).map_err(|_| {
+                    AppError::invalid("invalid_request", "analysis.create body is invalid.")
+                })?;
+            validate_filename_and_size(&input.filename, input.total_bytes)?;
+            let created = state
+                .store
+                .create_upload(
+                    &request.application_sub,
+                    &input.filename,
+                    input.total_bytes,
+                    request.operation_id,
+                    &request.request_sha256,
+                )
+                .await?;
+            state
+                .store
+                .bind_application_upload(&request.application_sub, created.upload.id)
+                .await?;
+            let finalize_operation_id = state
+                .store
+                .application_finalize_operation_id(&request.application_sub, created.upload.id)
+                .await?;
+            Ok((
+                StatusCode::CREATED,
+                json!({
+                    "analysis_id": created.analysis.id,
+                    "upload_id": created.upload.id,
+                    "finalize_operation_id": finalize_operation_id,
+                    "chunk_size": CHUNK_BYTES,
+                    "chunk_count": created.upload.chunk_count
+                }),
+            ))
+        }
+        "analysis.read" => {
+            let analysis_id = Uuid::parse_str(&request.resource).map_err(|_| {
+                AppError::invalid("invalid_request", "analysis.read resource is invalid.")
+            })?;
+            if request.body != json!({}) {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct TurnSelector {
+                    conversation_id: Uuid,
+                    turn_id: Uuid,
+                }
+                let input: TurnSelector =
+                    serde_json::from_value(request.body.clone()).map_err(|_| {
+                        AppError::invalid(
+                            "invalid_request",
+                            "analysis.read turn selector is invalid.",
+                        )
+                    })?;
+                let turn = state
+                    .store
+                    .get_turn(
+                        &request.application_sub,
+                        analysis_id,
+                        input.conversation_id,
+                        input.turn_id,
+                    )
+                    .await?;
+                let mut assistant = state.store.assistant_message(turn.id).await?;
+                // 应用引用读取依赖本次已通过鉴权的 read，不延续过期的后台授权。
+                if matches!(turn.state.as_str(), "completed" | "partial")
+                    && !assistant.content.is_empty()
+                {
+                    crate::citation::resolve(&state.store, &state.bridge, &turn, &assistant)
+                        .await?;
+                }
+                let citations = state
+                    .store
+                    .citation_refs(&request.application_sub, analysis_id, assistant.id)
+                    .await?;
+                let resolved: Vec<String> = citations
+                    .iter()
+                    .filter(|(_, resolved)| *resolved)
+                    .map(|(citation_ref, _)| citation_ref.clone())
+                    .collect();
+                assistant.content =
+                    crate::citation::annotate_uncited_markdown(&assistant.content, &resolved);
+                return Ok((
+                    StatusCode::OK,
+                    json!({"turn":turn,"assistant":assistant,"citations":citations}),
+                ));
+            }
+            let analysis = state
+                .store
+                .get_analysis(&request.application_sub, analysis_id)
+                .await?;
+            let artifacts = state
+                .store
+                .artifacts(&request.application_sub, analysis_id)
+                .await?;
+            Ok((
+                StatusCode::OK,
+                json!({"analysis":analysis,"artifacts":artifacts}),
+            ))
+        }
+        "analysis.conversation" => {
+            if request.body.get("conversation_id").is_some() {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct TurnInput {
+                    analysis_id: Uuid,
+                    conversation_id: Uuid,
+                    client_seq: i64,
+                    message: String,
+                    model: Option<String>,
+                }
+                let input: TurnInput =
+                    serde_json::from_value(request.body.clone()).map_err(|_| {
+                        AppError::invalid(
+                            "invalid_request",
+                            "analysis.conversation turn is invalid.",
+                        )
+                    })?;
+                if request.resource != input.analysis_id.to_string()
+                    || input.client_seq < 1
+                    || input.client_seq > 9_007_199_254_740_991
+                    || input.message.is_empty()
+                    || input.message.len() > 8192
+                    || input.message.contains('\0')
+                {
+                    return Err(AppError::invalid(
+                        "invalid_request",
+                        "analysis.conversation turn is invalid.",
+                    ));
+                }
+                state
+                    .store
+                    .get_conversation(
+                        &request.application_sub,
+                        input.analysis_id,
+                        input.conversation_id,
+                    )
+                    .await?;
+                let model = input
+                    .model
+                    .as_deref()
+                    .unwrap_or_else(|| state.newapi.model());
+                state.newapi.validate_model(model).await?;
+                let turn = state
+                    .store
+                    .create_application_turn(
+                        request,
+                        input.conversation_id,
+                        input.client_seq,
+                        model,
+                        &input.message,
+                    )
+                    .await?;
+                return Ok((StatusCode::ACCEPTED, json!({"turn":turn})));
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Input {
+                analysis_id: Uuid,
+                title: String,
+                persona_id: Option<String>,
+            }
+            let input: Input = serde_json::from_value(request.body.clone()).map_err(|_| {
+                AppError::invalid("invalid_request", "analysis.conversation body is invalid.")
+            })?;
+            if request.resource != input.analysis_id.to_string() {
+                return Err(AppError::invalid(
+                    "invalid_request",
+                    "analysis.conversation resource is inconsistent.",
+                ));
+            }
+            validate_conversation(
+                &input.title,
+                input.persona_id.as_deref().unwrap_or("binary-analyst"),
+            )?;
+            let conversation = state
+                .store
+                .create_conversation(
+                    &request.application_sub,
+                    input.analysis_id,
+                    &input.title,
+                    input.persona_id.as_deref().unwrap_or("binary-analyst"),
+                    request.operation_id,
+                    &request.request_sha256,
+                )
+                .await?;
+            Ok((StatusCode::CREATED, json!({"conversation":conversation})))
+        }
+        "analysis.upload.cancel" => {
+            if request.body != json!({}) {
+                return Err(AppError::invalid(
+                    "invalid_request",
+                    "analysis.upload.cancel body must be empty.",
+                ));
+            }
+            let upload_id = Uuid::parse_str(&request.resource).map_err(|_| {
+                AppError::invalid(
+                    "invalid_request",
+                    "analysis.upload.cancel resource is invalid.",
+                )
+            })?;
+            state
+                .store
+                .assert_application_upload(&request.application_sub, upload_id)
+                .await?;
+            state
+                .upload
+                .cancel(&request.application_sub, upload_id)
+                .await?;
+            Ok((
+                StatusCode::ACCEPTED,
+                json!({"upload_id":upload_id,"state":"cancelled"}),
+            ))
+        }
+        _ => Err(AppError::not_found()),
+    }
+}
+
+async fn facade_upload_chunk(
+    State(state): State<AppState>,
+    Path((upload_id, chunk_index)): Path<(Uuid, i32)>,
+    headers: HeaderMap,
+    Json(request): Json<FacadeUploadChunkRequest>,
+) -> Result<Response> {
+    verify_service_bearer(&headers, &state.config.facade_token)?;
+    ApplicationIdentity::parse(&request.application_sub)?;
+    state
+        .store
+        .assert_application_upload(&request.application_sub, upload_id)
+        .await?;
+    let digest_body = json!({
+        "content_range": request.content_range,
+        "chunk_sha256": request.chunk_sha256,
+        "content_base64": request.content_base64
+    });
+    let computed = canonical_application_request_sha(
+        &request.application_sub,
+        "analysis.create",
+        &format!("{upload_id}/{chunk_index}"),
+        &digest_body,
+    )?;
+    if computed != request.request_sha256 {
+        return Err(AppError::conflict(
+            "idempotency_mismatch",
+            "The upload chunk digest does not match its body.",
+        ));
+    }
+    request.execution.validate_binding(
+        &request.application_sub,
+        &request.request_sha256,
+        time::OffsetDateTime::now_utc(),
+    )?;
+    state.execution_fence.check(&request.execution).await?;
+    let range = ContentRange::parse(&request.content_range)?;
+    if range.index()? != chunk_index {
+        return Err(AppError::invalid(
+            "invalid_request",
+            "Chunk index does not match Content-Range.",
+        ));
+    }
+    let body = BASE64_STANDARD
+        .decode(request.content_base64)
+        .map_err(|_| AppError::invalid("invalid_upload", "Chunk body is not valid base64."))?;
+    if body.len() > CHUNK_BYTES as usize {
+        return Err(AppError::api(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            "The upload chunk exceeds 8 MiB.",
+            false,
+        ));
+    }
+    state
+        .upload
+        .put_chunk(
+            &request.application_sub,
+            upload_id,
+            range,
+            &request.chunk_sha256,
+            Bytes::from(body),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn facade_upload_finalize(
+    State(state): State<AppState>,
+    Path(upload_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<FacadeUploadMutationRequest>,
+) -> Result<Response> {
+    verify_service_bearer(&headers, &state.config.facade_token)?;
+    ApplicationIdentity::parse(&request.application_sub)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    state
+        .store
+        .assert_application_upload(&request.application_sub, upload_id)
+        .await?;
+    let finalize_operation_id = state
+        .store
+        .application_finalize_operation_id(&request.application_sub, upload_id)
+        .await?;
+    if idempotency_key != request.operation_id || idempotency_key != finalize_operation_id {
+        return Err(AppError::invalid(
+            "invalid_request",
+            "Idempotency-Key is not the server-issued finalize operation ID.",
+        ));
+    }
+    let empty = json!({});
+    let computed = canonical_application_request_sha(
+        &request.application_sub,
+        "analysis.create",
+        &format!("{upload_id}/finalize"),
+        &empty,
+    )?;
+    if computed != request.request_sha256 {
+        return Err(AppError::conflict(
+            "idempotency_mismatch",
+            "The finalize request digest is invalid.",
+        ));
+    }
+    request.execution.validate_binding(
+        &request.application_sub,
+        &request.request_sha256,
+        time::OffsetDateTime::now_utc(),
+    )?;
+    let claim = match state
+        .store
+        .claim_application_operation(
+            &request.application_sub,
+            "analysis.create",
+            request.operation_id,
+            &request.request_sha256,
+            request.correlation_id,
+        )
+        .await
+    {
+        Ok(claim) => claim,
+        Err(error) if error.code() == "quota_exceeded" => {
+            return Ok(application_error_response(error, request.correlation_id))
+        }
+        Err(error) => return Err(error),
+    };
+    let (lease_token, quota) = match claim {
+        ApplicationOperationClaim::Replay(replay) => {
+            state.execution_fence.check(&request.execution).await?;
+            return application_response(replay.status, replay.body, &replay.quota);
+        }
+        ApplicationOperationClaim::Claimed { lease_token, quota } => (lease_token, quota),
+    };
+    if let Err(error) = state.execution_fence.check(&request.execution).await {
+        state
+            .store
+            .fail_application_operation(
+                &request.application_sub,
+                "analysis.create",
+                request.operation_id,
+                lease_token,
+                error.code(),
+            )
+            .await?;
+        return Err(error);
+    }
+    state
+        .store
+        .begin_application_dispatch(
+            &request.application_sub,
+            "analysis.create",
+            request.operation_id,
+            lease_token,
+        )
+        .await?;
+    let result = state
+        .upload
+        .finalize(&request.application_sub, upload_id)
+        .await;
+    let body = match result {
+        Ok(FinalizeOutcome::Complete(analysis)) => {
+            json!({"analysis_id":analysis.id,"state":analysis.state})
+        }
+        Ok(FinalizeOutcome::Pending) => {
+            state
+                .store
+                .mark_application_operation_uncertain(
+                    &request.application_sub,
+                    "analysis.create",
+                    request.operation_id,
+                    lease_token,
+                    "analyzer_uncertain",
+                )
+                .await?;
+            return Err(AppError::unavailable(
+                "analyzer_unavailable",
+                "The analyzer result is pending reconciliation.",
+            ));
+        }
+        Ok(FinalizeOutcome::UnknownFile) => {
+            state
+                .store
+                .fail_application_operation(
+                    &request.application_sub,
+                    "analysis.create",
+                    request.operation_id,
+                    lease_token,
+                    "invalid_upload",
+                )
+                .await?;
+            return Err(AppError::invalid(
+                "invalid_upload",
+                "The uploaded file type is not supported.",
+            ));
+        }
+        Err(error) => {
+            state
+                .store
+                .mark_application_operation_uncertain(
+                    &request.application_sub,
+                    "analysis.create",
+                    request.operation_id,
+                    lease_token,
+                    error.code(),
+                )
+                .await?;
+            return Err(error);
+        }
+    };
+    complete_application_dispatch(
+        &state,
+        &request.application_sub,
+        "analysis.create",
+        request.operation_id,
+        lease_token,
+        202,
+        &body,
+    )
+    .await?;
+    application_response(202, body, &quota)
+}
+
+fn required_idempotency_key(headers: &HeaderMap) -> Result<Uuid> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let value = values.next().ok_or_else(|| {
+        AppError::invalid(
+            "invalid_request",
+            "Exactly one Idempotency-Key header is required.",
+        )
+    })?;
+    if values.next().is_some() {
+        return Err(AppError::invalid(
+            "invalid_request",
+            "Exactly one Idempotency-Key header is required.",
+        ));
+    }
+    Uuid::parse_str(
+        value
+            .to_str()
+            .map_err(|_| AppError::invalid("invalid_request", "Idempotency-Key is invalid."))?,
+    )
+    .map_err(|_| AppError::invalid("invalid_request", "Idempotency-Key is invalid."))
+}
+
+async fn facade_upload_cancel(
+    State(state): State<AppState>,
+    Path(upload_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<FacadeUploadMutationRequest>,
+) -> Result<Response> {
+    verify_service_bearer(&headers, &state.config.facade_token)?;
+    ApplicationIdentity::parse(&request.application_sub)?;
+    state
+        .store
+        .assert_application_upload(&request.application_sub, upload_id)
+        .await?;
+    if request.operation_id != server_operation_id("upload-cancel", &upload_id.to_string()) {
+        return Err(AppError::invalid(
+            "invalid_request",
+            "Idempotency-Key is not the server-issued cancel operation ID.",
+        ));
+    }
+    let empty = json!({});
+    let computed = canonical_application_request_sha(
+        &request.application_sub,
+        "analysis.upload.cancel",
+        &upload_id.to_string(),
+        &empty,
+    )?;
+    if computed != request.request_sha256 {
+        return Err(AppError::conflict(
+            "idempotency_mismatch",
+            "The cancel request digest is invalid.",
+        ));
+    }
+    request.execution.validate_binding(
+        &request.application_sub,
+        &request.request_sha256,
+        time::OffsetDateTime::now_utc(),
+    )?;
+    let claim = match state
+        .store
+        .claim_application_operation(
+            &request.application_sub,
+            "analysis.upload.cancel",
+            request.operation_id,
+            &request.request_sha256,
+            request.correlation_id,
+        )
+        .await
+    {
+        Ok(claim) => claim,
+        Err(error) if error.code() == "quota_exceeded" => {
+            return Ok(application_error_response(error, request.correlation_id))
+        }
+        Err(error) => return Err(error),
+    };
+    let (lease_token, quota) = match claim {
+        ApplicationOperationClaim::Replay(replay) => {
+            state.execution_fence.check(&request.execution).await?;
+            return application_response(replay.status, replay.body, &replay.quota);
+        }
+        ApplicationOperationClaim::Claimed { lease_token, quota } => (lease_token, quota),
+    };
+    if let Err(error) = state.execution_fence.check(&request.execution).await {
+        state
+            .store
+            .fail_application_operation(
+                &request.application_sub,
+                "analysis.upload.cancel",
+                request.operation_id,
+                lease_token,
+                error.code(),
+            )
+            .await?;
+        return Err(error);
+    }
+    state
+        .store
+        .begin_application_dispatch(
+            &request.application_sub,
+            "analysis.upload.cancel",
+            request.operation_id,
+            lease_token,
+        )
+        .await?;
+    if let Err(error) = state
+        .upload
+        .cancel(&request.application_sub, upload_id)
+        .await
+    {
+        if error.retryable() {
+            state
+                .store
+                .mark_application_operation_uncertain(
+                    &request.application_sub,
+                    "analysis.upload.cancel",
+                    request.operation_id,
+                    lease_token,
+                    error.code(),
+                )
+                .await?;
+        } else {
+            state
+                .store
+                .fail_application_operation(
+                    &request.application_sub,
+                    "analysis.upload.cancel",
+                    request.operation_id,
+                    lease_token,
+                    error.code(),
+                )
+                .await?;
+        }
+        return Err(error);
+    }
+    let body = json!({"upload_id":upload_id,"state":"cancelled"});
+    complete_application_dispatch(
+        &state,
+        &request.application_sub,
+        "analysis.upload.cancel",
+        request.operation_id,
+        lease_token,
+        202,
+        &body,
+    )
+    .await?;
+    application_response(202, body, &quota)
+}
+
+async fn facade_authorization_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AuthorizationAuditRequest>,
+) -> Result<StatusCode> {
+    verify_service_bearer(&headers, &state.config.facade_token)?;
+    ApplicationIdentity::parse(&request.application_sub)?;
+    state.store.record_authorization_audit(&request).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn facade_reconcile_application_operation(
+    State(state): State<AppState>,
+    Path((canonical_tool, operation_id)): Path<(String, Uuid)>,
+    headers: HeaderMap,
+    Json(request): Json<ApplicationReconciliationRequest>,
+) -> Result<StatusCode> {
+    verify_service_bearer(&headers, &state.config.facade_token)?;
+    ApplicationIdentity::parse(&request.application_sub)?;
+    if !is_public_tool(&canonical_tool) {
+        return Err(AppError::not_found());
+    }
+    state
+        .store
+        .reconcile_application_operation(&canonical_tool, operation_id, &request)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn governance_application_quota(
+    State(state): State<AppState>,
+    Path(application_sub): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    verify_service_bearer(&headers, &state.config.governance_reporting_token)?;
+    ApplicationIdentity::parse(&application_sub)?;
+    Ok(Json(
+        state
+            .store
+            .application_quota_report(&application_sub)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GovernanceAuditQuery {
+    limit: Option<i64>,
+    support: Option<bool>,
+}
+
+async fn governance_application_audit(
+    State(state): State<AppState>,
+    Path(application_sub): Path<String>,
+    Query(query): Query<GovernanceAuditQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    verify_service_bearer(&headers, &state.config.governance_reporting_token)?;
+    ApplicationIdentity::parse(&application_sub)?;
+    let events = if query.support.unwrap_or(false) {
+        let capability = optional_header(&headers, "x-support-capability")?;
+        let event_id = optional_header(&headers, "x-authorization-event-id")?
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or_else(Uuid::new_v4);
+        let correlation_id = optional_header(&headers, "x-correlation-id")?
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or_else(Uuid::new_v4);
+        state
+            .store
+            .support_application_audit(
+                &application_sub,
+                event_id,
+                correlation_id,
+                capability == Some("analyze.audit.support.read"),
+            )
+            .await?
+    } else {
+        state
+            .store
+            .application_audit(&application_sub, query.limit.unwrap_or(100))
+            .await?
+    };
+    Ok(Json(
+        json!({"application_sub":application_sub,"events":events}),
+    ))
+}
+
+fn application_response(
+    status: i32,
+    body: Value,
+    quota: &ApplicationQuotaSnapshot,
+) -> Result<Response> {
+    let status = StatusCode::from_u16(status as u16)
+        .map_err(|_| AppError::Invariant("application response status is invalid"))?;
+    let mut response = (status, Json(body)).into_response();
+    for (name, value) in [
+        ("x-ratelimit-limit", quota.rate_limit.to_string()),
+        ("x-ratelimit-remaining", quota.rate_remaining.to_string()),
+        ("x-ratelimit-reset", quota.rate_reset.to_string()),
+    ] {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(name),
+            HeaderValue::from_str(&value)
+                .map_err(|_| AppError::Invariant("quota response header is invalid"))?,
+        );
+    }
+    Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_application_dispatch(
+    state: &AppState,
+    application_sub: &str,
+    canonical_tool: &str,
+    operation_id: Uuid,
+    lease_token: Uuid,
+    response_status: i32,
+    response_body: &Value,
+) -> Result<()> {
+    if state
+        .store
+        .complete_application_operation(
+            application_sub,
+            canonical_tool,
+            operation_id,
+            lease_token,
+            response_status,
+            response_body,
+        )
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    state
+        .store
+        .mark_application_operation_uncertain(
+            application_sub,
+            canonical_tool,
+            operation_id,
+            lease_token,
+            "response_before_commit_crash",
+        )
+        .await?;
+    Err(AppError::unavailable(
+        "dependency_unavailable",
+        "The downstream response is pending audited reconciliation.",
+    ))
+}
+
+fn application_error_response(error: AppError, correlation_id: Uuid) -> Response {
+    let code = error.code();
+    let retryable = error.retryable();
+    let original = error.into_response();
+    let status = original.status();
+    let headers = original.headers().clone();
+    let mut response = (
+        status,
+        Json(json!({
+            "error": {
+                "code": code,
+                "message": "The application operation could not be accepted.",
+                "correlation_id": correlation_id,
+                "retryable": retryable
+            }
+        })),
+    )
+        .into_response();
+    *response.headers_mut() = headers;
+    response
 }
 
 async fn html_error_middleware(
@@ -235,6 +1212,7 @@ async fn readyz(State(state): State<AppState>) -> Result<StatusCode> {
         ));
     }
     state.verdict.readiness_probe().await?;
+    state.execution_fence.readiness_probe().await?;
     state.bridge.ready().await?;
     state.newapi.readiness_probe().await?;
     Ok(StatusCode::OK)
@@ -2213,6 +3191,22 @@ mod tests {
         assert!(validate_persona("custom", Some("Focus on imports")).is_ok());
         assert!(validate_persona("custom", None).is_err());
         assert!(validate_persona("arbitrary", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn application_quota_error_keeps_headers_and_correlation_id() {
+        let correlation_id = Uuid::new_v4();
+        let response = application_error_response(
+            AppError::quota("quota", 4, 0, 1_788_000_000, 60),
+            correlation_id,
+        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-ratelimit-limit"], "4");
+        assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["correlation_id"], correlation_id.to_string());
+        assert_eq!(value["error"]["code"], "quota_exceeded");
     }
 
     #[test]

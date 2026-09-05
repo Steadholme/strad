@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "routes": [
+    {"phase":"internal","name":"analyze-internal-decision","host":"sso.w33d.xyz","path_prefix":"/api/v2/application-check","upstream":"http://verdict:9140","auth":"public","internal_only":true},
+    {"phase":"internal","name":"analyze-internal-dispatch","host":"sso.w33d.xyz","path_prefix":"/internal/v1/facade/","upstream":"http://strad:9360","auth":"public","internal_only":true},
+    {"phase":"internal","name":"analyze-internal-reporting","host":"sso.w33d.xyz","path_prefix":"/internal/v1/governance/","upstream":"http://strad:9360","auth":"public","internal_only":true},
+    {"phase":"internal","name":"analyze-internal-fence","host":"sso.w33d.xyz","path_prefix":"/internal/v1/application-execution-fence/check","upstream":"http://access-governance:9390","auth":"public","internal_only":true},
+    {"phase":"internal","name":"analyze-internal-revocation","host":"sso.w33d.xyz","path_prefix":"/internal/v1/application-session-revocations","upstream":"http://analyze-facade:18120","auth":"public","internal_only":true},
+    {"phase":"internal","name":"analyze-internal-readiness","host":"sso.w33d.xyz","path_prefix":"/readyz","upstream":"http://strad:9360","auth":"public","internal_only":true},
+    {"phase":"public","name":"analyze-mcp","host":"analyze.w33d.xyz","path_prefix":"/mcp","upstream":"http://analyze-facade:18120","auth":"application","internal_only":false},
+    {"phase":"public","name":"analyze-uploads","host":"analyze.w33d.xyz","path_prefix":"/v1/uploads","upstream":"http://analyze-facade:18120","auth":"application","internal_only":false},
+    {"phase":"public","name":"analyze-access","host":"analyze.w33d.xyz","path_prefix":"/","upstream":"http://access-governance:9390","auth":"sso","internal_only":false,"risk":"critical","step_up_resume_path":"/applications/"}
+  ]
+}

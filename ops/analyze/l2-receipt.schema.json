@@ -1,0 +1,409 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://w33d.xyz/schemas/analyze/l2-acceptance-v1.json",
+  "title": "Analyze ingress-closed L2 acceptance receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "layer",
+    "status",
+    "ingress_closed",
+    "run_id",
+    "started_at",
+    "completed_at",
+    "duration_seconds",
+    "sources",
+    "topology",
+    "approval",
+    "browser",
+    "mcp",
+    "authorization",
+    "credential",
+    "revocation",
+    "final_fence",
+    "faults",
+    "missing_dependencies",
+    "native_checks",
+    "scenarios",
+    "evidence_digests"
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "pass": {
+      "type": "string",
+      "const": "pass"
+    },
+    "strictPassEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "status", "evidence_sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 80},
+        "status": {"$ref": "#/$defs/pass"},
+        "evidence_sha256": {"$ref": "#/$defs/digest"},
+        "correlation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "layer": {"type": "string", "const": "L2"},
+    "status": {"$ref": "#/$defs/pass"},
+    "ingress_closed": {"type": "boolean", "const": true},
+    "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "started_at": {"type": "integer", "minimum": 1},
+    "completed_at": {"type": "integer", "minimum": 1},
+    "duration_seconds": {"type": "integer", "minimum": 0, "maximum": 21600},
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "access_revision",
+        "sluice_revision",
+        "verdict_revision",
+        "strad_revision",
+        "facade_revision",
+        "analyzer_image",
+        "postgres_image",
+        "task003_manifest_sha256"
+      ],
+      "properties": {
+        "access_revision": {"$ref": "#/$defs/revision"},
+        "sluice_revision": {"$ref": "#/$defs/revision"},
+        "verdict_revision": {"$ref": "#/$defs/revision"},
+        "strad_revision": {"$ref": "#/$defs/revision"},
+        "facade_revision": {"$ref": "#/$defs/revision"},
+        "analyzer_image": {
+          "type": "string",
+          "pattern": "^[a-z0-9./_-]+(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$"
+        },
+        "postgres_image": {
+          "type": "string",
+          "const": "postgres:18-alpine@sha256:1b1689b20d16a014a3d195653381cf2caa75a41a92d93b255a9d6ea29fd353aa"
+        },
+        "task003_manifest_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "network_internal",
+        "published_ports",
+        "services",
+        "postgres",
+        "service_readyz",
+        "composite_real_ghidra"
+      ],
+      "properties": {
+        "network_internal": {"type": "boolean", "const": true},
+        "published_ports": {"type": "array", "maxItems": 0},
+        "services": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 8,
+          "maxItems": 8,
+          "items": {
+            "enum": ["access", "sluice", "verdict", "facade", "strad", "analyzer", "postgres", "acceptance"]
+          }
+        },
+        "postgres": {"type": "string", "const": "real"},
+        "service_readyz": {"type": "boolean", "const": true},
+        "composite_real_ghidra": {"type": "boolean", "const": true}
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ui_path",
+        "routes",
+        "states",
+        "request_expiry_seconds",
+        "strict_dtos",
+        "sponsor",
+        "system_decision",
+        "filesystem_assertion",
+        "direct_decision_injection"
+      ],
+      "properties": {
+        "ui_path": {"type": "string", "const": "/applications/"},
+        "routes": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {"const": "POST /api/v1/application-requests"},
+            {"const": "POST /api/v1/application-requests/{id}/submit"},
+            {"const": "GET /api/v1/application-requests/{id}"},
+            {"const": "POST /api/v1/application-requests/{id}/cancel"}
+          ],
+          "items": false
+        },
+        "states": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "prefixItems": [
+            {"const": "draft"},
+            {"const": "pending_approval"},
+            {"const": "approved"},
+            {"const": "rejected"},
+            {"const": "expired"},
+            {"const": "cancelled"}
+          ],
+          "items": false
+        },
+        "request_expiry_seconds": {"type": "integer", "const": 604800},
+        "strict_dtos": {"type": "boolean", "const": true},
+        "sponsor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["producer", "trusted_mfa", "version_bound", "consumed_count"],
+          "properties": {
+            "producer": {"type": "string", "const": "sluice_live_trusted_mfa"},
+            "trusted_mfa": {"type": "boolean", "const": true},
+            "version_bound": {"type": "boolean", "const": true},
+            "consumed_count": {"type": "integer", "const": 1}
+          }
+        },
+        "system_decision": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "worker", "ttl_seconds", "consumed_count"],
+          "properties": {
+            "event": {"type": "string", "const": "analyze.application.approval.requested.v1"},
+            "worker": {"type": "string", "const": "access_real_worker"},
+            "ttl_seconds": {"type": "integer", "const": 300},
+            "consumed_count": {"type": "integer", "const": 1}
+          }
+        },
+        "filesystem_assertion": {"type": "boolean", "const": false},
+        "direct_decision_injection": {"type": "boolean", "const": false}
+      }
+    },
+    "browser": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture_sha256", "issuer", "audience", "resume_path", "csrf_distinct", "cookie_flags", "dom_digest", "sensitive_values_recorded"],
+      "properties": {
+        "fixture_sha256": {"$ref": "#/$defs/digest"},
+        "issuer": {"type": "string", "const": "https://id.w33d.xyz"},
+        "audience": {"type": "string", "const": "access-governance"},
+        "resume_path": {"type": "string", "const": "/applications/"},
+        "csrf_distinct": {"type": "boolean", "const": true},
+        "cookie_flags": {"type": "string", "const": "Secure; HttpOnly; SameSite=Lax"},
+        "dom_digest": {"$ref": "#/$defs/digest"},
+        "sensitive_values_recorded": {"type": "boolean", "const": false}
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "tools", "upload_routes", "rest_cancel_status", "rest_cancel_compensation_count", "real_binary", "terminal_ghidra_read", "newapi_model", "newapi_conversation_calls", "mcp_cancel", "idempotency_byte_identical", "quota_exceeded"],
+      "properties": {
+        "protocol_version": {"type": "string", "const": "2025-11-25"},
+        "tools": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {"const": "analysis.create"},
+            {"const": "analysis.read"},
+            {"const": "analysis.conversation"},
+            {"const": "analysis.upload.cancel"}
+          ],
+          "items": false
+        },
+        "upload_routes": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {"const": "POST /v1/uploads/{upload_id}/chunks/{chunk_index}"},
+            {"const": "POST /v1/uploads/{upload_id}/finalize"}
+          ],
+          "items": false
+        },
+        "rest_cancel_status": {"type": "integer", "enum": [404, 405]},
+        "rest_cancel_compensation_count": {"type": "integer", "const": 0},
+        "real_binary": {"type": "string", "const": "/usr/bin/true"},
+        "terminal_ghidra_read": {"type": "boolean", "const": true},
+        "newapi_model": {"type": "string", "pattern": "^[A-Za-z0-9._:/-]{1,128}$"},
+        "newapi_conversation_calls": {"type": "integer", "const": 1},
+        "mcp_cancel": {"type": "boolean", "const": true},
+        "idempotency_byte_identical": {"type": "boolean", "const": true},
+        "quota_exceeded": {"type": "boolean", "const": true}
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_v2_fields", "negative_cases", "all_negative_dispatch_count", "insufficient_scope_authorization_event", "insufficient_scope_decision_digest", "non_allow_audit_count_each", "non_allow_dispatch_count"],
+      "properties": {
+        "request_v2_fields": {
+          "type": "array",
+          "minItems": 16,
+          "maxItems": 16,
+          "prefixItems": [
+            {"const": "v"}, {"const": "application_sub"}, {"const": "client_id"},
+            {"const": "credential_id"}, {"const": "credential_version"}, {"const": "grant_id"},
+            {"const": "package_id"}, {"const": "package_revision_digest"}, {"const": "scopes"},
+            {"const": "canonical_tool"}, {"const": "resource"}, {"const": "session_id"},
+            {"const": "request_sha256"}, {"const": "policy_epoch"}, {"const": "revocation_epoch"},
+            {"const": "correlation_id"}
+          ],
+          "items": false
+        },
+        "negative_cases": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 16,
+          "maxItems": 16,
+          "items": {
+            "enum": ["no_token", "fake_credential", "expired_credential", "revoked_credential", "wrong_scope", "stale_digest", "stale_version", "stale_ttl", "deny", "indeterminate", "dependency_failure", "reused_jti", "cross_application_read", "cross_application_upload", "alias", "introspection_outage"]
+          }
+        },
+        "all_negative_dispatch_count": {"type": "integer", "const": 0},
+        "insufficient_scope_authorization_event": {"type": "boolean", "const": true},
+        "insufficient_scope_decision_digest": {"type": "boolean", "const": false},
+        "non_allow_audit_count_each": {"type": "integer", "const": 1},
+        "non_allow_dispatch_count": {"type": "integer", "const": 0}
+      }
+    },
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["token_pattern", "random_bytes", "lookup", "plaintext_persisted", "expiry_clipped", "lineage_recorded", "last_used_recorded", "states", "overlap_seconds", "original_session_only_overlap", "new_session_new_credential", "old_expires", "emergency_overlap_seconds", "source_grant_cascade"],
+      "properties": {
+        "token_pattern": {"type": "string", "const": "^app_v1_[A-Za-z0-9_-]{43}$"},
+        "random_bytes": {"type": "integer", "const": 32},
+        "lookup": {"type": "string", "const": "HMAC-SHA-256"},
+        "plaintext_persisted": {"type": "boolean", "const": false},
+        "expiry_clipped": {"type": "boolean", "const": true},
+        "lineage_recorded": {"type": "boolean", "const": true},
+        "last_used_recorded": {"type": "boolean", "const": true},
+        "states": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [{"const": "active"}, {"const": "overlap"}, {"const": "revoked"}, {"const": "expired"}],
+          "items": false
+        },
+        "overlap_seconds": {"type": "integer", "const": 300},
+        "original_session_only_overlap": {"type": "boolean", "const": true},
+        "new_session_new_credential": {"type": "boolean", "const": true},
+        "old_expires": {"type": "boolean", "const": true},
+        "emergency_overlap_seconds": {"type": "integer", "const": 0},
+        "source_grant_cascade": {"type": "boolean", "const": true}
+      }
+    },
+    "revocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event", "monotonic_epoch", "same_public_path_polled", "cache_used", "new_http_result", "bound_session_result", "durable_revoked_at", "enforced_at", "enforced_within_seconds"],
+      "properties": {
+        "event": {"type": "string", "const": "analyze.application.sessions.revoked.v1"},
+        "monotonic_epoch": {"type": "boolean", "const": true},
+        "same_public_path_polled": {"type": "boolean", "const": true},
+        "cache_used": {"type": "boolean", "const": false},
+        "new_http_result": {"type": "string", "const": "unauthenticated"},
+        "bound_session_result": {"type": "string", "const": "invalid_session"},
+        "durable_revoked_at": {"type": "integer", "minimum": 1},
+        "enforced_at": {"type": "integer", "minimum": 1},
+        "enforced_within_seconds": {"type": "integer", "minimum": 0, "maximum": 30}
+      }
+    },
+    "final_fence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["barrier", "revoke_committed_before_release", "execution_envelope_fields", "subject_version_bound", "fence_result", "dispatch_count"],
+      "properties": {
+        "barrier": {"type": "string", "const": "postgres_advisory_notify"},
+        "revoke_committed_before_release": {"type": "boolean", "const": true},
+        "execution_envelope_fields": {
+          "type": "array",
+          "minItems": 13,
+          "maxItems": 13,
+          "prefixItems": [
+            {"const": "version"}, {"const": "decision_id"}, {"const": "decision_digest"},
+            {"const": "subject_version"}, {"const": "application_sub"}, {"const": "credential_id"},
+            {"const": "credential_version"}, {"const": "policy_epoch"}, {"const": "revocation_epoch"},
+            {"const": "request_sha256"}, {"const": "mcp_session_digest"}, {"const": "issued_at"},
+            {"const": "expires_at"}
+          ],
+          "items": false
+        },
+        "subject_version_bound": {"type": "boolean", "const": true},
+        "fence_result": {"type": "string", "const": "inactive"},
+        "dispatch_count": {"type": "integer", "const": 0}
+      }
+    },
+    "faults": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "state", "reservation_retained", "automatic_resend_count", "audited_reconciliation"],
+        "properties": {
+          "name": {"enum": ["dispatch_timeout", "response_before_crash", "cleanup_crash"]},
+          "state": {"type": "string", "const": "downstream_uncertain"},
+          "reservation_retained": {"type": "boolean", "const": true},
+          "automatic_resend_count": {"type": "integer", "const": 0},
+          "audited_reconciliation": {"type": "boolean", "const": true}
+        }
+      }
+    },
+    "missing_dependencies": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "result", "pass_receipt_written"],
+        "properties": {
+          "name": {"enum": ["postgresql", "analyzer_ghidra", "ed25519_keyring", "application_credential_pepper", "approval_worker_signing_key", "strad_facade_token", "strad_governance_reporting_token"]},
+          "result": {"type": "string", "const": "fail_closed"},
+          "pass_receipt_written": {"type": "boolean", "const": false}
+        }
+      }
+    },
+    "native_checks": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {"$ref": "#/$defs/strictPassEvidence"}
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 9,
+      "items": {"$ref": "#/$defs/strictPassEvidence"}
+    },
+    "evidence_digests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public_contract_sha256", "oidc_fixture_sha256", "compose_sha256", "analyzer_baseline_sha256"],
+      "properties": {
+        "public_contract_sha256": {"$ref": "#/$defs/digest"},
+        "oidc_fixture_sha256": {"$ref": "#/$defs/digest"},
+        "compose_sha256": {"$ref": "#/$defs/digest"},
+        "analyzer_baseline_sha256": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}

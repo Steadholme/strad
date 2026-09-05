@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "origin": "https://analyze.w33d.xyz",
+  "oidc": {
+    "issuer": "https://id.w33d.xyz",
+    "audience": "access-governance",
+    "anonymous_redirect_path": "/_gw/auth/login",
+    "callback": "https://id.w33d.xyz/_gw/auth/callback",
+    "state_required": true,
+    "nonce_required": true
+  },
+  "resume_path": "/applications/",
+  "csrf": {
+    "json_header": "X-CSRF-Token",
+    "html_field": "csrf_token"
+  },
+  "cookie": {
+    "name": "__Secure-gw",
+    "domain": ".w33d.xyz",
+    "path": "/",
+    "secure": true,
+    "http_only": true,
+    "same_site": "Lax"
+  },
+  "sponsor_assertion": {
+    "version": 1,
+    "issuer": "https://id.w33d.xyz",
+    "audience": "access-governance",
+    "auth_time_max_age_seconds": 300,
+    "ttl_seconds": 300,
+    "session_binding": "lowerhex64",
+    "producer": "sluice_live_trusted_mfa"
+  },
+  "application_projection": [
+    "pending_approval",
+    "approved"
+  ],
+  "dom": {
+    "root": "[data-application-access]",
+    "status": "[data-application-request-status]",
+    "credential_reveal": "[data-credential-reveal-once]",
+    "credential_fingerprint": "[data-credential-fingerprint]",
+    "credential_expiry": "[data-credential-expiry]",
+    "rotate": "[data-credential-rotate]",
+    "revoke": "[data-credential-revoke]",
+    "owner_quota": "[data-application-quota]",
+    "owner_audit": "[data-application-audit]"
+  },
+  "privacy": {
+    "forbidden_recordings": [
+      "passkey",
+      "cookie_value",
+      "token"
+    ],
+    "dom_digest_only": true
+  }
+}
