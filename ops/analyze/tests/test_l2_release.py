@@ -120,7 +120,7 @@ class ReleaseWiringTests(unittest.TestCase):
     def test_release_requires_explicit_static_digest_and_corrected_root_revision(self):
         workflow = (ROOT / '.github/workflows/release.yml').read_text()
         self.assertIn('RIKUNE_ANALYZER_IMAGE: ${{ inputs.rikune_analyzer_image }}', workflow)
-        self.assertIn('RIKUNE_EXPECTED_SOURCE_REVISION: 61e354c5bb7625db30a1132d62b3a2fdb829e8f8', workflow)
+        self.assertIn('RIKUNE_EXPECTED_SOURCE_REVISION: 2c54ef4d83b82dcbf831f74da210c59c9c5881eb', workflow)
         self.assertIn('--repo Last-emo-boy/rikune', workflow)
         self.assertIn('--source-digest "${RIKUNE_EXPECTED_SOURCE_REVISION}"', workflow)
         self.assertIn('--signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"', workflow)

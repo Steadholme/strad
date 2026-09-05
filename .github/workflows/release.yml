@@ -23,7 +23,7 @@ env:
   STRAD_RUNTIME_IMAGE: gcr.io/distroless/cc-debian13@sha256:a77defd6fedbb3392b175ba8ea3d1c22be963c1597c248c3ba987ddd80bfb512
   STRAD_NODE_BUILDER_IMAGE: docker.io/library/node@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
   RIKUNE_ANALYZER_IMAGE: ${{ inputs.rikune_analyzer_image }}
-  RIKUNE_EXPECTED_SOURCE_REVISION: 61e354c5bb7625db30a1132d62b3a2fdb829e8f8
+  RIKUNE_EXPECTED_SOURCE_REVISION: 2c54ef4d83b82dcbf831f74da210c59c9c5881eb
   RIKUNE_STATIC_LOCK_SHA256: 32e3ea5103ff73c413062b17ad3bb4e7270fbcd6fd1325f6a7f3dc831bee83ef
   COSIGN_IDENTITY: https://github.com/Steadholme/strad/.github/workflows/release.yml@refs/heads/main
   COSIGN_ISSUER: https://token.actions.githubusercontent.com
