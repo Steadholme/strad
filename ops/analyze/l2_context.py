@@ -22,7 +22,7 @@ def encoded(value):
     return base64.urlsafe_b64encode(value).decode().rstrip('=')
 
 
-def signed_request(run, identity, session, request):
+def signed_request(run, identity, session, request, *, attenuate=True):
     body = json.dumps(request, separators=(',', ':')).encode()
     now = int(time.time())
     context = {'v': 1, 'kid': 'application-l2', 'iss': 'sluice', 'aud': 'analyze-facade',
@@ -30,7 +30,7 @@ def signed_request(run, identity, session, request):
         'credential_id': identity['credential_id'], 'credential_version': identity['credential_version'],
         'grant_id': identity['grant_id'], 'package_id': identity['package_id'],
         'package_revision_digest': identity['package_revision_digest'],
-        'scopes': sorted(scope for scope in identity['scope'].split() if scope != 'analysis.read'),
+        'scopes': sorted(scope for scope in identity['scope'].split() if not attenuate or scope != 'analysis.read'),
         'method': 'POST', 'normalized_path': '/mcp', 'route': 'analyze-mcp',
         'body_sha256': hashlib.sha256(body).hexdigest(), 'request_id': uuid.uuid4().hex,
         'correlation_id': uuid.uuid4().hex, 'jti': encoded(secrets.token_bytes(16)),
@@ -38,7 +38,7 @@ def signed_request(run, identity, session, request):
         'credential_state': identity['credential_state'], 'overlap_until': identity['overlap_until'],
         'policy_epoch': identity['policy_epoch'], 'revocation_epoch': identity['revocation_epoch'],
         'iat': now, 'exp': now + 30}
-    if len(context['scopes']) != 3 or not set(context['scopes']).issubset(identity['scope'].split()):
+    if len(context['scopes']) != (3 if attenuate else 4) or not set(context['scopes']).issubset(identity['scope'].split()):
         raise RuntimeError('test context must strictly attenuate the real credential')
     canonical = json.dumps(context, separators=(',', ':')).encode()
     seed = json.loads(run.env['L2_APPLICATION_SIGNING_KEYRING'])['application-l2']

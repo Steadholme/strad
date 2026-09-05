@@ -14,7 +14,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
-INFRA_ROOT = ROOT.parents[1]
+INFRA_ROOT = ROOT.parents[2]
 ACCESS_ROOT = INFRA_ROOT / "access-governance"
 SLUICE_ROOT = INFRA_ROOT / ".worktrees" / "analyze-gen7" / "sluice"
 VERDICT_ROOT = INFRA_ROOT / ".worktrees" / "analyze-gen7" / "verdict"

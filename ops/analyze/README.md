@@ -25,7 +25,7 @@ remaining operation reservation. The no-restart behavior is additionally covered
 by a PostgreSQL contract test; the retained live recovery involved a service image
 replacement and is not evidence of a no-restart rollout.
 
-Current checks: 27 Strad contracts, 24 Access application/worker contracts, 54
+Current checks: 27 Strad contracts, 24 Access application/worker contracts, 63
 acceptance-harness unit tests, and both Rust all-target Clippy checks passed.
 The full 462-test Holdfast deployment-tool regression also passed.
 These are scoped results, not a complete release receipt. The harness unit tests
@@ -37,16 +37,17 @@ Remaining work:
    purposeful conversation acceptance with a verified artifact citation. Catalog
    availability and a healthy NewAPI service do not prove generation works.
    Do not add completion-based health probes or silently switch model/provider.
-2. Finish the complete composed acceptance runner and receipt. The current
-   `l2_runtime.py` exercises runtime/approval/MCP subsets; its normal full-run
-   branch is not yet a complete nine-scenario release-receipt producer.
+2. Execute a complete passing composed acceptance after the provider issue is
+   resolved. The full runner and strict receipt publisher are now implemented,
+   but no complete passing run or canonical receipt has been produced.
 3. Integrate and verify the new production overlay and staged route operations
    described below with immutable images, migration/bootstrap, and rollback.
    The legacy `ops/holdfast` public-open ceremony is still Rikune-only and retains
    an Analyze tombstone. Do not use it as an Analyze public rollout.
-4. Review and commit the integration changes, synchronize Loom and GitHub,
-   publish immutable release images, then execute and verify the controlled
-   production rollout. The Rikune Loom remote was not found at the previously
+4. Publish immutable release images, then execute and verify the controlled
+   production rollout. The four service repositories (Access, Strad, Sluice,
+   Verdict) have been synchronized to Loom and GitHub. Rikune itself is pending:
+   its Loom remote was not found at the previously
    tested `w33d/rikune.git` address; its correct remote is still needed. The
    updated Strad release workflow now includes facade publication, but has not
    been executed. It requires a published static-image digest for the corrected
@@ -58,6 +59,30 @@ Remaining work:
 and issuer keys belong only to this isolated environment, never production.
 Private checkpoints contain credentials and sessions and must remain in their
 mode-0700 runtime directory as mode-0600 files. Never commit or print them.
+
+The full entry point is:
+
+```sh
+./ops/analyze/run-l2-acceptance.sh \
+  --analyzer-image <named-immutable-analyzer-reference> \
+  --output ops/analyze/evidence/l2-acceptance-v1.json
+```
+
+Full mode requires clean, revision-bound source checkouts. Native tests use
+separate databases and exported source snapshots; their fixtures never enter
+the application-approval databases. The suite checks all refusal, rotation,
+revocation, dependency, and fault-recovery scenarios before its one model
+conversation. The real 900-second request timeout, 30-minute upload lease, and
+300-second rotation overlap remain unchanged. Allow roughly an hour for a full
+run; no shortened test clock is used for those live guarantees.
+
+On success the JSON Schema and semantic validator both run before the passing
+receipt is published. The sibling `l2-evidence-<run-id>/` directory preserves
+the explicit non-secret proof files, whose byte hashes are in the receipt.
+Diagnostic `*.private.json` checkpoints are never included in that bundle.
+On failure full mode retains the closed project and private diagnostics, and
+does not write a passing marker. Archive a prior receipt and its evidence bundle
+explicitly before asking for a new run at the same canonical output path.
 
 Use `l2_runtime.py --runtime-only --keep-on-failure --output <private-output>`
 for a fresh runtime-only run. `--four-tools` includes a real model generation and

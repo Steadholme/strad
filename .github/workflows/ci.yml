@@ -64,7 +64,10 @@ jobs:
       - name: Test Holdfast tooling
         run: sudo python3 -m unittest discover -s ops/holdfast/tests -v
       - name: Test Analyze acceptance harness without model calls
-        run: sudo python3 -m unittest discover -s ops/analyze/tests -p 'test_l2_*.py'
+        # Receipt tests run the same schema validator as the complete runner.
+        run: |
+          npm --prefix ops/analyze ci --ignore-scripts
+          sudo python3 -m unittest discover -s ops/analyze/tests -p 'test_l2_*.py'
 
   postgres-contract:
     name: PostgreSQL / ${{ matrix.test }}

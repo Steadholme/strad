@@ -29,6 +29,13 @@ class LiveProbeHandler(BaseHTTPRequestHandler):
 
 
 class RuntimeEvidenceTests(unittest.TestCase):
+    def test_new_run_identity_matches_the_complete_receipt_schema(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(runtime, 'INFRA', Path(temporary)):
+            run = runtime.ClosedRun()
+            self.assertRegex(run.run_id, r'^[0-9a-f]{32}$')
+            self.assertGreater(run.started_at, 0)
+            self.assertEqual(run.project, 'analyze-l2-' + run.run_id)
+
     def test_access_standalone_fixture_must_match_the_shared_contract_exactly(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary)

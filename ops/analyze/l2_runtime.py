@@ -13,13 +13,20 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 from urllib.parse import urlsplit
+
+if __name__ == '__main__':
+    # Full-suite helpers import this module. Keep one exception/class identity
+    # when the CLI is executed as a script rather than as an imported module.
+    sys.modules.setdefault('l2_runtime', sys.modules[__name__])
 
 
 ROOT = Path(__file__).resolve().parent
@@ -167,7 +174,8 @@ class ClosedRun:
         if not re.fullmatch(r"(?:[a-z0-9][a-z0-9./:_-]*@)?sha256:[a-f0-9]{64}", analyzer_image):
             raise RuntimeError("closed analyzer image must use an immutable digest")
         self.analyzer_image = analyzer_image
-        self.run_id = secrets.token_hex(12)
+        self.started_at = int(time.time())
+        self.run_id = secrets.token_hex(16)
         self.project = "analyze-l2-" + self.run_id
         runtime_root = INFRA / ".runtime"
         runtime_root.mkdir(mode=0o700, exist_ok=True)
@@ -214,6 +222,8 @@ class ClosedRun:
                 if self.command(["git", "status", "--porcelain"], cwd=checkout):
                     raise RuntimeError(f"{name} manifest worktree is dirty")
             self.sources[name] = {"revision": revision, "source_sha256": source_digest(checkout)}
+            if getattr(self, 'require_clean_sources', False) and self.command(['git', 'status', '--porcelain'], cwd=checkout):
+                raise RuntimeError(f'{name} full acceptance requires a clean source checkout')
         verify_shared_public_contract(CHECKOUTS['access'])
         for image in [NODE, RUNTIME, self.analyzer_image]:
             self.command(["docker", "image", "inspect", image, "--format", "{{.Id}}"])
@@ -655,10 +665,16 @@ FROM access_package WHERE package_catalog_frozen;"""))
         if not csrf:
             raise RuntimeError("applications page did not provide form CSRF")
         self.csrf = csrf[1]
+        csrf_cookie = self.cookies.get('__Host-csrf')
+        if (not csrf_cookie or csrf_cookie.value != self.csrf or cookie.value == self.csrf
+                or not csrf_cookie['secure'] or not csrf_cookie['httponly']
+                or csrf_cookie['samesite'].lower() != 'strict'):
+            raise RuntimeError('CSRF and gateway cookies are not distinct, correctly bound cookies')
         self.observations["oidc_browser_core"] = {"status": "pass", "started_at": started, "finished_at": time.time(),
             "checks": ["anonymous issuer redirect", "state/nonce/PKCE callback", "secure gateway cookie",
                        "applications resume", "authenticated applications DOM with CSRF"],
             "dom_sha256": hashlib.sha256(html.replace(self.csrf, "[csrf]").encode()).hexdigest(),
+            "csrf_distinct": True,
             "issuer_fixture": "closed-test-issuer", "production_user_used": False}
         print("L2 browser: real Sluice callback and Access applications page verified", flush=True)
 
@@ -844,13 +860,15 @@ WHERE p.id='pkg_analyze_mcp_client' AND p.requestable=TRUE AND p.package_catalog
             raise RuntimeError(f"L2 control-plane {method} {path} failed: HTTP {status}")
         return json.loads(raw)["data"] if raw else None
 
-    def application_approval(self):
+    def application_approval(self, credential_ttl_seconds=86400):
+        if credential_ttl_seconds not in {900, 86400, 604800}:
+            raise RuntimeError('invalid closed credential TTL')
         started = time.time()
         request = self.api("/api/v1/application-requests", method="POST", expected=201, value={
             "name": "Closed L2 client", "purpose": "Real composed Analyze acceptance",
             "package_id": "pkg_analyze_mcp_client",
             "scopes": ["analysis.create", "analysis.read", "analysis.conversation", "analysis.upload.cancel"],
-            "credential_ttl_seconds": 86400, "quota_tier": "mvp-default-v1",
+            "credential_ttl_seconds": credential_ttl_seconds, "quota_tier": "mvp-default-v1",
             "justification": "Verify the approved public application lifecycle"})
         if request["state"] != "draft" or request["expires_at"] - request["created_at"] != 604800:
             raise RuntimeError("application creation violated the draft/7-day contract")
@@ -873,11 +891,15 @@ WHERE p.id='pkg_analyze_mcp_client' AND p.requestable=TRUE AND p.package_catalog
             raise RuntimeError("real approval worker did not fulfill the request")
         proof = json.loads(self.sql(f"""SELECT json_build_object(
  'decisions',(SELECT count(*) FROM application_system_policy_decision WHERE request_id='{request_id}' AND consumed_at IS NOT NULL),
+ 'sponsor_consumptions',(SELECT count(*) FROM sponsor_assertion_consumption WHERE request_id='{request_id}'),
+ 'decision_ttl',(SELECT expires_at-issued_at FROM application_system_policy_decision WHERE request_id='{request_id}' AND consumed_at IS NOT NULL),
  'grants',(SELECT count(*) FROM \"grant\" WHERE request_id='{request_id}'),
  'principals',(SELECT count(*) FROM application_principal WHERE request_id='{request_id}'),
  'version',(SELECT version FROM application_principal WHERE request_id='{request_id}'));"""))
         if any(proof[name] != 1 for name in ["decisions", "grants", "principals"]):
             raise RuntimeError("approval consumption/grant/principal cardinality differs from one")
+        if proof['sponsor_consumptions'] != 1 or proof['decision_ttl'] != 300:
+            raise RuntimeError('Sponsor consumption or system decision TTL differs')
         credential = self.api("/api/v1/applications/" + request_id + "/credentials", method="POST",
                               expected=201, value={"expected_version": proof["version"]})
         if not re.fullmatch(r"app_v1_[A-Za-z0-9_-]{43}", credential["token"]):
@@ -1157,9 +1179,16 @@ def main():
         parser.error("L2 acceptance must use its canonical evidence path")
     if output and output.exists():
         parser.error("output exists; select a fresh runtime path or explicitly archive the old acceptance receipt")
+    full = not args.runtime_only and not args.catalog_only
+    if full and not re.fullmatch(r'[a-z0-9./_-]+(?::[A-Za-z0-9._-]+)?@sha256:[a-f0-9]{64}', args.analyzer_image):
+        parser.error('full acceptance requires a named immutable analyzer reference')
+    def interrupted(signum, _frame):
+        raise KeyboardInterrupt(f'closed acceptance interrupted by signal {signum}')
+    signal.signal(signal.SIGTERM, interrupted)
     os.umask(0o077)
     run = ClosedRun(args.analyzer_image)
-    run.keep_for_diagnosis = args.keep_on_failure
+    run.keep_for_diagnosis = args.keep_on_failure or full
+    run.require_clean_sources = full
     completed = False
     try:
         run.initialize()
@@ -1178,20 +1207,28 @@ def main():
         run.bootstrap_approver()
         run.application_approval()
         run.mcp_transport()
-        if args.four_tools or not args.runtime_only:
+        if full:
+            from l2_suite import FullSuite
+            from l2_receipt import emit_receipt
+            suite = FullSuite(run).execute()
+            emit_receipt(suite, output)
+            completed = True
+            print('L2 complete composed acceptance passed; production ingress was not opened', flush=True)
+            return
+        if args.four_tools:
             run.mcp_four_tools()
-        if not args.runtime_only:
-            require_complete(run.observations)
         result = {"status": "runtime_verified", "release_eligible": False, "run_id": run.run_id,
                   "sources": run.sources, "readiness": readiness, "observations": run.observations}
         write_private_json(output, result)
         completed = True
         print("L2 live runtime verified; full scenario acceptance remains required", flush=True)
-    except Exception as error:
+    except BaseException as error:
         print(f"L2 scenario failed ({type(error).__name__})", flush=True)
+        if full and hasattr(run, 'credential'):
+            run.diagnostic_checkpoint('full-suite-failure-' + uuid.uuid4().hex, error_type=type(error).__name__)
         raise
     finally:
-        if args.keep_on_failure and not completed and run.env_file.exists():
+        if run.keep_for_diagnosis and not completed and run.env_file.exists():
             print(f"L2 isolated diagnosis retained: project={run.project} work={run.work}", flush=True)
         else:
             run.cleanup()

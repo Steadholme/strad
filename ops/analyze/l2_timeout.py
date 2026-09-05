@@ -143,6 +143,11 @@ def recover_timeout(run, uncertain, *, started=None, first_status=None):
     audits = int(run.sql(f"SELECT count(*) FROM application_audit_events WHERE application_sub='{subject}' AND operation_id='{operation}' AND event_kind='reconciliation';", 'strad_l2'))
     if terminal['reservation_active'] is not False or terminal['dispatch_count'] != 1 or audits != 1:
         raise RuntimeError('timeout reconciliation did not preserve exactly-once semantics')
+    if completed:
+        if terminal['upload_state'] != 'finalized' or terminal['binding_state'] != 'committed':
+            raise RuntimeError('successful timeout recovery did not commit the upload binding')
+    elif terminal['binding_state'] != 'released' or terminal['upload_state'] not in {'cancelled', 'expired'}:
+        raise RuntimeError('failed timeout recovery still retains the upload reservation')
     return {'name': 'dispatch_timeout', 'fault_mechanism': 'paused_real_analyzer_with_original_timeouts',
         'state': 'downstream_uncertain', 'reservation_retained': True, 'automatic_resend_count': 0,
         'audited_reconciliation': True,
