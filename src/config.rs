@@ -316,10 +316,19 @@ fn exact_base_url(
 
 fn exact_https_url(name: &str, expected_path: &str) -> std::result::Result<String, String> {
     let raw = required(name)?;
-    let parsed = reqwest::Url::from_str(&raw).map_err(|_| format!("{name} is invalid"))?;
+    validate_exact_https_url(name, &raw, expected_path)?;
+    Ok(raw)
+}
+
+fn validate_exact_https_url(
+    name: &str,
+    raw: &str,
+    expected_path: &str,
+) -> std::result::Result<(), String> {
+    let parsed = reqwest::Url::from_str(raw).map_err(|_| format!("{name} is invalid"))?;
     if parsed.scheme() != "https"
         || parsed.path() != expected_path
-        || parsed.host_str() != Some("access.w33d.xyz")
+        || !matches!(parsed.host_str(), Some("access.w33d.xyz" | "sso.w33d.xyz"))
         || parsed.port_or_known_default() != Some(443)
         || parsed.query().is_some()
         || parsed.fragment().is_some()
@@ -330,7 +339,7 @@ fn exact_https_url(name: &str, expected_path: &str) -> std::result::Result<Strin
             "{name} must be an exact HTTPS execution-fence endpoint"
         ));
     }
-    Ok(raw)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -378,20 +387,38 @@ mod tests {
 
     #[test]
     fn execution_fence_requires_exact_https_without_redirectable_components() {
-        assert!(exact_https_url(
-            "TEST_FENCE",
-            "/internal/v1/application-execution-fence/check"
-        )
-        .is_err());
+        let path = "/internal/v1/application-execution-fence/check";
+        for host in ["access.w33d.xyz", "sso.w33d.xyz"] {
+            for port in ["", ":443"] {
+                let endpoint = format!("https://{host}{port}{path}");
+                assert!(validate_exact_https_url("TEST_FENCE", &endpoint, path).is_ok());
+            }
+            for endpoint in [
+                format!("http://{host}{path}"),
+                format!("https://{host}:444{path}"),
+                format!("https://{host}:80{path}"),
+                format!("https://evil.{host}{path}"),
+                format!("https://{host}.evil{path}"),
+                format!("https://{host}.{path}"),
+                format!("https://user@{host}{path}"),
+                format!("https://user:password@{host}{path}"),
+                format!("https://{host}{path}?next=x"),
+                format!("https://{host}{path}#fragment"),
+                format!("https://{host}{path}/"),
+                format!("https://{host}/other"),
+            ] {
+                assert!(
+                    validate_exact_https_url("TEST_FENCE", &endpoint, path).is_err(),
+                    "accepted hostile endpoint: {endpoint}"
+                );
+            }
+        }
         for hostile in [
-            "http://access/internal/v1/application-execution-fence/check",
-            "https://user@access.w33d.xyz/internal/v1/application-execution-fence/check",
-            "https://access.w33d.xyz/internal/v1/application-execution-fence/check?next=x",
+            "https://evil.example/internal/v1/application-execution-fence/check",
+            "https://127.0.0.1/internal/v1/application-execution-fence/check",
+            "not a URL",
         ] {
-            let parsed = reqwest::Url::parse(hostile).unwrap();
-            assert!(
-                parsed.scheme() != "https" || parsed.username() != "" || parsed.query().is_some()
-            );
+            assert!(validate_exact_https_url("TEST_FENCE", hostile, path).is_err());
         }
     }
 }

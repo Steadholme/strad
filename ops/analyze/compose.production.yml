@@ -26,7 +26,9 @@ services:
       MFA_ASSERTION_HMAC_KEY: ${MFA_ASSERTION_HMAC_KEY:?existing trusted MFA key is required}
       ACCESS_ANALYZE_EXTERNAL_ORIGIN: https://analyze.w33d.xyz
       ACCESS_ANALYZE_STEP_UP_RESUME_PATH: /applications/
-      ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING: ${SLUICE_APPLICATION_CONTEXT_VERIFICATION_KEYRING:?matching public signing keyring is required}
+      # Access consumes kid -> raw public key; Facade consumes key lifecycle
+      # records. Use the same public keys with each service's exact JSON shape.
+      ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING: ${ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING:?matching sponsor public keyring is required}
       ACCESS_ANALYZE_APPROVAL_ACTIVE_KID: ${ACCESS_ANALYZE_APPROVAL_ACTIVE_KID:?approval signing KID is required}
       ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING: ${ACCESS_ANALYZE_APPROVAL_SIGNING_KEYRING:?approval signing keyring is required}
       ACCESS_APPLICATION_CREDENTIAL_PEPPER: ${ACCESS_APPLICATION_CREDENTIAL_PEPPER:?application credential pepper is required}

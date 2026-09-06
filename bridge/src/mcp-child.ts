@@ -17,6 +17,7 @@ import {
 } from './static-lock.js'
 import { validateAndProjectBusinessResult } from './schemas.js'
 import { verifyFrozenToolCatalog } from './tool-catalog.js'
+import { LateTimeoutTransport } from './late-timeout-transport.js'
 
 type JsonRecord = Record<string, unknown>
 
@@ -209,7 +210,12 @@ export class RikuneChild implements AnalyzerClient {
     // Startup is single-threaded, so scrub that list until spawn captures the
     // explicitly frozen child environment, then restore PID 1 immediately.
     try {
-      await withoutSdkInheritedEnvironment(() => this.client.connect(transport))
+      const guardedTransport = new LateTimeoutTransport(transport, () => {
+        process.stderr.write(`${JSON.stringify({
+          level: 'warn', event: 'mcp_late_timeout_response_discarded',
+        })}\n`)
+      })
+      await withoutSdkInheritedEnvironment(() => this.client.connect(guardedTransport))
       this.initialized = true
       await this.waitForHttpReady(120_000)
       for (const canonicalName of ACTIVATION_TARGETS) {

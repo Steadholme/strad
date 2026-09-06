@@ -44,6 +44,10 @@ class ProductionWiringTests(unittest.TestCase):
             if name.endswith('_IMAGE'):
                 env[name] = 'example.invalid/analyze@sha256:' + 'a' * 64
         env['ANALYZE_FACADE_DATABASE_URL'] = 'postgresql://facade:unit-only@postgres:5432/analyze_facade'
+        public_key = 'a' * 43
+        env['ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING'] = json.dumps({'test-key': public_key})
+        env['SLUICE_APPLICATION_CONTEXT_VERIFICATION_KEYRING'] = json.dumps(
+            {'test-key': {'public_key': public_key, 'retired_at': None}})
         services = {name: {'image': 'example.invalid/base:unit', 'networks': ['hf-mgmt']}
                     for name in ['sluice', 'sluice-internal', 'access-governance', 'verdict', 'strad', 'rikune-analyzer', 'postgres']}
         services['strad']['networks'] = ['legacy']
@@ -69,6 +73,10 @@ class ProductionWiringTests(unittest.TestCase):
         self.assertEqual(access['PUBLIC_HOST'], 'access.w33d.xyz')
         self.assertEqual(access['GATEWAY_ROUTE_NAME'], 'access-root')
         self.assertEqual(access['ACCESS_ANALYZE_EXTERNAL_ORIGIN'], 'https://analyze.w33d.xyz')
+        self.assertEqual(json.loads(access['ACCESS_ANALYZE_SPONSOR_PUBLIC_KEYRING']),
+                         {'test-key': public_key})
+        self.assertEqual(json.loads(facade['environment']['SLUICE_APPLICATION_CONTEXT_VERIFICATION_KEYRING']),
+                         {'test-key': {'public_key': public_key, 'retired_at': None}})
 
 
 if __name__ == '__main__':
