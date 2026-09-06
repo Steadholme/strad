@@ -7,9 +7,29 @@ package policy. Opaque credentials do not bypass scope, ownership, quota, live
 authorization, or revocation checks. The public contract is
 [`analyze-public-v1.json`](analyze-public-v1.json).
 
-## Current release status — 2026-09-05
+## Current release status — 2026-09-06
 
-**Not promoted to production.** The retained private acceptance project has
+**Deployed to production using operator-authorized, digest-pinned on-host images.**
+The operator explicitly waived creation of Rikune's missing Loom repository and
+a successful GLM conversation as launch prerequisites. This is a model-free
+production rollout, not a passing receipt from the model-required full L2 suite.
+`/applications/` and the root require SSO; `/mcp` and `/v1/uploads` require an
+approved application credential. Internal routes remain hidden from the public
+gateway. The original Rikune workbench and its permission checks remain intact.
+
+Access was migrated through its official CLI to v18, the existing catalog
+promotion was reused idempotently, and the Analyze-only non-login system
+approver was bootstrapped with the existing on-host RSA release authority.
+No human request, business grant, or application credential was injected for
+production acceptance. The existing production analysis recovered to `analyzed`
+and produced 17 artifacts; the production conversation table remained empty.
+Six successive checks over 106 seconds found all nine services healthy with no
+additional restarts. Public SSO, missing/invalid credential, untrusted Origin,
+and private-route denial checks passed. The stored Ghidra functions file also
+matched its persisted SHA256. Exact pins, evidence hash and rollback entry point
+are recorded in [`production-release-20260906.json`](production-release-20260906.json).
+
+The retained private acceptance project has
 verified real approval/credential issuance, Ghidra upload and artifact integrity,
 credential rotation/revocation, cross-application isolation, the final execution
 fence, and three failure/recovery paths. Boundary fault injection is labelled
@@ -31,27 +51,27 @@ The full 462-test Holdfast deployment-tool regression also passed.
 These are scoped results, not a complete release receipt. The harness unit tests
 use doubles and do not prove a successful real model conversation.
 
-Remaining work:
+Non-blocking follow-ups, not acceptance claims:
 
-1. Resolve the existing GLM-5.2 upstream 500 through NewAPI, then perform one
-   purposeful conversation acceptance with a verified artifact citation. Catalog
-   availability and a healthy NewAPI service do not prove generation works.
-   Do not add completion-based health probes or silently switch model/provider.
-2. Execute a complete passing composed acceptance after the provider issue is
-   resolved. The full runner and strict receipt publisher are now implemented,
-   but no complete passing run or canonical receipt has been produced.
-3. Integrate and verify the new production overlay and staged route operations
-   described below with immutable images, migration/bootstrap, and rollback.
-   The legacy `ops/holdfast` public-open ceremony is still Rikune-only and retains
-   an Analyze tombstone. Do not use it as an Analyze public rollout.
-4. Publish immutable release images, then execute and verify the controlled
-   production rollout. The four service repositories (Access, Strad, Sluice,
-   Verdict) have been synchronized to Loom and GitHub. Rikune itself is pending:
-   its Loom remote was not found at the previously
-   tested `w33d/rikune.git` address; its correct remote is still needed. The
-   updated Strad release workflow now includes facade publication, but has not
-   been executed. It requires a published static-image digest for the corrected
-   Rikune source revision; that upstream image is not published yet.
+1. GLM-5.2 generation was not retried during launch. Its last purposeful test
+   failed upstream. NewAPI service readiness does not prove model generation;
+   health probes must not call completions or silently change the model.
+2. The complete model-required L2 receipt and registry publication/attestation
+   remain separate future work. Do not describe the on-host rollout as either.
+3. Access, Strad, Sluice and Verdict sources are synchronized to Loom and GitHub.
+   Rikune's main was pushed to GitHub; its absent Loom repository was waived.
+
+Use `/root/w33d_infra/deploy/analyze-compose.sh` for later Compose operations;
+it loads the production overlay and protected `analyze.env`. Running only the
+legacy base Compose file would omit the application-auth configuration.
+Protected database/config/volume backups and launch tooling are retained at
+`/root/w33d_infra/.runtime/analyze-production-20260906-bPZq1N`.
+To close only the new public Analyze ingress, run that directory's
+`launch.py routes public down`. Do not downgrade Access to v17 without a
+coordinated database recovery; preserve post-launch writes.
+
+The legacy `ops/holdfast` public-open ceremony remains Rikune-only and retains
+an Analyze tombstone. Do not use it to reconcile this Analyze deployment.
 
 ## Closed diagnostics
 
@@ -157,12 +177,13 @@ drift and conflicting host/path ownership abort rather than overwrite. Real
 PostgreSQL contract evidence is in
 `/root/w33d_infra/.runtime/analyze-production-route-contract-20260905.json`.
 
-Before any production execution, bind the overlay to published digest-pinned
+For future production executions, bind the overlay to verified digest-pinned
 images and protected provisioned secrets, create the dedicated facade database
 and restricted role, complete the application migration and system-approver
 bootstrap, and verify closed readiness and rollback. Route SQL alone does not
 prove release eligibility. Existing estate snapshots and other services must be
-preserved. Neither the overlay nor route SQL has been applied to production.
+preserved. The overlay and both route phases were applied on 2026-09-06 under
+the explicit on-host, model-free launch authorization above.
 
 The dual-origin closed check completed real SSO, Sponsor submission, system
 approval, credential issuance, and MCP create/cancel. See
@@ -184,3 +205,12 @@ probes 40–100. Evidence is in
 `/root/w33d_infra/.runtime/analyze-bounded-live-probes-20260905.json`.
 This short observation does not prove the absence of every possible long-running
 memory leak; extended runtime observation remains necessary.
+
+Production also exposed a late-response race: an SDK request could time out
+while a busy child had already sent its response. That late frame was reported
+as an unknown ID and caused a fatal bridge restart. `LateTimeoutTransport` now
+discards only the first late response for an actually sent request with the
+SDK's exact timeout cancellation. Unknown IDs, duplicates and transport/parse
+errors still fail closed; the tracking cache is bounded. All 38 bridge tests
+pass, including a real SDK timeout/late-response regression. Production now
+uses both this fix and the bounded catalog probes.
