@@ -63,3 +63,17 @@ same full commit SHA before a release revision is accepted.
 ## License
 
 Licensed under either Apache License 2.0 or the MIT license, at your option.
+
+## 前端 v2（2026-09-08）
+
+七个 SSR 模板按 Figma 文件 `KLOaplFFOVGZm5FUEgvb8F`（Strad / Rikune Workbench，oxide accent）
+换到共享的 Steadholme v2 视觉系统。SSR 契约一字未动：flat `{{key}}` 全转义、未知占位符 →
+500、`src/templates.rs` 里的 enrich 锚点字符串、全部 `data-wb-*` 钩子、CSP 无内联样式、
+`[data-section]` 纯 CSS 分区切换、以及 upload 恢复文案。
+
+`static/rikune.css` 现在由三层拼成（strad 直接从磁盘回源，故必须自包含）：
+Odyssey canonical（原样 vendored 自 `/root/w33d_infra/odyssey/css/`）+ 共享 v2 kit（oxide）
++ Rikune 表面层。token 变更仍回 canonical Odyssey 仓修改。
+
+模板改动只在外壳：应用栏补上主机名 / All apps / 身份，页头去掉无意义的 eyebrow，
+页脚补上同产品线链接。

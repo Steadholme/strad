@@ -8,7 +8,7 @@
 <title>{{ title }} · Rikune Workbench</title>
 <link rel="stylesheet" href="/static/rikune.css">
 </head>
-<body data-wb-page="conversation">
+<body class="page-v2" data-wb-page="conversation">
 <a class="wb-skip" href="#main-content">Skip to main content</a>
 
 <header class="appbar">
@@ -18,11 +18,13 @@
     </span>
     <span class="appbar__name"><b>Rikune</b><span>Analysis workbench</span></span>
   </a>
+  <span class="appbar__host">rikune.w33d.xyz</span>
   <nav class="appbar__nav" aria-label="Primary">
     <a class="appnav" href="/">Overview</a>
     <a class="appnav is-active" href="/analyses" aria-current="page">Analyses</a>
   </nav>
   <div class="appbar__right">
+    <a class="appnav" href="https://w33d.xyz">All apps</a>
     <span class="chip" title="Signed in">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
       <span class="sr-only">Signed in.</span>Account
@@ -169,8 +171,11 @@
 </main>
 
 <footer class="site-foot">
-  <span>Steadholme · Rikune Workbench</span>
-  <span class="muted">Static binary analysis</span>
+  <span>Steadholme · Rikune Workbench · rikune.w33d.xyz</span>
+  <a href="https://detonate.w33d.xyz">Crucible</a>
+  <a href="https://audit.w33d.xyz">Watchtower</a>
+  <a href="https://status.w33d.xyz">Status</a>
+  <a href="https://w33d.xyz">All apps</a>
 </footer>
 
 <div class="toast-region" data-wb-toasts aria-live="polite" aria-atomic="false"></div>
