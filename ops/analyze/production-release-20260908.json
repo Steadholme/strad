@@ -1,0 +1,82 @@
+{
+  "schema": "w33d.analyze.operator-authorized-production-release.v1",
+  "status": "frontend_v2_promoted_access_and_verdict_only",
+  "date": "2026-09-08",
+  "mode": "digest-pinned-on-host",
+  "supersedes": "production-release-20260906.json",
+  "scope": "Frontend v2 only. This release promotes new Access and Verdict binaries onto the 2026-09-06 production bases so the Figma v2 consoles ship. No application-auth behaviour, schema, policy, catalog or credential was changed.",
+  "operator_authorization": "The operator authorized direct operation on the host and asked explicitly for these three products to be advanced.",
+  "origins": {
+    "application_portal": "https://analyze.w33d.xyz/applications/",
+    "mcp": "https://analyze.w33d.xyz/mcp",
+    "human_workbench": "https://rikune.w33d.xyz"
+  },
+  "promotion_method": {
+    "pattern": "ops/analyze/Dockerfile.promote",
+    "dockerfile_used": "scratchpad Dockerfile.promote-20260908 (same shape: tested binary copied onto the production base, every other base layer preserved)",
+    "what_crosses_over": "the service binary only",
+    "lineage_check": "each repo HEAD was verified to be a descendant of the revision pinned in production-release-20260906.json, so the promoted binaries contain that release's application-auth code rather than regressing it"
+  },
+  "source_revisions": {
+    "access_governance": "808e68b26cde58015fee04ff4ff6419e3de8a6df",
+    "access_governance_ancestor_in_20260906": "e54f2df236deebe8b233ed64aee230809196718f",
+    "verdict": "dc000a6ea0c96108186ad3b2c2ad26d4ca6702d1",
+    "verdict_ancestor_in_20260906": "88a8cae0e9df6ff66ca4ee3970fb2d768b77e473"
+  },
+  "tested_images": {
+    "access": "steadholme/access-governance:v2-20260908@sha256:f4c5a7686c5fbd50dbf37309c5b5d35811deaa418e4735ad0748ad0b74d17a4f",
+    "verdict": "steadholme/verdict:v2-20260908@sha256:9d2de42fcf1f25181a403942bea3c80138de8935b161e3870861fb5e18c98c6b"
+  },
+  "images": {
+    "access": "localhost/analyze-production-access@sha256:dc2697d2f8690b5084d33b7b18a345416056af811b899dbbd68819ca186a2247",
+    "verdict": "localhost/analyze-production-verdict@sha256:210cd73b03ef435baad950888a303ec24e293a2ccbbcf1717dace2315ff31628",
+    "strad": "localhost/analyze-production-strad@sha256:1a70a3a0f941f81db4fc13b052a8e364288dfd631f2d8a54e6c06e16927927ed",
+    "sluice": "localhost/analyze-production-sluice@sha256:166761b16d04ac959da21b3481d4c4dd38b4c27e00dac7a1d6a279c52378eb54",
+    "analyzer": "localhost/strad-analyzer@sha256:144f016a2decdf9a93152910b053bac7ef04a919c94567f8a3052eb712a4afd5",
+    "facade": "localhost/strad-analyze-facade@sha256:2b99966b0224d65fd4d8cf7ec4afe51c1a807443272a9e9b9bb8209c1b836976"
+  },
+  "unchanged_from_20260906": [
+    "Strad, Sluice, the analyzer and the facade keep their 2026-09-06 digests",
+    "application schema version 18",
+    "no catalog promotion, no approver bootstrap, no credential issuance"
+  ],
+  "gateway_route_migration": {
+    "reason": "each stylesheet is exposed by its own public route with the exact filename in path_prefix; an asset bump orphans it in both directions",
+    "authz-static-style": "/assets/verdict-20260821.css -> /assets/verdict-20260908.css",
+    "access-static-style": "/assets/access-governance-20260823-r2.css -> /assets/access-governance-20260908.css"
+  },
+  "production_acceptance": {
+    "public_sso_entries": 302,
+    "analyze_applications_portal": 302,
+    "mcp_without_credential": 401,
+    "uploads_without_credential": 401,
+    "mcp_untrusted_browser_origin": 403,
+    "public_access_to_internal_routes": 404,
+    "verdict_scoped_service_credential_auth": "ENABLED (from the container's own startup log)",
+    "estate_containers_running": 48,
+    "estate_containers_unhealthy": 0,
+    "model_completion_calls": 0,
+    "human_passkey_acceptance_performed": false,
+    "production_application_credential_issued_for_acceptance": false
+  },
+  "rollback": {
+    "env_file": "/root/w33d_infra/deploy/analyze.env",
+    "backup": "/root/w33d_infra/deploy/analyze.env.before-v2-20260908",
+    "access_previous": "localhost/analyze-production-access@sha256:b36d8db97949c8d5c498c7207d5fbc45c3606680948f07d91b073785f431a598",
+    "verdict_previous": "localhost/analyze-production-verdict@sha256:f2ccb0ed0b1b230a913c00215192ed4532f86e1ff5df3dacf9b54deeeb0197ca",
+    "note": "roll the image and the gateway stylesheet route back together, otherwise the stylesheet 404s either way",
+    "compose_entrypoint": "/root/w33d_infra/deploy/analyze-compose.sh"
+  },
+  "not_claimed": [
+    "The model-required full L2 acceptance suite was NOT run. This is a model-free promotion, same mode as 2026-09-06.",
+    "No registry publication or attestation.",
+    "No new approval, credential, or catalog state was exercised; only the public boundary checks were re-run.",
+    "Strad is NOT included — see strad_not_promoted."
+  ],
+  "strad_not_promoted": {
+    "reason": "strad/Dockerfile refuses to build without digest-pinned STRAD_RUST_BUILDER_IMAGE and STRAD_RUNTIME_IMAGE plus a 40-hex STRAD_REVISION (exit 64). ops/holdfast/frozen-targets.json lists these as required unresolved inputs supplied at render time, together with AUTHORITY_PUBLIC_KEY_SHA256, SUPPLY_CHAIN_PUBLIC_KEY_SHA256 and SUPPLY_CHAIN_SIGNATURE_SHA256.",
+    "judgement": "That gate exists so a Strad image can only be produced by the holder of the release signing authority. Hand-rolling values to get past it would defeat its purpose, so Strad was left on its 2026-09-06 digest.",
+    "strad_frontend_v2_state": "implemented, tested, committed and pushed at d410904; only the production promotion is outstanding",
+    "path_forward": "render a release with ops/holdfast/render.py using the operator's pinned digests and signing authority under /secure/release"
+  }
+}
