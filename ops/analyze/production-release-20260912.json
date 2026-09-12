@@ -1,0 +1,69 @@
+{
+  "schema": "w33d.analyze.operator-authorized-production-release.v1",
+  "status": "incident_fix_promoted_access_only",
+  "date": "2026-09-12",
+  "mode": "digest-pinned-on-host",
+  "supersedes": "production-release-20260908.json",
+  "scope": "Access only. Fixes the recertification path that bumped a live grant's version without advancing its materialized rows, which took the service to 503 on every path for three days. No application-auth behaviour, schema, policy, catalog or credential was otherwise changed.",
+  "incident": {
+    "opened_at": "2026-09-09T22:59:36Z",
+    "closed_at": "2026-09-12",
+    "symptom": "access.w33d.xyz answered 503 on every path except /healthz; container reported unhealthy; analyze-facade went unhealthy with it",
+    "root_cause": "workers/due.rs open_recertification() moved grt_platform_bootstrap_admin_v7 from active to expiring with version=version+1 and re-enqueued its projection at desired_version 2, but did not advance grant_entitlement.grant_version or grant_binding.grant_version. The projection worker then read a stale expansion, failed with 'desired grant expansion is stale', exhausted 12 attempts and marked the projection dead. /readyz requires that projection to be 'projected', so the serving readiness gate returned 503 for every path.",
+    "why_it_was_latent": "Every other version-bump path already advances the materialization in the same transaction (advance_materialized_grant_version in workers/effective_birthright.rs, the repository activate path, application_access.rs). Only recertification omitted it, and recertification only fires when a grant reaches its recert due date.",
+    "not_caused_by": "The 2026-09-09 frontend v2 promotion. That changed templates and CSS only; the service ran healthy for about eleven hours after it and failed when the recert job came due."
+  },
+  "code_fix": {
+    "commit": "3b8bb1ddadb315188d3ee0e6759a838a425c287f",
+    "change": "open_recertification() now advances grant_entitlement and grant_binding to the new version in the same transaction, matching every other version-bump path",
+    "regression_test": "tests/postgres_governance_flow.rs::recertification_advances_the_materialized_grant_version",
+    "expiry_path_untouched": "The expire/revoke transition bumps toward a terminal state where the grant is no longer live and readiness does not join it; it was deliberately left alone."
+  },
+  "data_repair": {
+    "grant": "grt_platform_bootstrap_admin_v7",
+    "grant_entitlement_rows_advanced": 238,
+    "grant_binding_rows_advanced": 238,
+    "from_version": 1,
+    "to_version": 2,
+    "projection_reset": "dead -> pending (attempts 0, lease_generation+1) so the worker could re-drive it",
+    "outcome": "projected on the first attempt; policy_epoch 41, projected_edge_count 238 equal to binding rows at version, ack digest valid",
+    "pre_image": "/tmp/claude-0/-root-w33d-infra/5cf87e8f-d7dd-4611-928d-284501a8b2f4/scratchpad/ag-repair/*.csv",
+    "note": "Recertification does not change what is granted, so the same 238 entitlements are correct at version 2. grt_platform_bootstrap_admin_v1..v6 carry the same version skew but are superseded grants that readiness does not join; they were left alone."
+  },
+  "images": {
+    "tested": "steadholme/access-governance:v3-20260912@sha256:cbf539fa47695611c34c93fe685a0e9a886d660ff4d1de8809e7698eb4f93b5f",
+    "access": "localhost/analyze-production-access@sha256:ca65e77a7d723c09488131c34d467c440b9e034e2eccf05d0ae6540dba543adc"
+  },
+  "source_revisions": {
+    "access_governance": "3b8bb1ddadb315188d3ee0e6759a838a425c287f",
+    "access_governance_ancestor_in_20260906": "e54f2df236deebe8b233ed64aee230809196718f"
+  },
+  "production_acceptance": {
+    "readyz": 200,
+    "public_sso_entries": 302,
+    "analyze_applications_portal": 302,
+    "mcp_without_credential": 401,
+    "mcp_untrusted_browser_origin": 403,
+    "public_access_to_internal_routes": 404,
+    "estate_containers_running": 48,
+    "estate_containers_unhealthy": 0,
+    "analyze_facade": "recovered to healthy once Access stopped returning 503",
+    "model_completion_calls": 0
+  },
+  "rollback": {
+    "env_file": "/root/w33d_infra/deploy/analyze.env",
+    "access_previous": "localhost/analyze-production-access@sha256:081a1edda5596769fab1156bd6b985b39515051ef0b0d2483b609ba606f5da19",
+    "note": "Rolling the image back reinstates the bug but not the data skew; the repaired rows stay correct.",
+    "compose_entrypoint": "/root/w33d_infra/deploy/analyze-compose.sh"
+  },
+  "not_claimed": [
+    "The model-required full L2 acceptance suite was NOT run. Same model-free mode as 2026-09-06.",
+    "The repository's Postgres-backed tests could not be executed against a throwaway database: migrate() enforces a public-schema trust gate that a plain postgres:16-alpine does not satisfy, and the pre-existing tests fail there identically. The regression test is written and compiles but has not been executed against a real provisioned database.",
+    "No registry publication or attestation."
+  ],
+  "follow_ups": [
+    "newapi declares depends_on access-governance: service_healthy. While Access was unhealthy any restart of NewAPI would have hung; it survived only because it had been running for twelve days.",
+    "grt_platform_bootstrap_admin_v1..v6 still show grant.version 2 against materialized version 1. They are superseded and unused by readiness, but the skew is evidence the same path bumped them earlier.",
+    "Provision a test database that satisfies the migrate() schema-trust gate so the governance suite can actually run in CI."
+  ]
+}
